@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
 
 use inference::health_server::{Health, HealthServer};
@@ -63,7 +65,7 @@ pub struct SonicService;
 #[tonic::async_trait]
 impl Sonic for SonicService {
     type CheckpointStream =
-        tonic::codegen::tokio_stream::Iter<std::vec::IntoIter<Result<CheckpointResponse, Status>>>;
+        tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
     async fn view_models(
         &self,
@@ -97,7 +99,8 @@ impl Sonic for SonicService {
             )));
         }
 
-        let model_dir = Path::new("ml-backends").join(&model_name);
+        let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))
+            .map_err(|err| Status::internal(format!("failed to resolve model path: {err}")))?;
         let main_py = model_dir.join("main.py");
         if !main_py.is_file() {
             return Err(Status::not_found(format!(
@@ -105,29 +108,131 @@ impl Sonic for SonicService {
             )));
         }
 
-        let output = Command::new("python3")
-            .arg("main.py")
-            .current_dir(&model_dir)
-            .output()
-            .map_err(|err| Status::internal(format!("failed to run python3 main.py: {err}")))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let chunk = match (stdout.is_empty(), stderr.is_empty()) {
-            (true, true) => "checkpoint command finished with no output".to_string(),
-            (false, true) => stdout,
-            (true, false) => stderr,
-            (false, false) => format!("{stdout}\n{stderr}"),
+        let venv_dir = model_dir.join("venv");
+        let python_path = if cfg!(windows) {
+            venv_dir.join("Scripts").join("python.exe")
+        } else {
+            venv_dir.join("bin").join("python")
         };
+        if !python_path.is_file() {
+            return Err(Status::not_found(format!(
+                "venv python not found for model '{model_name}'"
+            )));
+        }
+        let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(64);
 
-        let response = CheckpointResponse {
-            chunk,
-            done: true,
-            exit_code: output.status.code().unwrap_or(-1),
-        };
+        std::thread::spawn(move || {
+            let mut child = match Command::new(&python_path)
+                .arg("-u")
+                .arg("main.py")
+                .current_dir(&model_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    let _ =
+                        tx.blocking_send(Err(Status::internal(format!("failed to run main.py: {err}"))));
+                    return;
+                }
+            };
 
-        let stream = tonic::codegen::tokio_stream::iter(vec![Ok(response)]);
-        Ok(Response::new(stream))
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    let _ = tx.blocking_send(Err(Status::internal(
+                        "failed to capture stdout from main.py process",
+                    )));
+                    return;
+                }
+            };
+            let stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    let _ = tx.blocking_send(Err(Status::internal(
+                        "failed to capture stderr from main.py process",
+                    )));
+                    return;
+                }
+            };
+
+            let tx_stdout = tx.clone();
+            let stdout_handle = std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            if tx_stdout
+                                .blocking_send(Ok(CheckpointResponse {
+                                    chunk: line,
+                                    done: false,
+                                    exit_code: 0,
+                                }))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx_stdout.blocking_send(Err(Status::internal(format!(
+                                "failed reading stdout: {err}"
+                            ))));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let tx_stderr = tx.clone();
+            let stderr_handle = std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            if tx_stderr
+                                .blocking_send(Ok(CheckpointResponse {
+                                    chunk: format!("stderr: {line}"),
+                                    done: false,
+                                    exit_code: 0,
+                                }))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx_stderr.blocking_send(Err(Status::internal(format!(
+                                "failed reading stderr: {err}"
+                            ))));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let status = match child.wait() {
+                Ok(status) => status,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(Status::internal(format!(
+                        "failed waiting on main.py process: {err}"
+                    ))));
+                    return;
+                }
+            };
+
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            let _ = tx.blocking_send(Ok(CheckpointResponse {
+                chunk: String::new(),
+                done: true,
+                exit_code: status.code().unwrap_or(-1),
+            }));
+        });
+
+        Ok(Response::new(
+            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
     }
 }
 
