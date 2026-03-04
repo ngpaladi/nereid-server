@@ -330,11 +330,13 @@ impl Sonic for SonicService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Preparing model environments...");
     prepare_model_envs()?;
-
+    println!("Model environments ready. Starting gRPC server...");
     let addr = "[::1]:50051".parse()?;
     let health = HealthService;
     let sonic = SonicService;
+    println!("gRPC server listening on {}", addr);
 
     Server::builder()
         .add_service(HealthServer::new(health))
