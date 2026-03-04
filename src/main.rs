@@ -60,10 +60,7 @@ fn prepare_model_envs() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let venv_dir = model_dir.join("venv");
-        if venv_dir.is_dir() {
-            continue;
-        }
-        if venv_dir.exists() {
+        if venv_dir.exists() && !venv_dir.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("path exists but is not a directory: {}", venv_dir.display()),
@@ -71,19 +68,21 @@ fn prepare_model_envs() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
 
-        let create_venv = Command::new("python3")
-            .args(["-m", "venv", "venv"])
-            .current_dir(&model_dir)
-            .output()?;
-        if !create_venv.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "failed to create venv for model '{model_name}': {}",
-                    output_details(&create_venv)
-                ),
-            )
-            .into());
+        if !venv_dir.is_dir() {
+            let create_venv = Command::new("python3")
+                .args(["-m", "venv", "venv"])
+                .current_dir(&model_dir)
+                .output()?;
+            if !create_venv.status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "failed to create venv for model '{model_name}': {}",
+                        output_details(&create_venv)
+                    ),
+                )
+                .into());
+            }
         }
 
         let pip_path = venv_pip_path(&venv_dir);
@@ -331,11 +330,11 @@ impl Sonic for SonicService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    prepare_model_envs()?;
+
     let addr = "[::1]:50051".parse()?;
     let health = HealthService;
     let sonic = SonicService;
-
-    prepare_model_envs()?;
 
     Server::builder()
         .add_service(HealthServer::new(health))
