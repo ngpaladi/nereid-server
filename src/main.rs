@@ -1,75 +1,106 @@
+use std::fs;
 use tonic::{transport::Server, Request, Response, Status};
 
-use hello_world::greeter_server::{Greeter, GreeterServer};
-use hello_world::{AddTensorsRequest, AddTensorsResponse, HelloReply, HelloRequest, Tensor};
+use inference::health_server::{Health, HealthServer};
+use inference::sonic_server::{Sonic, SonicServer};
+use inference::{
+    CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse,
+    ViewModelsRequest, ViewModelsResponse,
+};
 
-pub mod hello_world {
-    tonic::include_proto!("helloworld");
+pub mod inference {
+    tonic::include_proto!("inference");
+}
+
+fn get_model_names() -> Result<Vec<String>, Status> {
+    let model_roots = ["ml-backend", "ml-backends"];
+
+    for root in model_roots {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(Status::internal(format!(
+                    "failed to read model directory '{root}': {err}"
+                )))
+            }
+        };
+
+        let mut model_names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                Status::internal(format!("failed to read entry in '{root}': {err}"))
+            })?;
+            let file_type = entry.file_type().map_err(|err| {
+                Status::internal(format!("failed to inspect entry in '{root}': {err}"))
+            })?;
+
+            if file_type.is_dir() {
+                model_names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        model_names.sort();
+        if model_names.is_empty() {
+            return Ok(vec!["No models found".to_string()]);
+        }
+        return Ok(model_names);
+    }
+
+    Ok(vec!["No models found".to_string()])
 }
 
 #[derive(Debug, Default)]
-pub struct MyGreeter {}
+pub struct HealthService;
 
 #[tonic::async_trait]
-impl Greeter for MyGreeter {
-    async fn say_hello(
+impl Health for HealthService {
+    async fn health_check(
         &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<HelloReply>, Status> {
-        println!("Got a request: {:?}", request);
+        _request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        Ok(Response::new(HealthCheckResponse {
+            status: "ok".to_string(),
+        }))
+    }
+}
 
-        let reply = HelloReply {
-            message: format!("Hello {}!", request.into_inner().name),
-        };
+#[derive(Debug, Default)]
+pub struct SonicService;
 
-        Ok(Response::new(reply))
+#[tonic::async_trait]
+impl Sonic for SonicService {
+    type CheckpointStream = tonic::codegen::tokio_stream::wrappers::ReceiverStream<
+        Result<CheckpointResponse, Status>,
+    >;
+
+    async fn view_models(
+        &self,
+        _request: Request<ViewModelsRequest>,
+    ) -> Result<Response<ViewModelsResponse>, Status> {
+        let model_names = get_model_names()?;
+        Ok(Response::new(ViewModelsResponse {
+            model_names,
+        }))
     }
 
-    async fn add_tensors(
+    async fn checkpoint(
         &self,
-        request: Request<AddTensorsRequest>,) -> Result<Response<AddTensorsResponse>, Status> {
-        let AddTensorsRequest { a, b } = request.into_inner();
-
-        let a = a.ok_or_else(|| Status::invalid_argument("missing tensor a"))?;
-        let b = b.ok_or_else(|| Status::invalid_argument("missing tensor b"))?;
-
-        if a.shape != b.shape {
-            return Err(Status::invalid_argument(
-                "tensor shapes must match for addition",
-            ));
-        }
-
-        if a.values.len() != b.values.len() {
-            return Err(Status::invalid_argument(
-                "tensor value lengths must match for addition",
-            ));
-        }
-
-        let result_values = a
-            .values
-            .iter()
-            .zip(&b.values)
-            .map(|(x, y)| x + y)
-            .collect();
-
-        let response = AddTensorsResponse {
-            result: Some(Tensor {
-                values: result_values,
-                shape: a.shape,
-            }),
-        };
-
-        Ok(Response::new(response))
+        _request: Request<CheckpointRequest>,
+    ) -> Result<Response<Self::CheckpointStream>, Status> {
+        Err(Status::unimplemented("Checkpoint is not implemented yet"))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
-    let greeter = MyGreeter::default();
+    let health = HealthService;
+    let sonic = SonicService;
 
     Server::builder()
-        .add_service(GreeterServer::new(greeter))
+        .add_service(HealthServer::new(health))
+        .add_service(SonicServer::new(sonic))
         .serve(addr)
         .await?;
 

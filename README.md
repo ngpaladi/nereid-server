@@ -2,10 +2,11 @@ Goal is to build a simple replacement for nvidia triton server.
 Right now this only contains a simple Rust gRPC server built with `tonic` and `prost`.
 
 ## What it does
-- Exposes `Greeter/SayHello` to return a greeting message.
-- Exposes `Greeter/AddTensors` to add two tensors element-wise.
+- Exposes `Health/HealthCheck` and returns a `HealthCheckResponse` with status `ok`.
+- Exposes `Sonic/ViewModels` and returns a `ViewModelsResponse` with sample model names.
+- Defines `Sonic/Checkpoint` in proto (currently returns `UNIMPLEMENTED` in server code).
 
-Proto definition: `proto/helloworld.proto`.
+Proto definition: `proto/inference.proto`.
 
 ## Installation
 Prerequisites:
@@ -27,4 +28,4 @@ Server starts on `127.0.0.1:50051`
 ## Project structure
 - `src/main.rs`: gRPC service implementation and server bootstrap.
 - `build.rs`: compiles `.proto` files at build time.
-- `proto/helloworld.proto`: service and message definitions.
+- `proto/inference.proto`: service and message definitions.
