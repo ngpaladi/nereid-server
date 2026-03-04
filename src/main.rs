@@ -1,9 +1,9 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tokio::sync::mpsc;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 use inference::health_server::{Health, HealthServer};
 use inference::sonic_server::{Sonic, SonicServer};
@@ -16,6 +16,104 @@ pub mod inference {
     tonic::include_proto!("inference");
 }
 
+fn venv_python_path(venv_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+fn venv_pip_path(venv_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv_dir.join("Scripts").join("pip.exe")
+    } else {
+        venv_dir.join("bin").join("pip")
+    }
+}
+
+fn output_details(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no command output".to_string()
+    }
+}
+
+fn prepare_model_envs() -> Result<(), Box<dyn std::error::Error>> {
+    let models = get_model_names()
+        .map_err(|status| std::io::Error::new(std::io::ErrorKind::Other, status.to_string()))?;
+
+    for model_name in models {
+        let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))?;
+        let requirements = model_dir.join("requirements.txt");
+        if !requirements.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("requirements.txt not found for model '{model_name}'"),
+            )
+            .into());
+        }
+
+        let venv_dir = model_dir.join("venv");
+        if venv_dir.is_dir() {
+            continue;
+        }
+        if venv_dir.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("path exists but is not a directory: {}", venv_dir.display()),
+            )
+            .into());
+        }
+
+        let create_venv = Command::new("python3")
+            .args(["-m", "venv", "venv"])
+            .current_dir(&model_dir)
+            .output()?;
+        if !create_venv.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "failed to create venv for model '{model_name}': {}",
+                    output_details(&create_venv)
+                ),
+            )
+            .into());
+        }
+
+        let pip_path = venv_pip_path(&venv_dir);
+        if !pip_path.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("venv pip not found for model '{model_name}'"),
+            )
+            .into());
+        }
+
+        let install = Command::new(&pip_path)
+            .args(["install", "-r", "requirements.txt"])
+            .current_dir(&model_dir)
+            .output()?;
+        if !install.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "failed to install requirements for model '{model_name}': {}",
+                    output_details(&install)
+                ),
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 fn get_model_names() -> Result<Vec<String>, Status> {
     let entries = match fs::read_dir("ml-backends") {
         Ok(entries) => entries,
@@ -23,7 +121,7 @@ fn get_model_names() -> Result<Vec<String>, Status> {
         Err(err) => {
             return Err(Status::internal(format!(
                 "failed to read model directory 'ml-backends': {err}"
-            )))
+            )));
         }
     };
 
@@ -76,9 +174,7 @@ impl Sonic for SonicService {
             model_names.push("No models found".to_string());
         }
 
-        Ok(Response::new(ViewModelsResponse {
-            model_names,
-        }))
+        Ok(Response::new(ViewModelsResponse { model_names }))
     }
 
     async fn checkpoint(
@@ -109,11 +205,7 @@ impl Sonic for SonicService {
         }
 
         let venv_dir = model_dir.join("venv");
-        let python_path = if cfg!(windows) {
-            venv_dir.join("Scripts").join("python.exe")
-        } else {
-            venv_dir.join("bin").join("python")
-        };
+        let python_path = venv_python_path(&venv_dir);
         if !python_path.is_file() {
             return Err(Status::not_found(format!(
                 "venv python not found for model '{model_name}'"
@@ -132,8 +224,9 @@ impl Sonic for SonicService {
             {
                 Ok(child) => child,
                 Err(err) => {
-                    let _ =
-                        tx.blocking_send(Err(Status::internal(format!("failed to run main.py: {err}"))));
+                    let _ = tx.blocking_send(Err(Status::internal(format!(
+                        "failed to run main.py: {err}"
+                    ))));
                     return;
                 }
             };
@@ -241,6 +334,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
     let health = HealthService;
     let sonic = SonicService;
+
+    prepare_model_envs()?;
 
     Server::builder()
         .add_service(HealthServer::new(health))
