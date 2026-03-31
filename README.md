@@ -1,3 +1,6 @@
+# nereid-server
+A nifty little rust inference server
+
 Goal is to build a simple replacement for an inference server.
 Right now, this project contains a Rust gRPC server built with `tonic`.
 It can handle client requests and spawn a python process to run a sample model accordingly
