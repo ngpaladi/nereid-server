@@ -33,3 +33,8 @@ message CheckpointResponse {
     bool done = 2;
     int32 exit_code = 3;
 }
+
+message ModelInferenceConfig {
+    string model_path = 1;
+    repeated int64 input_shape = 2;
+}
