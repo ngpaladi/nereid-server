@@ -336,6 +336,7 @@ impl Sonic for SonicService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Float just means float32
     let mock_input = Tensor::randn(DEMO_INPUT_SHAPE, (Kind::Float, Device::Cpu));
     let model_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DEMO_MODEL_PATH);
     let model_path = model_path.to_string_lossy().into_owned();
