@@ -1,0 +1,5 @@
+[env]
+# Command Line Tools on Apple Silicon expose libc++ headers in the SDK, while
+# cc-rs may search a non-existent CLT include directory. This keeps torch-sys
+# native builds finding standard C++ headers like <cstddef>.
+CXXFLAGS_aarch64_apple_darwin = "-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
