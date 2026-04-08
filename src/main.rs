@@ -12,7 +12,7 @@ use proto::health_server::{Health, HealthServer};
 use proto::sonic_server::{Sonic, SonicServer};
 use proto::{
     CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse,
-    ViewModelsRequest, ViewModelsResponse,
+    ViewModelsRequest, ViewModelsResponse, checkpoint_request::Payload,
 };
 
 pub mod proto {
@@ -147,6 +147,24 @@ fn get_model_names() -> Result<Vec<String>, Status> {
     Ok(model_names)
 }
 
+fn find_pt_model_file(model_dir: &Path) -> Result<Option<PathBuf>, Status> {
+    let mut pt_files = Vec::new();
+    let entries = fs::read_dir(model_dir)
+        .map_err(|err| Status::internal(format!("failed to read model directory: {err}")))?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| Status::internal(format!("failed to read model entry: {err}")))?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "pt") {
+            pt_files.push(path);
+        }
+    }
+
+    pt_files.sort();
+    Ok(pt_files.into_iter().next())
+}
+
 #[derive(Debug, Default)]
 pub struct HealthService;
 
@@ -184,10 +202,35 @@ impl Sonic for SonicService {
 
     async fn checkpoint(
         &self,
-        request: Request<CheckpointRequest>,
+        request: Request<tonic::Streaming<CheckpointRequest>>,
     ) -> Result<Response<Self::CheckpointStream>, Status> {
-        let request = request.into_inner();
-        let model_name = request.model_name.trim().to_string();
+        let mut stream = request.into_inner();
+        let first_message = stream.message().await.map_err(|err| {
+            Status::internal(format!(
+                "failed to read first checkpoint stream message: {err}"
+            ))
+        })?;
+        let first_message = first_message.ok_or_else(|| {
+            Status::invalid_argument(
+                "checkpoint stream is empty; first message must include metadata",
+            )
+        })?;
+
+        let meta = match first_message.payload {
+            Some(Payload::Meta(meta)) => meta,
+            Some(Payload::Chunk(_)) => {
+                return Err(Status::invalid_argument(
+                    "first checkpoint stream message must be metadata",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "first checkpoint stream message has no payload",
+                ));
+            }
+        };
+
+        let model_name = meta.model_name.trim().to_string();
 
         if model_name.is_empty() {
             return Err(Status::invalid_argument("model_name is required"));
@@ -202,6 +245,137 @@ impl Sonic for SonicService {
 
         let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))
             .map_err(|err| Status::internal(format!("failed to resolve model path: {err}")))?;
+        let pt_file = find_pt_model_file(&model_dir)?;
+        let has_textproto = model_dir.join("model_inference.textproto").is_file();
+
+        if pt_file.is_some() && has_textproto {
+            let pt_file = pt_file.expect("pt file existence already checked");
+            let mut tensor_bytes = Vec::<u8>::new();
+            let mut tensor_shape: Option<Vec<i64>> = None;
+            let mut seen_end_of_tensor = false;
+
+            while let Some(message) = stream.message().await.map_err(|err| {
+                Status::internal(format!("failed reading checkpoint stream message: {err}"))
+            })? {
+                let payload = message.payload.ok_or_else(|| {
+                    Status::invalid_argument("checkpoint stream message has no payload")
+                })?;
+                match payload {
+                    Payload::Meta(_) => {
+                        return Err(Status::invalid_argument(
+                            "metadata can only be sent as the first checkpoint stream message",
+                        ));
+                    }
+                    Payload::Chunk(chunk) => {
+                        if seen_end_of_tensor {
+                            return Err(Status::invalid_argument(
+                                "received tensor chunk after end_of_tensor=true",
+                            ));
+                        }
+
+                        if !chunk.shape.is_empty() {
+                            if let Some(existing) = &tensor_shape {
+                                if existing != &chunk.shape {
+                                    return Err(Status::invalid_argument(
+                                        "tensor chunk shape mismatch across stream",
+                                    ));
+                                }
+                            } else {
+                                tensor_shape = Some(chunk.shape);
+                            }
+                        }
+
+                        tensor_bytes.extend_from_slice(&chunk.data);
+                        if chunk.end_of_tensor {
+                            seen_end_of_tensor = true;
+                        }
+                    }
+                }
+            }
+
+            if tensor_bytes.is_empty() {
+                return Err(Status::invalid_argument(
+                    "no tensor chunk data provided for Rust inference model",
+                ));
+            }
+
+            if tensor_bytes.len() % 4 != 0 {
+                return Err(Status::invalid_argument(
+                    "tensor chunk bytes must be a multiple of 4 for float32",
+                ));
+            }
+
+            let values: Vec<f32> = tensor_bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            let inferred_shape = vec![
+                i64::try_from(values.len())
+                    .map_err(|_| Status::invalid_argument("tensor is too large"))?,
+            ];
+            let shape = tensor_shape.unwrap_or(inferred_shape);
+
+            if shape.iter().any(|d| *d <= 0) {
+                return Err(Status::invalid_argument(
+                    "tensor shape dimensions must all be positive",
+                ));
+            }
+            let expected_numel = shape
+                .iter()
+                .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
+                .ok_or_else(|| Status::invalid_argument("tensor shape overflow"))?;
+            if expected_numel != i64::try_from(values.len()).unwrap_or(-1) {
+                return Err(Status::invalid_argument(
+                    "tensor shape does not match tensor byte payload length",
+                ));
+            }
+
+            let tensor = Tensor::f_from_slice(&values)
+                .and_then(|t| t.f_reshape(shape.as_slice()))
+                .map_err(|err| {
+                    Status::invalid_argument(format!(
+                        "failed to build input tensor from stream chunks: {err}"
+                    ))
+                })?;
+
+            let model_path = pt_file.to_string_lossy().into_owned();
+            inference::run_forward_pass(&model_path, &tensor)
+                .map_err(|err| Status::internal(format!("Rust inference failed: {err}")))?;
+
+            let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(4);
+            let _ = tx
+                .send(Ok(CheckpointResponse {
+                    chunk: format!("Rust inference completed for model '{model_name}'"),
+                    done: false,
+                    exit_code: 0,
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(CheckpointResponse {
+                    chunk: String::new(),
+                    done: true,
+                    exit_code: 0,
+                }))
+                .await;
+            drop(tx);
+
+            return Ok(Response::new(
+                tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
+            ));
+        }
+
+        if pt_file.is_some() && !has_textproto {
+            return Err(Status::failed_precondition(format!(
+                "model '{model_name}' has a .pt file but is missing model_inference.textproto"
+            )));
+        }
+        if pt_file.is_none() && has_textproto {
+            return Err(Status::failed_precondition(format!(
+                "model '{model_name}' has model_inference.textproto but no .pt file"
+            )));
+        }
+
         let main_py = model_dir.join("main.py");
         if !main_py.is_file() {
             return Err(Status::not_found(format!(
