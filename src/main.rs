@@ -10,7 +10,7 @@ mod inference;
 
 use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
-    CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse,
+    CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse, TensorChunk,
     ViewModelsRequest, ViewModelsResponse, checkpoint_request::Payload,
 };
 
@@ -262,7 +262,7 @@ fn run_rust_inference(
     model_dir: &Path,
     pt_file: &Path,
     tensor_bytes: &[u8],
-) -> Result<(), Status> {
+) -> Result<(Vec<i64>, Vec<u8>), Status> {
     if tensor_bytes.is_empty() {
         return Err(Status::invalid_argument(
             "no tensor chunk data provided for Rust inference model",
@@ -302,8 +302,7 @@ fn run_rust_inference(
 
     let model_path = pt_file.to_string_lossy().into_owned();
     inference::run_forward_pass(&model_path, &tensor)
-        .map_err(|err| Status::internal(format!("Rust inference failed: {err}")))?;
-    Ok(())
+        .map_err(|err| Status::internal(format!("Rust inference failed: {err}")))
 }
 
 #[derive(Debug, Default)]
@@ -424,21 +423,63 @@ impl Nereid for NereidService {
                 }
             }
 
-            run_rust_inference(&model_name, &model_dir, &pt_file, &tensor_bytes)?;
+            let (output_shape, output_bytes) =
+                run_rust_inference(&model_name, &model_dir, &pt_file, &tensor_bytes)?;
 
-            let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(4);
+            const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+            let num_chunks = (output_bytes.len() + OUTPUT_CHUNK_BYTES - 1) / OUTPUT_CHUNK_BYTES;
+            let response_capacity = usize::max(2, num_chunks + 2);
+            let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(response_capacity);
             let _ = tx
                 .send(Ok(CheckpointResponse {
                     chunk: format!("Rust inference completed for model '{model_name}'"),
                     done: false,
                     exit_code: 0,
+                    output_chunk: None,
                 }))
                 .await;
+
+            if output_bytes.is_empty() {
+                let _ = tx
+                    .send(Ok(CheckpointResponse {
+                        chunk: String::new(),
+                        done: false,
+                        exit_code: 0,
+                        output_chunk: Some(TensorChunk {
+                            tensor_name: "output".to_string(),
+                            shape: output_shape.clone(),
+                            data: Vec::new(),
+                            chunk_index: 0,
+                            end_of_tensor: true,
+                        }),
+                    }))
+                    .await;
+            } else {
+                for (chunk_index, data_chunk) in output_bytes.chunks(OUTPUT_CHUNK_BYTES).enumerate()
+                {
+                    let _ = tx
+                        .send(Ok(CheckpointResponse {
+                            chunk: String::new(),
+                            done: false,
+                            exit_code: 0,
+                            output_chunk: Some(TensorChunk {
+                                tensor_name: "output".to_string(),
+                                shape: output_shape.clone(),
+                                data: data_chunk.to_vec(),
+                                chunk_index: chunk_index as u64,
+                                end_of_tensor: chunk_index + 1 == num_chunks,
+                            }),
+                        }))
+                        .await;
+                }
+            }
+
             let _ = tx
                 .send(Ok(CheckpointResponse {
                     chunk: String::new(),
                     done: true,
                     exit_code: 0,
+                    output_chunk: None,
                 }))
                 .await;
             drop(tx);
@@ -523,6 +564,7 @@ impl Nereid for NereidService {
                                     chunk: line,
                                     done: false,
                                     exit_code: 0,
+                                    output_chunk: None,
                                 }))
                                 .is_err()
                             {
@@ -550,6 +592,7 @@ impl Nereid for NereidService {
                                     chunk: format!("stderr: {line}"),
                                     done: false,
                                     exit_code: 0,
+                                    output_chunk: None,
                                 }))
                                 .is_err()
                             {
@@ -582,6 +625,7 @@ impl Nereid for NereidService {
                 chunk: String::new(),
                 done: true,
                 exit_code: status.code().unwrap_or(-1),
+                output_chunk: None,
             }));
         });
 

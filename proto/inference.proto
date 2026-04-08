@@ -43,6 +43,7 @@ message CheckpointResponse {
     string chunk = 1;
     bool done = 2;
     int32 exit_code = 3;
+    TensorChunk output_chunk = 4;
 }
 
 message ModelInferenceConfig {

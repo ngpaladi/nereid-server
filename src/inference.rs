@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::io;
 
 use tch::{CModule, Device, IValue, Kind, Tensor};
 
@@ -15,7 +16,10 @@ fn tensor_to_full_string(tensor: &Tensor) -> String {
     }
 }
 
-pub fn run_forward_pass(model_path: &str, input_tensor: &Tensor) -> Result<(), Box<dyn Error>> {
+pub fn run_forward_pass(
+    model_path: &str,
+    input_tensor: &Tensor,
+) -> Result<(Vec<i64>, Vec<u8>), Box<dyn Error>> {
     let device = Device::Cpu;
     let model = CModule::load_on_device(model_path, device)?;
 
@@ -31,12 +35,25 @@ pub fn run_forward_pass(model_path: &str, input_tensor: &Tensor) -> Result<(), B
 
     match output {
         IValue::Tensor(tensor) => {
-            println!("Model output full: {}", tensor_to_full_string(&tensor));
-        }
-        other => {
-            println!("Model output (non-tensor): {other:?}");
-        }
-    }
+            let output_tensor = tensor.to_device(Device::Cpu).to_kind(Kind::Float);
+            println!(
+                "Model output full: {}",
+                tensor_to_full_string(&output_tensor)
+            );
 
-    Ok(())
+            let shape = output_tensor.size();
+            let flat = output_tensor.reshape([-1]);
+            let values = Vec::<f32>::try_from(&flat)?;
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok((shape, bytes))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("model output was non-tensor: {other:?}"),
+        )
+        .into()),
+    }
 }
