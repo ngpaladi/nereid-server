@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tch::{Device, Kind, Tensor};
+use tch::Tensor;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, transport::Server};
 
@@ -18,9 +18,6 @@ use proto::{
 pub mod proto {
     tonic::include_proto!("inference");
 }
-
-const DEMO_MODEL_PATH: &str = "ml-backends/model3/mlp.pt";
-const DEMO_INPUT_SHAPE: [i64; 2] = [1, 16];
 
 fn venv_python_path(venv_dir: &Path) -> PathBuf {
     if cfg!(windows) {
@@ -560,25 +557,16 @@ impl Sonic for SonicService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Float just means float32
-    let mock_input = Tensor::randn(DEMO_INPUT_SHAPE, (Kind::Float, Device::Cpu));
-    let model_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DEMO_MODEL_PATH);
-    let model_path = model_path.to_string_lossy().into_owned();
-    inference::run_forward_pass(&model_path, &mock_input)?;
+    let addr = "[::1]:50051".parse()?;
+    let health = HealthService;
+    let sonic = SonicService;
+    println!("gRPC server listening on {}", addr);
 
-    // println!("Preparing model environments...");
-    // prepare_model_envs()?;
-    // println!("Model environments ready. Starting gRPC server...");
-    // let addr = "[::1]:50051".parse()?;
-    // let health = HealthService;
-    // let sonic = SonicService;
-    // println!("gRPC server listening on {}", addr);
-
-    // Server::builder()
-    //     .add_service(HealthServer::new(health))
-    //     .add_service(SonicServer::new(sonic))
-    //     .serve(addr)
-    //     .await?;
+    Server::builder()
+        .add_service(HealthServer::new(health))
+        .add_service(SonicServer::new(sonic))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }
