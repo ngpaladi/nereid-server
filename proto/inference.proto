@@ -46,6 +46,5 @@ message CheckpointResponse {
 }
 
 message ModelInferenceConfig {
-    string model_path = 1;
-    repeated int64 input_shape = 2;
+    repeated int64 input_shape = 1;
 }

@@ -17,11 +17,22 @@ It can handle client requests and spawn a python process to run a sample model a
 Each model must be a folder under `ml-backends/<model_name>/` with:
 - `requirements.txt`
 - `main.py`
+- `model_inference.textproto` (for Rust `.pt` inference models)
 
 On server startup:
 - If `venv/` exists for a model, it is reused.
 - If `venv/` is missing, server creates it and installs from `requirements.txt`.
 - If `requirements.txt` is missing, startup fails with an error.
+
+`model_inference.textproto` shape examples:
+```text
+input_shape: [1, 16]
+# also supported:
+# input_shape: 1
+# input_shape: 16
+# input_shape: "1,16"
+# input_shape: "1x16"
+```
 
 ## Server installation
 Prerequisites:

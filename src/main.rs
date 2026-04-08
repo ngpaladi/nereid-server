@@ -170,6 +170,65 @@ fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Status>
         ))
     })?;
 
+    fn parse_shape_dims(
+        raw_value: &str,
+        raw_line: &str,
+        config_path: &Path,
+    ) -> Result<Vec<i64>, Status> {
+        let trimmed = raw_value.trim().trim_matches('"').trim();
+        let inner = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(trimmed)
+            .trim();
+
+        let dims_str: Vec<&str> = if inner.contains(',') {
+            inner
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else if inner.contains('x') || inner.contains('X') {
+            inner
+                .split(|c| c == 'x' || c == 'X')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else if inner.split_whitespace().count() > 1 {
+            inner.split_whitespace().collect()
+        } else if inner.is_empty() {
+            Vec::new()
+        } else {
+            vec![inner]
+        };
+
+        if dims_str.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "invalid input_shape in {}: '{raw_line}'. expected positive dimensions such as `input_shape: [1, 16]`",
+                config_path.to_string_lossy()
+            )));
+        }
+
+        let mut dims = Vec::with_capacity(dims_str.len());
+        for dim_str in dims_str {
+            let dim = dim_str.parse::<i64>().map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed parsing input_shape dimension '{dim_str}' in {}: {err}",
+                    config_path.to_string_lossy()
+                ))
+            })?;
+            if dim <= 0 {
+                return Err(Status::failed_precondition(format!(
+                    "input_shape dimensions in {} must be positive",
+                    config_path.to_string_lossy()
+                )));
+            }
+            dims.push(dim);
+        }
+
+        Ok(dims)
+    }
+
     let mut shape = Vec::new();
     for raw_line in contents.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -184,24 +243,8 @@ fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Status>
             ))
         })?;
 
-        let dim = raw_value
-            .trim()
-            .trim_matches('"')
-            .parse::<i64>()
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed parsing input_shape in {}: {err}",
-                    config_path.to_string_lossy()
-                ))
-            })?;
-
-        if dim <= 0 {
-            return Err(Status::failed_precondition(format!(
-                "input_shape dimensions in {} must be positive",
-                config_path.to_string_lossy()
-            )));
-        }
-        shape.push(dim);
+        let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
+        shape.extend(dims);
     }
 
     if shape.is_empty() {
