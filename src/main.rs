@@ -165,6 +165,108 @@ fn find_pt_model_file(model_dir: &Path) -> Result<Option<PathBuf>, Status> {
     Ok(pt_files.into_iter().next())
 }
 
+fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Status> {
+    let config_path = model_dir.join("model_inference.textproto");
+    let contents = fs::read_to_string(&config_path).map_err(|err| {
+        Status::internal(format!(
+            "failed to read {}: {err}",
+            config_path.to_string_lossy()
+        ))
+    })?;
+
+    let mut shape = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() || !line.starts_with("input_shape") {
+            continue;
+        }
+
+        let (_, raw_value) = line.split_once(':').ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "invalid input_shape line in {}: '{raw_line}'",
+                config_path.to_string_lossy()
+            ))
+        })?;
+
+        let dim = raw_value
+            .trim()
+            .trim_matches('"')
+            .parse::<i64>()
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed parsing input_shape in {}: {err}",
+                    config_path.to_string_lossy()
+                ))
+            })?;
+
+        if dim <= 0 {
+            return Err(Status::failed_precondition(format!(
+                "input_shape dimensions in {} must be positive",
+                config_path.to_string_lossy()
+            )));
+        }
+        shape.push(dim);
+    }
+
+    if shape.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "{} must contain at least one input_shape field",
+            config_path.to_string_lossy()
+        )));
+    }
+
+    Ok(shape)
+}
+
+fn run_rust_inference(
+    model_name: &str,
+    model_dir: &Path,
+    pt_file: &Path,
+    tensor_bytes: &[u8],
+) -> Result<(), Status> {
+    if tensor_bytes.is_empty() {
+        return Err(Status::invalid_argument(
+            "no tensor chunk data provided for Rust inference model",
+        ));
+    }
+    if tensor_bytes.len() % 4 != 0 {
+        return Err(Status::invalid_argument(
+            "tensor chunk bytes must be a multiple of 4 for float32",
+        ));
+    }
+
+    let shape = read_input_shape_from_textproto(model_dir)?;
+    let values: Vec<f32> = tensor_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    let expected_numel = shape
+        .iter()
+        .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| Status::invalid_argument("tensor shape overflow"))?;
+
+    if expected_numel != i64::try_from(values.len()).unwrap_or(-1) {
+        return Err(Status::invalid_argument(format!(
+            "input tensor size mismatch for model '{model_name}': expected {expected_numel} values from model_inference.textproto, got {}",
+            values.len()
+        )));
+    }
+
+    let tensor = Tensor::f_from_slice(&values)
+        .and_then(|t| t.f_reshape(shape.as_slice()))
+        .map_err(|err| {
+            Status::invalid_argument(format!(
+                "failed to build input tensor from stream chunks: {err}"
+            ))
+        })?;
+
+    let model_path = pt_file.to_string_lossy().into_owned();
+    inference::run_forward_pass(&model_path, &tensor)
+        .map_err(|err| Status::internal(format!("Rust inference failed: {err}")))?;
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct HealthService;
 
@@ -251,8 +353,8 @@ impl Sonic for SonicService {
         if pt_file.is_some() && has_textproto {
             let pt_file = pt_file.expect("pt file existence already checked");
             let mut tensor_bytes = Vec::<u8>::new();
-            let mut tensor_shape: Option<Vec<i64>> = None;
             let mut seen_end_of_tensor = false;
+            let expected_shape = read_input_shape_from_textproto(&model_dir)?;
 
             while let Some(message) = stream.message().await.map_err(|err| {
                 Status::internal(format!("failed reading checkpoint stream message: {err}"))
@@ -274,14 +376,10 @@ impl Sonic for SonicService {
                         }
 
                         if !chunk.shape.is_empty() {
-                            if let Some(existing) = &tensor_shape {
-                                if existing != &chunk.shape {
-                                    return Err(Status::invalid_argument(
-                                        "tensor chunk shape mismatch across stream",
-                                    ));
-                                }
-                            } else {
-                                tensor_shape = Some(chunk.shape);
+                            if chunk.shape != expected_shape {
+                                return Err(Status::invalid_argument(
+                                    "tensor chunk shape does not match model_inference.textproto",
+                                ));
                             }
                         }
 
@@ -293,55 +391,7 @@ impl Sonic for SonicService {
                 }
             }
 
-            if tensor_bytes.is_empty() {
-                return Err(Status::invalid_argument(
-                    "no tensor chunk data provided for Rust inference model",
-                ));
-            }
-
-            if tensor_bytes.len() % 4 != 0 {
-                return Err(Status::invalid_argument(
-                    "tensor chunk bytes must be a multiple of 4 for float32",
-                ));
-            }
-
-            let values: Vec<f32> = tensor_bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-
-            let inferred_shape = vec![
-                i64::try_from(values.len())
-                    .map_err(|_| Status::invalid_argument("tensor is too large"))?,
-            ];
-            let shape = tensor_shape.unwrap_or(inferred_shape);
-
-            if shape.iter().any(|d| *d <= 0) {
-                return Err(Status::invalid_argument(
-                    "tensor shape dimensions must all be positive",
-                ));
-            }
-            let expected_numel = shape
-                .iter()
-                .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
-                .ok_or_else(|| Status::invalid_argument("tensor shape overflow"))?;
-            if expected_numel != i64::try_from(values.len()).unwrap_or(-1) {
-                return Err(Status::invalid_argument(
-                    "tensor shape does not match tensor byte payload length",
-                ));
-            }
-
-            let tensor = Tensor::f_from_slice(&values)
-                .and_then(|t| t.f_reshape(shape.as_slice()))
-                .map_err(|err| {
-                    Status::invalid_argument(format!(
-                        "failed to build input tensor from stream chunks: {err}"
-                    ))
-                })?;
-
-            let model_path = pt_file.to_string_lossy().into_owned();
-            inference::run_forward_pass(&model_path, &tensor)
-                .map_err(|err| Status::internal(format!("Rust inference failed: {err}")))?;
+            run_rust_inference(&model_name, &model_dir, &pt_file, &tensor_bytes)?;
 
             let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(4);
             let _ = tx
