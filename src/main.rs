@@ -8,8 +8,7 @@ use tonic::{Request, Response, Status, transport::Server};
 
 mod inference;
 
-use proto::health_server::{Health, HealthServer};
-use proto::sonic_server::{Sonic, SonicServer};
+use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
     CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse,
     ViewModelsRequest, ViewModelsResponse, checkpoint_request::Payload,
@@ -265,10 +264,13 @@ fn run_rust_inference(
 }
 
 #[derive(Debug, Default)]
-pub struct HealthService;
+pub struct NereidService;
 
 #[tonic::async_trait]
-impl Health for HealthService {
+impl Nereid for NereidService {
+    type CheckpointStream =
+        tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
+
     async fn health_check(
         &self,
         _request: Request<HealthCheckRequest>,
@@ -277,15 +279,6 @@ impl Health for HealthService {
             status: "ok".to_string(),
         }))
     }
-}
-
-#[derive(Debug, Default)]
-pub struct SonicService;
-
-#[tonic::async_trait]
-impl Sonic for SonicService {
-    type CheckpointStream =
-        tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
     async fn view_models(
         &self,
@@ -558,13 +551,11 @@ impl Sonic for SonicService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
-    let health = HealthService;
-    let sonic = SonicService;
+    let nereid = NereidService;
     println!("gRPC server listening on {}", addr);
 
     Server::builder()
-        .add_service(HealthServer::new(health))
-        .add_service(SonicServer::new(sonic))
+        .add_service(NereidServer::new(nereid))
         .serve(addr)
         .await?;
 

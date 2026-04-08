@@ -9,9 +9,9 @@ It can handle client requests and spawn a python process to run a sample model a
 - `proto/inference.proto`
 
 ## Server behavior
-- `Health/HealthCheck` returns status `ok`.
-- `Sonic/ViewModels` returns folder names under `ml-backends` (or `["No models found"]` when empty).
-- `Sonic/Checkpoint` runs `<model>/main.py` using that model's existing `venv` Python and streams output chunks.
+- `Nereid/HealthCheck` returns status `ok`.
+- `Nereid/ViewModels` returns folder names under `ml-backends` (or `["No models found"]` when empty).
+- `Nereid/Checkpoint` runs `<model>/main.py` using that model's existing `venv` Python and streams output chunks.
 
 ## Model folder contract
 Each model must be a folder under `ml-backends/<model_name>/` with:
@@ -47,12 +47,12 @@ See the official [`grpcurl` installation guide](https://github.com/fullstorydev/
 ## Client usage
 Health check:
 ```bash
-grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Health/HealthCheck
+grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Nereid/HealthCheck
 ```
 
 View models:
 ```bash
-grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Sonic/ViewModels
+grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Nereid/ViewModels
 ```
 
 Checkpoint (streaming):
@@ -67,7 +67,7 @@ grpcurl -plaintext \
         "output_file": "out.txt"
       }' \
   '[::1]:50051' \
-  inference.Sonic/Checkpoint
+  inference.Nereid/Checkpoint
 ```
 
 ## Project structure
