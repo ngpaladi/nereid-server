@@ -57,3 +57,40 @@ pub fn run_forward_pass(
         .into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::run_forward_pass;
+    use std::path::PathBuf;
+    use tch::{Device, Tensor};
+
+    #[test]
+    fn run_forward_pass_is_deterministic_for_fixed_input() {
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("ml-backends")
+            .join("model3")
+            .join("mlp.pt");
+
+        assert!(
+            model_path.is_file(),
+            "expected test model to exist at {}",
+            model_path.display()
+        );
+
+        let input_values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let input_tensor = Tensor::from_slice(&input_values)
+            .reshape([1, 16])
+            .to_device(Device::Cpu);
+
+        let model_path_str = model_path.to_str().expect("valid UTF-8 model path");
+        let (baseline_shape, baseline_bytes) =
+            run_forward_pass(model_path_str, &input_tensor).expect("initial forward pass succeeds");
+
+        for i in 0..1000 {
+            let (shape, bytes) = run_forward_pass(model_path_str, &input_tensor)
+                .unwrap_or_else(|err| panic!("forward pass {i} failed: {err}"));
+            assert_eq!(shape, baseline_shape, "shape changed at iteration {i}");
+            assert_eq!(bytes, baseline_bytes, "output bytes changed at iteration {i}");
+        }
+    }
+}
