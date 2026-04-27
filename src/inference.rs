@@ -90,7 +90,10 @@ mod tests {
             let (shape, bytes) = run_forward_pass(model_path_str, &input_tensor)
                 .unwrap_or_else(|err| panic!("forward pass {i} failed: {err}"));
             assert_eq!(shape, baseline_shape, "shape changed at iteration {i}");
-            assert_eq!(bytes, baseline_bytes, "output bytes changed at iteration {i}");
+            assert_eq!(
+                bytes, baseline_bytes,
+                "output bytes changed at iteration {i}"
+            );
         }
     }
 }
