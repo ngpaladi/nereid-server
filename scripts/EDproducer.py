@@ -4,7 +4,6 @@
 import math
 import random
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import List, Sequence
@@ -13,7 +12,6 @@ from typing import List, Sequence
 ITERATIONS = 1
 PRODUCER_ID = "edproducer-1"
 SHAPE = "1,16"
-VALUES = ""
 RANDOM_MIN = 0.0
 RANDOM_MAX = 1.0
 RANDOM_PRECISION = 6
@@ -24,7 +22,6 @@ HOST = "[::1]"
 PORT = 50051
 MODEL = "model3"
 CHUNK_BYTES = 64 * 1024
-PYTHON_BIN = sys.executable
 CLIENT_PATH = ""
 
 
@@ -36,13 +33,6 @@ def parse_shape(raw: str) -> List[int]:
     if any(d <= 0 for d in dims):
         raise ValueError("all shape dimensions must be positive")
     return dims
-
-
-def parse_values(raw: str) -> List[float]:
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        raise ValueError("values cannot be empty")
-    return [float(p) for p in parts]
 
 
 def build_random_values(count: int, lo: float, hi: float, precision: int) -> List[float]:
@@ -75,22 +65,12 @@ def run_producer() -> int:
     if not client_path.exists():
         raise FileNotFoundError(f"client script not found at {client_path}")
 
-    fixed_values: List[float] = []
-    if VALUES.strip():
-        fixed_values = parse_values(VALUES)
-        if len(fixed_values) != expected:
-            raise ValueError(
-                f"VALUES count mismatch: shape {shape} expects {expected}, got {len(fixed_values)}"
-            )
-
     for i in range(ITERATIONS):
         iteration = i + 1
-        values = fixed_values or build_random_values(
-            expected, RANDOM_MIN, RANDOM_MAX, RANDOM_PRECISION
-        )
+        values = build_random_values(expected, RANDOM_MIN, RANDOM_MAX, RANDOM_PRECISION)
 
         cmd = [
-            PYTHON_BIN,
+            "python3",
             str(client_path),
             "--host",
             HOST,
