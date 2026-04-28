@@ -1,3 +1,8 @@
+// Parses and validates the server YAML configuration.
+// Defines server/model config types, maps configured devices to `tch::Device`,
+// and enforces basic checks (required fields, non-empty names, unique model names,
+// and positive queue capacity).
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
