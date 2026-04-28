@@ -10,16 +10,20 @@ It can handle client requests and spawn a python process to run a sample model a
 
 ## Server behavior
 - `Nereid/HealthCheck` returns status `ok`.
-- `Nereid/ViewModels` returns folder names under `ml-backends` (or `["No models found"]` when empty).
-- `Nereid/Checkpoint` runs `<model>/main.py` using that model's existing `venv` Python and streams output chunks.
+- `Nereid/ViewModels` returns model names configured in `nereid.yaml`.
+- `Nereid/Checkpoint` only accepts `model_name` values configured in `nereid.yaml`, runs Rust inference for that model, and streams output chunks.
+
+Note: Functionality for models containing main.py is temporarily disabled right now.
 
 ## Model folder contract
 Each model must be a folder under `ml-backends/<model_name>/` with:
 - `requirements.txt`
 - `main.py`
+OR
 - `model_inference.textproto` (for Rust `.pt` inference models)
+- `.pt` model
 
-On server startup:
+On server startup (if using main.py):
 - If `venv/` exists for a model, it is reused.
 - If `venv/` is missing, server creates it and installs from `requirements.txt`.
 - If `requirements.txt` is missing, startup fails with an error.
@@ -32,6 +36,27 @@ input_shape: [1, 16]
 # input_shape: 16
 # input_shape: "1,16"
 # input_shape: "1x16"
+```
+
+## `nereid.yaml` configuration (required)
+`nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).
+If this file is missing or invalid, the server does not start.
+
+It is required because the server uses it to:
+- decide which models are exposed via gRPC (`ViewModels` and `Checkpoint`)
+- choose execution device per model (`cpu` or `cuda`)
+- size each model request queue (`queue_capacity`)
+- choose the server bind address (`server.bind_addr`)
+
+Example:
+```yaml
+server:
+  bind_addr: "[::1]:50051"
+
+models:
+  - name: "model3"
+    device: "cuda"      # "cpu" or "cuda"
+    queue_capacity: 16  # must be > 0
 ```
 
 ## Server installation
@@ -49,7 +74,34 @@ Run:
 cargo run
 ```
 
-Server listens on `[::1]:50051`.
+Server binds to `server.bind_addr` from `nereid.yaml` (default example: `[::1]:50051`).
+
+## Dummy ED producers
+Dummy ED producers act as test clients for the server. They create random input tensors and call `python-client/client.py` repeatedly.
+
+Files:
+- `scripts/spawn_edproducers.py`: can spawn one or multiple producer processes
+
+Run from repository root:
+```bash
+python3 scripts/spawn_edproducers.py
+```
+
+Producer config is currently set by constants in `scripts/spawn_edproducers.py`:
+- `PRODUCERS`: number of parallel producer processes
+- `ITERATIONS_PER_PRODUCER`: number of requests (tensors) each producer sends
+- `MODEL`: target `model_name` sent to server (must exist in `nereid.yaml`)
+- `HOST`/`PORT`: server address
+
+Iterations:
+- one iteration = one generated tensor + one `Checkpoint` request
+- total requests sent = `PRODUCERS * ITERATIONS_PER_PRODUCER`
+- example: `PRODUCERS=4` and `ITERATIONS_PER_PRODUCER=25` sends 100 requests in total
+
+Producer role:
+- simulate concurrent clients
+- verify routing to a configured model
+- stress queueing/backpressure behavior using `queue_capacity`
 
 ## Client installation (`grpcurl`)
 
