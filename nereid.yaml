@@ -1,0 +1,15 @@
+server:
+  bind_addr: "[::1]:50051"
+
+models:
+  - name: "model4"
+    device: "cuda"
+    queue_capacity: 16
+
+  - name: "model5"
+    device: "cpu"
+    queue_capacity: 16
+
+  - name: "model3"
+    device: "cuda"
+    queue_capacity: 16

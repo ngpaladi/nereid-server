@@ -23,6 +23,7 @@ target
 
 # Ignore all ml-backends/folder-name/venv folders
 ml-backends/*/venv
+ml-backends/*
 
 # Generated Python gRPC stubs for local client
 python-client/_generated/

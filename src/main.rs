@@ -1,12 +1,15 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use tch::Tensor;
+use std::path::Path;
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, transport::Server};
 
+mod config;
 mod inference;
-mod python_backend;
+mod model_runtime;
 
+use config::load_server_config;
+use model_runtime::{ModelManager, tensor_from_input_bytes};
 use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
     CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse, TensorChunk,
@@ -17,203 +20,92 @@ pub mod proto {
     tonic::include_proto!("inference");
 }
 
-pub(crate) fn get_model_names() -> Result<Vec<String>, Status> {
-    let entries = match fs::read_dir("ml-backends") {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(Status::internal(format!(
-                "failed to read model directory 'ml-backends': {err}"
-            )));
-        }
-    };
+type CheckpointStream =
+    tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
-    let mut model_names = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| Status::internal(format!("failed to read model entry: {err}")))?;
-        let file_type = entry.file_type().map_err(|err| {
-            Status::internal(format!("failed to inspect model entry type: {err}"))
-        })?;
-
-        if file_type.is_dir() {
-            model_names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-
-    model_names.sort();
-    Ok(model_names)
-}
-
-fn find_pt_model_file(model_dir: &Path) -> Result<Option<PathBuf>, Status> {
-    let mut pt_files = Vec::new();
-    let entries = fs::read_dir(model_dir)
-        .map_err(|err| Status::internal(format!("failed to read model directory: {err}")))?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| Status::internal(format!("failed to read model entry: {err}")))?;
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "pt") {
-            pt_files.push(path);
-        }
-    }
-
-    pt_files.sort();
-    Ok(pt_files.into_iter().next())
-}
-
-fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Status> {
-    let config_path = model_dir.join("model_inference.textproto");
-    let contents = fs::read_to_string(&config_path).map_err(|err| {
-        Status::internal(format!(
-            "failed to read {}: {err}",
-            config_path.to_string_lossy()
-        ))
-    })?;
-
-    fn parse_shape_dims(
-        raw_value: &str,
-        raw_line: &str,
-        config_path: &Path,
-    ) -> Result<Vec<i64>, Status> {
-        let trimmed = raw_value.trim().trim_matches('"').trim();
-        let inner = trimmed
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(trimmed)
-            .trim();
-
-        let dims_str: Vec<&str> = if inner.contains(',') {
-            inner
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else if inner.contains('x') || inner.contains('X') {
-            inner
-                .split(|c| c == 'x' || c == 'X')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else if inner.split_whitespace().count() > 1 {
-            inner.split_whitespace().collect()
-        } else if inner.is_empty() {
-            Vec::new()
-        } else {
-            vec![inner]
-        };
-
-        if dims_str.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "invalid input_shape in {}: '{raw_line}'. expected positive dimensions such as `input_shape: [1, 16]`",
-                config_path.to_string_lossy()
-            )));
-        }
-
-        let mut dims = Vec::with_capacity(dims_str.len());
-        for dim_str in dims_str {
-            let dim = dim_str.parse::<i64>().map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed parsing input_shape dimension '{dim_str}' in {}: {err}",
-                    config_path.to_string_lossy()
-                ))
-            })?;
-            if dim <= 0 {
-                return Err(Status::failed_precondition(format!(
-                    "input_shape dimensions in {} must be positive",
-                    config_path.to_string_lossy()
-                )));
-            }
-            dims.push(dim);
-        }
-
-        Ok(dims)
-    }
-
-    let mut shape = Vec::new();
-    for raw_line in contents.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || !line.starts_with("input_shape") {
-            continue;
-        }
-
-        let (_, raw_value) = line.split_once(':').ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "invalid input_shape line in {}: '{raw_line}'",
-                config_path.to_string_lossy()
-            ))
-        })?;
-
-        let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
-        shape.extend(dims);
-    }
-
-    if shape.is_empty() {
-        return Err(Status::failed_precondition(format!(
-            "{} must contain at least one input_shape field",
-            config_path.to_string_lossy()
-        )));
-    }
-
-    Ok(shape)
-}
-
-fn run_rust_inference(
+fn output_to_stream(
     model_name: &str,
-    model_dir: &Path,
-    pt_file: &Path,
-    tensor_bytes: &[u8],
-) -> Result<(Vec<i64>, Vec<u8>), Status> {
-    if tensor_bytes.is_empty() {
-        return Err(Status::invalid_argument(
-            "no tensor chunk data provided for Rust inference model",
-        ));
-    }
-    if tensor_bytes.len() % 4 != 0 {
-        return Err(Status::invalid_argument(
-            "tensor chunk bytes must be a multiple of 4 for float32",
-        ));
-    }
+    output_shape: Vec<i64>,
+    output_bytes: Vec<u8>,
+) -> CheckpointStream {
+    const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
-    let shape = read_input_shape_from_textproto(model_dir)?;
-    let values: Vec<f32> = tensor_bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    let num_chunks = output_bytes.len().div_ceil(OUTPUT_CHUNK_BYTES);
+    let response_capacity = usize::max(2, num_chunks + 2);
+    let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(response_capacity);
 
-    let expected_numel = shape
-        .iter()
-        .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
-        .ok_or_else(|| Status::invalid_argument("tensor shape overflow"))?;
+    let model_name = model_name.to_string();
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(CheckpointResponse {
+                chunk: format!("Rust inference completed for model '{model_name}'"),
+                done: false,
+                exit_code: 0,
+                output_chunk: None,
+            }))
+            .await;
 
-    if expected_numel != i64::try_from(values.len()).unwrap_or(-1) {
-        return Err(Status::invalid_argument(format!(
-            "input tensor size mismatch for model '{model_name}': expected {expected_numel} values from model_inference.textproto, got {}",
-            values.len()
-        )));
-    }
+        if output_bytes.is_empty() {
+            let _ = tx
+                .send(Ok(CheckpointResponse {
+                    chunk: String::new(),
+                    done: false,
+                    exit_code: 0,
+                    output_chunk: Some(TensorChunk {
+                        tensor_name: "output".to_string(),
+                        shape: output_shape.clone(),
+                        data: Vec::new(),
+                        chunk_index: 0,
+                        end_of_tensor: true,
+                    }),
+                }))
+                .await;
+        } else {
+            for (chunk_index, data_chunk) in output_bytes.chunks(OUTPUT_CHUNK_BYTES).enumerate() {
+                let _ = tx
+                    .send(Ok(CheckpointResponse {
+                        chunk: String::new(),
+                        done: false,
+                        exit_code: 0,
+                        output_chunk: Some(TensorChunk {
+                            tensor_name: "output".to_string(),
+                            shape: output_shape.clone(),
+                            data: data_chunk.to_vec(),
+                            chunk_index: chunk_index as u64,
+                            end_of_tensor: chunk_index + 1 == num_chunks,
+                        }),
+                    }))
+                    .await;
+            }
+        }
 
-    let tensor = Tensor::f_from_slice(&values)
-        .and_then(|t| t.f_reshape(shape.as_slice()))
-        .map_err(|err| {
-            Status::invalid_argument(format!(
-                "failed to build input tensor from stream chunks: {err}"
-            ))
-        })?;
+        let _ = tx
+            .send(Ok(CheckpointResponse {
+                chunk: String::new(),
+                done: true,
+                exit_code: 0,
+                output_chunk: None,
+            }))
+            .await;
+    });
 
-    let model_path = pt_file.to_string_lossy().into_owned();
-    inference::run_forward_pass(&model_path, &tensor)
-        .map_err(|err| Status::internal(format!("Rust inference failed: {err}")))
+    tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
-#[derive(Debug, Default)]
-pub struct NereidService;
+#[derive(Clone)]
+pub struct NereidService {
+    model_manager: Arc<ModelManager>,
+}
+
+impl NereidService {
+    fn new(model_manager: Arc<ModelManager>) -> Self {
+        Self { model_manager }
+    }
+}
 
 #[tonic::async_trait]
 impl Nereid for NereidService {
-    type CheckpointStream =
-        tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
+    type CheckpointStream = CheckpointStream;
 
     async fn health_check(
         &self,
@@ -228,12 +120,9 @@ impl Nereid for NereidService {
         &self,
         _request: Request<ViewModelsRequest>,
     ) -> Result<Response<ViewModelsResponse>, Status> {
-        let mut model_names = get_model_names()?;
-        if model_names.is_empty() {
-            model_names.push("No models found".to_string());
-        }
-
-        Ok(Response::new(ViewModelsResponse { model_names }))
+        Ok(Response::new(ViewModelsResponse {
+            model_names: self.model_manager.configured_models(),
+        }))
     }
 
     async fn checkpoint(
@@ -267,150 +156,85 @@ impl Nereid for NereidService {
         };
 
         let model_name = meta.model_name.trim().to_string();
-
         if model_name.is_empty() {
             return Err(Status::invalid_argument("model_name is required"));
         }
 
-        let model_names = get_model_names()?;
-        if !model_names.iter().any(|name| name == &model_name) {
-            return Err(Status::not_found(format!(
-                "model '{model_name}' was not found in ml-backends"
-            )));
-        }
+        let expected_shape = self
+            .model_manager
+            .input_shape(&model_name)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "model '{model_name}' is not configured in nereid.yaml"
+                ))
+            })?
+            .to_vec();
 
-        let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))
-            .map_err(|err| Status::internal(format!("failed to resolve model path: {err}")))?;
-        let pt_file = find_pt_model_file(&model_dir)?;
-        let has_textproto = model_dir.join("model_inference.textproto").is_file();
+        let mut tensor_bytes = Vec::<u8>::new();
+        let mut seen_end_of_tensor = false;
 
-        if pt_file.is_some() && has_textproto {
-            let pt_file = pt_file.expect("pt file existence already checked");
-            let mut tensor_bytes = Vec::<u8>::new();
-            let mut seen_end_of_tensor = false;
-            let expected_shape = read_input_shape_from_textproto(&model_dir)?;
+        while let Some(message) = stream.message().await.map_err(|err| {
+            Status::internal(format!("failed reading checkpoint stream message: {err}"))
+        })? {
+            let payload = message.payload.ok_or_else(|| {
+                Status::invalid_argument("checkpoint stream message has no payload")
+            })?;
 
-            while let Some(message) = stream.message().await.map_err(|err| {
-                Status::internal(format!("failed reading checkpoint stream message: {err}"))
-            })? {
-                let payload = message.payload.ok_or_else(|| {
-                    Status::invalid_argument("checkpoint stream message has no payload")
-                })?;
-                match payload {
-                    Payload::Meta(_) => {
+            match payload {
+                Payload::Meta(_) => {
+                    return Err(Status::invalid_argument(
+                        "metadata can only be sent as the first checkpoint stream message",
+                    ));
+                }
+                Payload::Chunk(chunk) => {
+                    if seen_end_of_tensor {
                         return Err(Status::invalid_argument(
-                            "metadata can only be sent as the first checkpoint stream message",
+                            "received tensor chunk after end_of_tensor=true",
                         ));
                     }
-                    Payload::Chunk(chunk) => {
-                        if seen_end_of_tensor {
-                            return Err(Status::invalid_argument(
-                                "received tensor chunk after end_of_tensor=true",
-                            ));
-                        }
 
-                        if !chunk.shape.is_empty() {
-                            if chunk.shape != expected_shape {
-                                return Err(Status::invalid_argument(
-                                    "tensor chunk shape does not match model_inference.textproto",
-                                ));
-                            }
-                        }
+                    if !chunk.shape.is_empty() && chunk.shape != expected_shape {
+                        return Err(Status::invalid_argument(
+                            "tensor chunk shape does not match model_inference.textproto",
+                        ));
+                    }
 
-                        tensor_bytes.extend_from_slice(&chunk.data);
-                        if chunk.end_of_tensor {
-                            seen_end_of_tensor = true;
-                        }
+                    tensor_bytes.extend_from_slice(&chunk.data);
+                    if chunk.end_of_tensor {
+                        seen_end_of_tensor = true;
                     }
                 }
             }
-
-            let (output_shape, output_bytes) =
-                run_rust_inference(&model_name, &model_dir, &pt_file, &tensor_bytes)?;
-
-            const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
-            let num_chunks = (output_bytes.len() + OUTPUT_CHUNK_BYTES - 1) / OUTPUT_CHUNK_BYTES;
-            let response_capacity = usize::max(2, num_chunks + 2);
-            let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(response_capacity);
-            let _ = tx
-                .send(Ok(CheckpointResponse {
-                    chunk: format!("Rust inference completed for model '{model_name}'"),
-                    done: false,
-                    exit_code: 0,
-                    output_chunk: None,
-                }))
-                .await;
-
-            if output_bytes.is_empty() {
-                let _ = tx
-                    .send(Ok(CheckpointResponse {
-                        chunk: String::new(),
-                        done: false,
-                        exit_code: 0,
-                        output_chunk: Some(TensorChunk {
-                            tensor_name: "output".to_string(),
-                            shape: output_shape.clone(),
-                            data: Vec::new(),
-                            chunk_index: 0,
-                            end_of_tensor: true,
-                        }),
-                    }))
-                    .await;
-            } else {
-                for (chunk_index, data_chunk) in output_bytes.chunks(OUTPUT_CHUNK_BYTES).enumerate()
-                {
-                    let _ = tx
-                        .send(Ok(CheckpointResponse {
-                            chunk: String::new(),
-                            done: false,
-                            exit_code: 0,
-                            output_chunk: Some(TensorChunk {
-                                tensor_name: "output".to_string(),
-                                shape: output_shape.clone(),
-                                data: data_chunk.to_vec(),
-                                chunk_index: chunk_index as u64,
-                                end_of_tensor: chunk_index + 1 == num_chunks,
-                            }),
-                        }))
-                        .await;
-                }
-            }
-
-            let _ = tx
-                .send(Ok(CheckpointResponse {
-                    chunk: String::new(),
-                    done: true,
-                    exit_code: 0,
-                    output_chunk: None,
-                }))
-                .await;
-            drop(tx);
-
-            return Ok(Response::new(
-                tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
-            ));
         }
 
-        if pt_file.is_some() && !has_textproto {
-            return Err(Status::failed_precondition(format!(
-                "model '{model_name}' has a .pt file but is missing model_inference.textproto"
-            )));
-        }
-        if pt_file.is_none() && has_textproto {
-            return Err(Status::failed_precondition(format!(
-                "model '{model_name}' has model_inference.textproto but no .pt file"
-            )));
-        }
+        let input_tensor = tensor_from_input_bytes(&tensor_bytes, &expected_shape, &model_name)?;
+        let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
+        let (output_shape, output_bytes) = response_rx.await.map_err(|_| {
+            Status::internal(format!(
+                "worker response channel closed for model '{model_name}'"
+            ))
+        })??;
 
-        let stream = python_backend::spawn_python_checkpoint_stream(&model_name, model_dir)?;
-        Ok(Response::new(stream))
+        Ok(Response::new(output_to_stream(
+            &model_name,
+            output_shape,
+            output_bytes,
+        )))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
-    let nereid = NereidService;
+    let config_path = Path::new("nereid.yaml");
+    let config = load_server_config(config_path)?;
+
+    let addr = config.server.bind_addr.parse()?;
+    let model_manager = Arc::new(
+        ModelManager::from_config(&config)
+            .map_err(|status| std::io::Error::other(status.to_string()))?,
+    );
+
+    let nereid = NereidService::new(model_manager);
     println!("gRPC server listening on {}", addr);
 
     Server::builder()
