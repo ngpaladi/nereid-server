@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import argparse
+# This module is configured via globals and invoked by spawn_edproducers.py.
+# It runs one producer loop and calls python-client/client.py each iteration.
 import math
 import random
 import subprocess
@@ -7,6 +8,24 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Sequence
+
+# Global config (overridden by spawn_edproducers.py before each producer starts).
+ITERATIONS = 1
+PRODUCER_ID = "edproducer-1"
+SHAPE = "1,16"
+VALUES = ""
+RANDOM_MIN = 0.0
+RANDOM_MAX = 1.0
+RANDOM_PRECISION = 6
+
+SEED = None
+SLEEP_SECONDS = 0.0
+HOST = "[::1]"
+PORT = 50051
+MODEL = "model3"
+CHUNK_BYTES = 64 * 1024
+PYTHON_BIN = sys.executable
+CLIENT_PATH = ""
 
 
 def parse_shape(raw: str) -> List[int]:
@@ -37,118 +56,73 @@ def csv(values: Sequence[float]) -> str:
     return ",".join(f"{v:g}" for v in values)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Dummy EDproducer: invoke python-client/client.py repeatedly with a configurable "
-            "shape and generated/random tensor values."
-        )
-    )
-    parser.add_argument("--iterations", type=int, default=1, help="number of client runs")
-    parser.add_argument("--producer-id", default="edproducer-1", help="label for log lines")
-    parser.add_argument("--shape", default="1,16", help="input tensor shape, e.g. 1,16")
-    parser.add_argument(
-        "--values",
-        default="",
-        help="fixed comma-separated values (overrides random generation)",
-    )
-    parser.add_argument("--random-min", type=float, default=0.0, help="minimum random value")
-    parser.add_argument("--random-max", type=float, default=1.0, help="maximum random value")
-    parser.add_argument(
-        "--random-precision",
-        type=int,
-        default=6,
-        help="decimal digits for random values; use negative to disable rounding",
-    )
-    parser.add_argument("--seed", type=int, default=None, help="RNG seed")
-    parser.add_argument(
-        "--sleep-seconds",
-        type=float,
-        default=0.0,
-        help="delay between iterations",
-    )
-    parser.add_argument("--host", default="[::1]", help="gRPC host")
-    parser.add_argument("--port", type=int, default=50051, help="gRPC port")
-    parser.add_argument("--model", default="model3", help="model name")
-    parser.add_argument("--chunk-bytes", type=int, default=64 * 1024, help="chunk bytes")
-    parser.add_argument(
-        "--python-bin",
-        default=sys.executable,
-        help="python executable used to invoke client.py",
-    )
-    parser.add_argument(
-        "--client-path",
-        default="",
-        help="path to python-client/client.py (default: auto-detect from repo root)",
-    )
-    args = parser.parse_args()
+def run_producer() -> int:
+    if ITERATIONS <= 0:
+        raise ValueError("ITERATIONS must be > 0")
+    if RANDOM_MIN > RANDOM_MAX:
+        raise ValueError("RANDOM_MIN cannot be greater than RANDOM_MAX")
 
-    if args.iterations <= 0:
-        raise ValueError("--iterations must be > 0")
-    if args.random_min > args.random_max:
-        raise ValueError("--random-min cannot be greater than --random-max")
+    if SEED is not None:
+        random.seed(SEED)
 
-    if args.seed is not None:
-        random.seed(args.seed)
-
-    shape = parse_shape(args.shape)
+    shape = parse_shape(SHAPE)
     expected = math.prod(shape)
 
     here = Path(__file__).resolve()
     repo_root = here.parent.parent
-    client_path = Path(args.client_path) if args.client_path else (repo_root / "python-client" / "client.py")
+    client_path = Path(CLIENT_PATH) if CLIENT_PATH else (repo_root / "python-client" / "client.py")
     client_path = client_path.resolve()
     if not client_path.exists():
         raise FileNotFoundError(f"client script not found at {client_path}")
 
     fixed_values: List[float] = []
-    if args.values.strip():
-        fixed_values = parse_values(args.values)
+    if VALUES.strip():
+        fixed_values = parse_values(VALUES)
         if len(fixed_values) != expected:
             raise ValueError(
-                f"--values count mismatch: shape {shape} expects {expected}, got {len(fixed_values)}"
+                f"VALUES count mismatch: shape {shape} expects {expected}, got {len(fixed_values)}"
             )
 
-    for i in range(args.iterations):
+    for i in range(ITERATIONS):
         iteration = i + 1
         values = fixed_values or build_random_values(
-            expected, args.random_min, args.random_max, args.random_precision
+            expected, RANDOM_MIN, RANDOM_MAX, RANDOM_PRECISION
         )
 
         cmd = [
-            args.python_bin,
+            PYTHON_BIN,
             str(client_path),
             "--host",
-            args.host,
+            HOST,
             "--port",
-            str(args.port),
+            str(PORT),
             "--model",
-            args.model,
+            MODEL,
             "--shape",
-            args.shape,
+            SHAPE,
             "--values",
             csv(values),
             "--chunk-bytes",
-            str(args.chunk_bytes),
+            str(CHUNK_BYTES),
         ]
 
         print(
-            f"[{args.producer_id}] iteration {iteration}/{args.iterations} "
+            f"[{PRODUCER_ID}] iteration {iteration}/{ITERATIONS} "
             f"shape={shape} values={values}"
         )
         result = subprocess.run(cmd)
         if result.returncode != 0:
             print(
-                f"[{args.producer_id}] iteration {iteration} failed with exit code {result.returncode}"
+                f"[{PRODUCER_ID}] iteration {iteration} failed with exit code {result.returncode}"
             )
             return result.returncode
 
-        if args.sleep_seconds > 0 and iteration < args.iterations:
-            time.sleep(args.sleep_seconds)
+        if SLEEP_SECONDS > 0 and iteration < ITERATIONS:
+            time.sleep(SLEEP_SECONDS)
 
-    print(f"[{args.producer_id}] complete ({args.iterations} iterations)")
+    print(f"[{PRODUCER_ID}] complete ({ITERATIONS} iterations)")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_producer())

@@ -27,3 +27,4 @@ ml-backends/*
 
 # Generated Python gRPC stubs for local client
 python-client/_generated/
+__pycache__/
