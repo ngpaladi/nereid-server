@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 use tch::{CModule, Device, Tensor};
@@ -16,18 +18,25 @@ pub type InferenceOutput = (Vec<i64>, Vec<u8>);
 struct ModelHandle {
     input_shape: Vec<i64>,
     job_tx: std_mpsc::SyncSender<InferenceJob>,
+    queue_capacity: usize,
+    occupancy: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 struct InferenceJob {
     input_tensor: Tensor,
     response_tx: oneshot::Sender<Result<InferenceOutput, Status>>,
+    occupancy: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 pub struct ModelManager {
     model_names: Vec<String>,
     handles: HashMap<String, ModelHandle>,
+}
+
+fn model_log(msg: &str) {
+    println!("[nereid-server] {msg}");
 }
 
 impl ModelManager {
@@ -63,6 +72,7 @@ impl ModelManager {
             })?;
 
             let (job_tx, job_rx) = std_mpsc::sync_channel::<InferenceJob>(model_cfg.queue_capacity);
+            let occupancy = Arc::new(AtomicUsize::new(0));
             spawn_model_worker(model_cfg.name.clone(), model, device, job_rx);
 
             model_names.push(model_cfg.name.clone());
@@ -71,6 +81,8 @@ impl ModelManager {
                 ModelHandle {
                     input_shape,
                     job_tx,
+                    queue_capacity: model_cfg.queue_capacity,
+                    occupancy,
                 },
             );
         }
@@ -103,19 +115,36 @@ impl ModelManager {
         })?;
 
         let (response_tx, response_rx) = oneshot::channel();
+        let occupancy = handle.occupancy.clone();
         let job = InferenceJob {
             input_tensor,
             response_tx,
+            occupancy: occupancy.clone(),
         };
 
+        let current = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
         match handle.job_tx.try_send(job) {
-            Ok(()) => Ok(response_rx),
+            Ok(()) => {
+                model_log(&format!(
+                    "queue status model={model_name} queue={current}/{}",
+                    handle.queue_capacity
+                ));
+                Ok(response_rx)
+            }
             Err(std_mpsc::TrySendError::Full(_)) => {
+                let current = occupancy.fetch_sub(1, Ordering::SeqCst) - 1;
+                model_log(&format!(
+                    "queue status model={model_name} queue={current}/{} full",
+                    handle.queue_capacity
+                ));
                 Err(Status::resource_exhausted("model queue full, retry later"))
             }
-            Err(std_mpsc::TrySendError::Disconnected(_)) => Err(Status::internal(format!(
-                "worker for model '{model_name}' is unavailable"
-            ))),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                occupancy.fetch_sub(1, Ordering::SeqCst);
+                Err(Status::internal(format!(
+                    "worker for model '{model_name}' is unavailable"
+                )))
+            }
         }
     }
 }
@@ -135,7 +164,15 @@ fn spawn_model_worker(
                     .map_err(|err| {
                         Status::internal(format!("Rust inference failed for '{model_name}': {err}"))
                     });
+                match &result {
+                    Ok(_) => model_log(&format!("job completed model={model_name}")),
+                    Err(status) => model_log(&format!(
+                        "job failed model={model_name} error={}",
+                        status.message()
+                    )),
+                }
                 let _ = job.response_tx.send(result);
+                job.occupancy.fetch_sub(1, Ordering::SeqCst);
             }
         });
 }

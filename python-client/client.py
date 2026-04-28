@@ -2,8 +2,10 @@
 import argparse
 import importlib
 import math
+import random
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -124,6 +126,18 @@ def request_stream(pb2, model_name: str, shape: Sequence[int], data: bytes, chun
         )
 
 
+def build_random_values(count: int, lo: float, hi: float, precision: int) -> List[float]:
+    values = [random.uniform(lo, hi) for _ in range(count)]
+    if precision >= 0:
+        return [round(v, precision) for v in values]
+    return values
+
+
+def log(msg: str, quiet: bool) -> None:
+    if not quiet:
+        print(msg)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stream an input tensor to Nereid/Checkpoint and print output tensor values"
@@ -143,61 +157,90 @@ def main() -> None:
         default=64 * 1024,
         help="bytes per streamed tensor chunk",
     )
+    parser.add_argument("--quiet", action="store_true", help="suppress verbose output")
+    parser.add_argument("--iterations", type=int, default=1, help="number of requests to send")
+    parser.add_argument("--sleep-seconds", type=float, default=0.0, help="sleep between requests")
+    parser.add_argument("--randomize-values", action="store_true", help="generate random values per request")
+    parser.add_argument("--random-min", type=float, default=0.0, help="random generation lower bound")
+    parser.add_argument("--random-max", type=float, default=1.0, help="random generation upper bound")
+    parser.add_argument("--random-precision", type=int, default=6, help="rounding digits; <0 disables rounding")
+    parser.add_argument("--seed", type=int, default=None, help="optional random seed")
 
     args = parser.parse_args()
+    if args.iterations <= 0:
+        raise ValueError("--iterations must be > 0")
+    if args.random_min > args.random_max:
+        raise ValueError("--random-min cannot be greater than --random-max")
 
     repo_root = Path(__file__).resolve().parent.parent
     pb2, pb2_grpc = load_proto_modules(repo_root)
 
     shape = parse_shape(args.shape)
-    values = parse_values(args.values)
-
     expected = math.prod(shape)
-    if len(values) != expected:
-        raise ValueError(
-            f"input values count mismatch: shape {shape} expects {expected}, got {len(values)}"
-        )
+    base_values: List[float] = []
+    if not args.randomize_values:
+        base_values = parse_values(args.values)
+        if len(base_values) != expected:
+            raise ValueError(
+                f"input values count mismatch: shape {shape} expects {expected}, got {len(base_values)}"
+            )
+    if args.seed is not None:
+        random.seed(args.seed)
 
-    data = encode_f32_le(values)
     target = f"{args.host}:{args.port}"
-    print(f"connecting to {target}")
-
-    output_shape: List[int] = []
-    output_chunks: Dict[int, bytes] = {}
+    log(f"connecting to {target}", args.quiet)
 
     with grpc.insecure_channel(target) as channel:
         stub = pb2_grpc.NereidStub(channel)
-        responses = stub.Checkpoint(
-            request_stream(pb2, args.model, shape, data, args.chunk_bytes)
-        )
 
-        for resp in responses:
-            if resp.chunk:
-                print(f"server: {resp.chunk}")
+        for i in range(args.iterations):
+            iteration = i + 1
+            values = (
+                build_random_values(
+                    expected,
+                    args.random_min,
+                    args.random_max,
+                    args.random_precision,
+                )
+                if args.randomize_values
+                else base_values
+            )
+            data = encode_f32_le(values)
 
-            if resp.HasField("output_chunk"):
-                oc = resp.output_chunk
-                if oc.shape:
-                    output_shape = list(oc.shape)
-                output_chunks[int(oc.chunk_index)] = bytes(oc.data)
+            output_shape: List[int] = []
+            output_chunks: Dict[int, bytes] = {}
+            responses = stub.Checkpoint(
+                request_stream(pb2, args.model, shape, data, args.chunk_bytes)
+            )
 
-            if resp.done:
-                print(f"done=true exit_code={resp.exit_code}")
+            for resp in responses:
+                if resp.chunk:
+                    log(f"server: {resp.chunk}", args.quiet)
 
-    if not output_chunks:
-        print("no output tensor chunks received")
-        return
+                if resp.HasField("output_chunk"):
+                    oc = resp.output_chunk
+                    if oc.shape:
+                        output_shape = list(oc.shape)
+                    output_chunks[int(oc.chunk_index)] = bytes(oc.data)
 
-    output_bytes = b"".join(output_chunks[i] for i in sorted(output_chunks.keys()))
-    output_values = decode_f32_le(output_bytes)
-    if output_shape:
-        pretty = reshape(output_values, output_shape)
-    else:
-        pretty = output_values
+                if resp.done:
+                    log(f"done=true exit_code={resp.exit_code}", args.quiet)
 
-    print(f"output shape: {output_shape if output_shape else '[unknown]'}")
-    print("output values:")
-    print(pretty)
+            if not output_chunks:
+                log("no output tensor chunks received", args.quiet)
+                continue
+
+            if not args.quiet:
+                output_bytes = b"".join(output_chunks[j] for j in sorted(output_chunks.keys()))
+                output_values = decode_f32_le(output_bytes)
+                pretty = reshape(output_values, output_shape) if output_shape else output_values
+                print(f"iteration {iteration}/{args.iterations}")
+                print(f"output shape: {output_shape if output_shape else '[unknown]'}")
+                print("output values:")
+                print(pretty)
+
+            if args.sleep_seconds > 0 and iteration < args.iterations:
+                time.sleep(args.sleep_seconds)
 
 
 if __name__ == "__main__":

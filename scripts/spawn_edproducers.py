@@ -8,8 +8,8 @@ from typing import List, Tuple
 import EDproducer
 
 # Global config for spawner behavior.
-PRODUCERS = 2
-ITERATIONS_PER_PRODUCER = 1
+PRODUCERS = 200
+ITERATIONS_PER_PRODUCER = 20
 SHAPE = "1,16"
 RANDOM_MIN = 0.0
 RANDOM_MAX = 1.0
@@ -19,8 +19,8 @@ HOST = "[::1]"
 PORT = 50051
 MODEL = "model3"
 CHUNK_BYTES = 64 * 1024
-SLEEP_SECONDS = 0.0
-STAGGER_SECONDS = 0.0
+SLEEP_SECONDS = 0.5 # Gap between iterations in a single producer
+STAGGER_SECONDS = 0 # Gap between spawning producers
 FAIL_FAST = False
 CLIENT_PATH = ""
 
@@ -105,7 +105,6 @@ def main() -> int:
             print(f"[spawner] completed with failures (first: {first_name} rc={first_rc})")
             return first_rc
 
-        print("[spawner] all producers completed successfully")
         return 0
 
     except KeyboardInterrupt:
