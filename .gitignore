@@ -27,4 +27,15 @@ ml-backends/*
 
 # Generated Python gRPC stubs for local client
 python-client/_generated/
+python-client/client.yaml
+python-client/.venv/
 __pycache__/
+**/__pycache__/
+
+# Local runtime config files (examples are kept under docs/)
+/nereid.yaml
+
+# Keep docs examples versioned
+!/docs/
+!/docs/*.yaml
+!/docs/*.md

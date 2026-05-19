@@ -76,38 +76,55 @@ cargo run
 
 Server binds to `server.bind_addr` from `nereid.yaml` (default example: `[::1]:50051`).
 
-## Dummy ED producers
-Dummy ED producers act as test clients for the server. They create random input tensors and call `python-client/client.py` repeatedly.
+## Python mock ED client
+The Python client is a small YAML-configured mock ED producer runner. It creates random float32 input tensors and sends them to `Nereid/Checkpoint`.
 
-Files:
-- `scripts/spawn_edproducers.py`: can spawn one or multiple producer processes
-
-Run from repository root:
+Install dependencies:
 ```bash
-python3 scripts/spawn_edproducers.py
+python3 -m venv python-client/.venv
+source python-client/.venv/bin/activate
+pip install -r python-client/requirements.txt
 ```
 
-Producer config is currently set by constants in `scripts/spawn_edproducers.py`:
-- `PRODUCERS`: number of parallel producer processes
-- `ITERATIONS_PER_PRODUCER`: number of requests (tensors) each producer sends
-- `MODEL`: target `model_name` sent to server (must exist in `nereid.yaml`)
-- `HOST`/`PORT`: server address
+Create a local config:
+```bash
+cp python-client/client.yaml.example python-client/client.yaml
+```
 
-Iterations:
-- one iteration = one generated tensor + one `Checkpoint` request
-- total requests sent = `PRODUCERS * ITERATIONS_PER_PRODUCER`
-- example: `PRODUCERS=4` and `ITERATIONS_PER_PRODUCER=25` sends 100 requests in total
+Example config (all values are explained in client.yaml.example):
+```yaml
+host: "[::1]"
+port: 50051
+model: "model3"
+shape: [1, 16]
+producers: 1
+inputs_per_producer: 1
+chunk_bytes: 65536
+sleep_seconds: 0
+```
 
-Producer role:
-- simulate concurrent clients
-- verify routing to a configured model
-- stress queueing/backpressure behavior using `queue_capacity`
+Run from the repository root:
+```bash
+python3 python-client/client.py
+```
 
-## Client installation (`grpcurl`)
+To use a different config file:
+```bash
+python3 python-client/client.py --config path/to/client.yaml
+```
+
+Client behavior:
+- starts `producers` separate OS processes
+- opens one persistent gRPC channel per producer
+- sends `inputs_per_producer` separate tensors per producer
+- sends one `Checkpoint` stream per tensor
+- prints status only, without decoding output tensors
+
+## grpcurl installation
 
 See the official [`grpcurl` installation guide](https://github.com/fullstorydev/grpcurl#installation).
 
-## Client usage
+## grpcurl usage
 Health check:
 ```bash
 grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Nereid/HealthCheck
@@ -118,22 +135,8 @@ View models:
 grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Nereid/ViewModels
 ```
 
-Checkpoint (streaming):
-Note: Right now the data and output files are ignored here
-```bash
-grpcurl -plaintext \
-  -import-path ./proto \
-  -proto inference.proto \
-  -d '{
-        "model_name": "model2",
-        "data": "input.csv",
-        "output_file": "out.txt"
-      }' \
-  '[::1]:50051' \
-  inference.Nereid/Checkpoint
-```
-
 ## Project structure
 - `src/main.rs`: gRPC service implementation and server bootstrap.
 - `build.rs`: compiles `.proto` files at build time.
 - `proto/inference.proto`: service and message definitions.
+- `python-client/client.py`: YAML-configured mock ED client.

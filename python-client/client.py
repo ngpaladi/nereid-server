@@ -2,18 +2,112 @@
 import argparse
 import importlib
 import math
+import multiprocessing as mp
 import random
 import struct
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Iterator, Sequence
 
-import grpc
-from grpc_tools import protoc
+
+@dataclass(frozen=True)
+class ClientConfig:
+    host: str
+    port: int
+    model: str
+    shape: list[int]
+    producers: int
+    inputs_per_producer: int
+    chunk_bytes: int
+    sleep_seconds: float
+
+
+def load_config(path: Path) -> ClientConfig:
+    import yaml
+
+    if not path.exists():
+        raise FileNotFoundError(f"config file not found: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict):
+        raise ValueError("config must be a YAML mapping")
+
+    allowed_keys = {
+        "host",
+        "port",
+        "model",
+        "shape",
+        "producers",
+        "inputs_per_producer",
+        "chunk_bytes",
+        "sleep_seconds",
+    }
+    unknown_keys = sorted(set(raw) - allowed_keys)
+    if unknown_keys:
+        raise ValueError(f"unknown config fields: {', '.join(unknown_keys)}")
+
+    config = ClientConfig(
+        host=require_str(raw, "host"),
+        port=require_int(raw, "port"),
+        model=require_str(raw, "model"),
+        shape=require_shape(raw),
+        producers=require_int(raw, "producers"),
+        inputs_per_producer=require_int(raw, "inputs_per_producer"),
+        chunk_bytes=require_int(raw, "chunk_bytes"),
+        sleep_seconds=optional_number(raw, "sleep_seconds", 0),
+    )
+
+    if config.port < 1 or config.port > 65535:
+        raise ValueError("port must be between 1 and 65535")
+    if config.producers < 1:
+        raise ValueError("producers must be >= 1")
+    if config.inputs_per_producer < 1:
+        raise ValueError("inputs_per_producer must be >= 1")
+    if config.chunk_bytes < 1:
+        raise ValueError("chunk_bytes must be >= 1")
+    if config.sleep_seconds < 0:
+        raise ValueError("sleep_seconds must be >= 0")
+
+    return config
+
+
+def require_str(raw: dict, key: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def require_int(raw: dict, key: str) -> int:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    return value
+
+
+def require_shape(raw: dict) -> list[int]:
+    value = raw.get("shape")
+    if not isinstance(value, list) or not value:
+        raise ValueError("shape must be a non-empty list of positive integers")
+    if any(isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 for dim in value):
+        raise ValueError("shape must contain only positive integers")
+    return value
+
+
+def optional_number(raw: dict, key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number")
+    return float(value)
 
 
 def generate_proto_modules(repo_root: Path, out_dir: Path) -> None:
+    from grpc_tools import protoc
+
     proto_dir = repo_root / "proto"
     proto_file = proto_dir / "inference.proto"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -33,215 +127,148 @@ def generate_proto_modules(repo_root: Path, out_dir: Path) -> None:
 
 def load_proto_modules(repo_root: Path):
     out_dir = repo_root / "python-client" / "_generated"
-    generate_proto_modules(repo_root, out_dir)
-
     sys.path.insert(0, str(out_dir))
     pb2 = importlib.import_module("inference_pb2")
     pb2_grpc = importlib.import_module("inference_pb2_grpc")
     return pb2, pb2_grpc
 
 
-def parse_shape(raw: str) -> List[int]:
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        raise ValueError("shape cannot be empty")
-    shape = [int(p) for p in parts]
-    if any(d <= 0 for d in shape):
-        raise ValueError("all shape dimensions must be positive")
-    return shape
+def random_tensor_values(shape: Sequence[int]) -> list[float]:
+    return [random.random() for _ in range(math.prod(shape))]
 
 
-def parse_values(raw: str) -> List[float]:
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        raise ValueError("values cannot be empty")
-    return [float(p) for p in parts]
+def encode_f32(values: Sequence[float]) -> bytes:
+    return b"".join(struct.pack("<f", value) for value in values)
 
 
-def encode_f32_le(values: Sequence[float]) -> bytes:
-    return b"".join(struct.pack("<f", v) for v in values)
-
-
-def decode_f32_le(data: bytes) -> List[float]:
-    if len(data) % 4 != 0:
-        raise ValueError(f"output byte length {len(data)} is not divisible by 4")
-    return [x[0] for x in struct.iter_unpack("<f", data)]
-
-
-def reshape(flat: Sequence[float], shape: Sequence[int]):
-    if not shape:
-        return list(flat)
-
-    total = 1
-    for dim in shape:
-        total *= dim
-    if total != len(flat):
-        raise ValueError(f"shape {list(shape)} expects {total} values but got {len(flat)}")
-
-    def build(offset: int, dims: Sequence[int]):
-        if len(dims) == 1:
-            width = dims[0]
-            return list(flat[offset : offset + width]), offset + width
-
-        width = math.prod(dims[1:])
-        out = []
-        cursor = offset
-        for _ in range(dims[0]):
-            part, cursor = build(cursor, dims[1:])
-            out.append(part)
-        return out, cursor
-
-    nested, _ = build(0, shape)
-    return nested
-
-
-def request_stream(pb2, model_name: str, shape: Sequence[int], data: bytes, chunk_bytes: int):
+def request_stream(
+    pb2,
+    model: str,
+    shape: Sequence[int],
+    data: bytes,
+    chunk_bytes: int,
+) -> Iterator:
     yield pb2.CheckpointRequest(
-        meta=pb2.CheckpointMeta(model_name=model_name, output_file="")
+        meta=pb2.CheckpointMeta(model_name=model, output_file="")
     )
-
-    if not data:
-        yield pb2.CheckpointRequest(
-            chunk=pb2.TensorChunk(
-                tensor_name="input",
-                shape=shape,
-                data=b"",
-                chunk_index=0,
-                end_of_tensor=True,
-            )
-        )
-        return
 
     total_chunks = (len(data) + chunk_bytes - 1) // chunk_bytes
-    for i, start in enumerate(range(0, len(data), chunk_bytes)):
-        payload = data[start : start + chunk_bytes]
+    for index, start in enumerate(range(0, len(data), chunk_bytes)):
         yield pb2.CheckpointRequest(
             chunk=pb2.TensorChunk(
                 tensor_name="input",
                 shape=shape,
-                data=payload,
-                chunk_index=i,
-                end_of_tensor=(i + 1 == total_chunks),
+                data=data[start : start + chunk_bytes],
+                chunk_index=index,
+                end_of_tensor=(index + 1 == total_chunks),
             )
         )
 
 
-def build_random_values(count: int, lo: float, hi: float, precision: int) -> List[float]:
-    values = [random.uniform(lo, hi) for _ in range(count)]
-    if precision >= 0:
-        return [round(v, precision) for v in values]
-    return values
-
-
-def log(msg: str, quiet: bool) -> None:
-    if not quiet:
-        print(msg)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Stream an input tensor to Nereid/Checkpoint and print output tensor values"
-    )
-    parser.add_argument("--host", default="[::1]", help="gRPC host")
-    parser.add_argument("--port", type=int, default=50051, help="gRPC port")
-    parser.add_argument("--model", default="model3", help="model name")
-    parser.add_argument("--shape", default="1,16", help="input shape, e.g. 1,16")
-    parser.add_argument(
-        "--values",
-        default=",".join(str(i) for i in range(1, 17)),
-        help="comma-separated float values",
-    )
-    parser.add_argument(
-        "--chunk-bytes",
-        type=int,
-        default=64 * 1024,
-        help="bytes per streamed tensor chunk",
-    )
-    parser.add_argument("--quiet", action="store_true", help="suppress verbose output")
-    parser.add_argument("--iterations", type=int, default=1, help="number of requests to send")
-    parser.add_argument("--sleep-seconds", type=float, default=0.0, help="sleep between requests")
-    parser.add_argument("--randomize-values", action="store_true", help="generate random values per request")
-    parser.add_argument("--random-min", type=float, default=0.0, help="random generation lower bound")
-    parser.add_argument("--random-max", type=float, default=1.0, help="random generation upper bound")
-    parser.add_argument("--random-precision", type=int, default=6, help="rounding digits; <0 disables rounding")
-    parser.add_argument("--seed", type=int, default=None, help="optional random seed")
-
-    args = parser.parse_args()
-    if args.iterations <= 0:
-        raise ValueError("--iterations must be > 0")
-    if args.random_min > args.random_max:
-        raise ValueError("--random-min cannot be greater than --random-max")
+def run_producer(config: ClientConfig, producer_id: int) -> int:
+    import grpc
 
     repo_root = Path(__file__).resolve().parent.parent
     pb2, pb2_grpc = load_proto_modules(repo_root)
+    target = f"{config.host}:{config.port}"
+    label = f"edproducer-{producer_id}"
 
-    shape = parse_shape(args.shape)
-    expected = math.prod(shape)
-    base_values: List[float] = []
-    if not args.randomize_values:
-        base_values = parse_values(args.values)
-        if len(base_values) != expected:
-            raise ValueError(
-                f"input values count mismatch: shape {shape} expects {expected}, got {len(base_values)}"
-            )
-    if args.seed is not None:
-        random.seed(args.seed)
+    print(
+        f"[{label}] start target={target} model={config.model} "
+        f"inputs={config.inputs_per_producer} shape={config.shape}"
+    )
 
-    target = f"{args.host}:{args.port}"
-    log(f"connecting to {target}", args.quiet)
-
+    completed = 0
     with grpc.insecure_channel(target) as channel:
         stub = pb2_grpc.NereidStub(channel)
 
-        for i in range(args.iterations):
-            iteration = i + 1
-            values = (
-                build_random_values(
-                    expected,
-                    args.random_min,
-                    args.random_max,
-                    args.random_precision,
+        for index in range(config.inputs_per_producer):
+            input_number = index + 1
+            values = random_tensor_values(config.shape)
+            data = encode_f32(values)
+
+            try:
+                responses = stub.Checkpoint(
+                    request_stream(
+                        pb2,
+                        config.model,
+                        config.shape,
+                        data,
+                        config.chunk_bytes,
+                    )
                 )
-                if args.randomize_values
-                else base_values
-            )
-            data = encode_f32_le(values)
+                saw_done = False
+                for response in responses:
+                    if response.done:
+                        saw_done = True
 
-            output_shape: List[int] = []
-            output_chunks: Dict[int, bytes] = {}
-            responses = stub.Checkpoint(
-                request_stream(pb2, args.model, shape, data, args.chunk_bytes)
-            )
+                if not saw_done:
+                    print(f"[{label}] failed input={input_number} reason=missing_done")
+                    return 1
+            except grpc.RpcError as err:
+                print(
+                    f"[{label}] failed input={input_number} "
+                    f"code={err.code()} details={err.details()}"
+                )
+                return 1
 
-            for resp in responses:
-                if resp.chunk:
-                    log(f"server: {resp.chunk}", args.quiet)
+            completed += 1
+            if completed == config.inputs_per_producer or completed % 100 == 0:
+                print(f"[{label}] ok inputs={completed}/{config.inputs_per_producer}")
 
-                if resp.HasField("output_chunk"):
-                    oc = resp.output_chunk
-                    if oc.shape:
-                        output_shape = list(oc.shape)
-                    output_chunks[int(oc.chunk_index)] = bytes(oc.data)
+            if config.sleep_seconds > 0 and input_number < config.inputs_per_producer:
+                time.sleep(config.sleep_seconds)
 
-                if resp.done:
-                    log(f"done=true exit_code={resp.exit_code}", args.quiet)
+    print(f"[{label}] complete inputs={completed}")
+    return 0
 
-            if not output_chunks:
-                log("no output tensor chunks received", args.quiet)
-                continue
 
-            if not args.quiet:
-                output_bytes = b"".join(output_chunks[j] for j in sorted(output_chunks.keys()))
-                output_values = decode_f32_le(output_bytes)
-                pretty = reshape(output_values, output_shape) if output_shape else output_values
-                print(f"iteration {iteration}/{args.iterations}")
-                print(f"output shape: {output_shape if output_shape else '[unknown]'}")
-                print("output values:")
-                print(pretty)
+def producer_entry(config: ClientConfig, producer_id: int) -> None:
+    raise SystemExit(run_producer(config, producer_id))
 
-            if args.sleep_seconds > 0 and iteration < args.iterations:
-                time.sleep(args.sleep_seconds)
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run mock ED producers against Nereid")
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "client.yaml"),
+        help="path to YAML config file",
+    )
+    args = parser.parse_args()
+
+    config_path = Path(args.config).resolve()
+    config = load_config(config_path)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    generate_proto_modules(repo_root, repo_root / "python-client" / "_generated")
+
+    procs: list[tuple[int, mp.Process]] = []
+    for producer_id in range(1, config.producers + 1):
+        proc = mp.Process(
+            target=producer_entry,
+            args=(config, producer_id),
+            name=f"edproducer-{producer_id}",
+        )
+        proc.start()
+        procs.append((producer_id, proc))
+        print(f"[client] started edproducer-{producer_id} pid={proc.pid}")
+
+    failures = 0
+    for producer_id, proc in procs:
+        proc.join()
+        if proc.exitcode == 0:
+            continue
+        failures += 1
+        print(f"[client] edproducer-{producer_id} exited rc={proc.exitcode}")
+
+    succeeded = config.producers - failures
+    total_inputs = config.producers * config.inputs_per_producer
+    print(
+        f"[client] summary producers_ok={succeeded}/{config.producers} "
+        f"producer_failures={failures} requested_inputs={total_inputs}"
+    )
+    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

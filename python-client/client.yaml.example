@@ -1,0 +1,22 @@
+host: "[::1]"
+port: 50051
+model: "model3"
+shape: [1, 16]
+producers: 1
+inputs_per_producer: 1
+chunk_bytes: 65536
+sleep_seconds: 0
+
+# This client acts as one or more mock ED producers. Each producer opens one
+# persistent gRPC connection to the Nereid server, then sends random float32
+# tensors to the selected model as separate Checkpoint requests.
+
+# host: gRPC host for the running Nereid server.
+# port: gRPC port for the running Nereid server.
+# model: model name to send in CheckpointMeta.
+# This model must exist in the server config (nereid.yaml) and in the folder where the ML models are present.
+# shape: input tensor shape. Must match the model's model_inference.textproto shape.
+# producers: number of mock ED producer processes to run.
+# inputs_per_producer: number of input tensors each producer sends.
+# chunk_bytes: maximum bytes per streamed TensorChunk.
+# sleep_seconds: seconds to wait between inputs from the same producer.

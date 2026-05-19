@@ -1,6 +1,8 @@
 server:
   bind_addr: "[::1]:50051"
 
+# path for ml model folder
+
 models:
   - name: "model4"
     device: "cpu"
