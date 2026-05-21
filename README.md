@@ -1,9 +1,9 @@
 # nereid-server
 A nifty little rust inference server
 
-Goal is to build a simple replacement for an inference server.
+Goal is to build a simple replacement for a ML inference server.
 Right now, this project contains a Rust gRPC server built with `tonic`.
-It can handle client requests and spawn a python process to run a sample model accordingly
+At this time, the server only supports PyTorch models exported in TorchScript (.pt) format.
 
 ## Proto
 - `proto/inference.proto`
@@ -78,7 +78,6 @@ models:
 ## Server installation
 Prerequisites:
 - Rust (stable) with Cargo: [Rust Installation](https://rust-lang.org/tools/install/)
-- `protoc`: [Protocol Buffers Installation](https://protobuf.dev/installation/)
 
 Build:
 ```bash
@@ -99,7 +98,7 @@ The Python client is a YAML-configured mock ED producer runner. It supports fixe
 
 See `python-client/README.md` for installation, configuration, and examples.
 
-## grpcurl installation
+## grpcurl installation (Alternate way to test server)
 
 See the official [`grpcurl` installation guide](https://github.com/fullstorydev/grpcurl#installation).
 
