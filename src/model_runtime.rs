@@ -14,9 +14,15 @@ use crate::inference;
 
 pub type InferenceOutput = (Vec<i64>, Vec<u8>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputShapeContract {
+    input_shape: Vec<i64>,
+    max_batch_size: i64,
+}
+
 #[derive(Debug)]
 struct ModelHandle {
-    input_shape: Vec<i64>,
+    input_contract: InputShapeContract,
     job_tx: std_mpsc::SyncSender<InferenceJob>,
     queue_capacity: usize,
     occupancy: Arc<AtomicUsize>,
@@ -75,7 +81,7 @@ impl ModelManager {
             }
 
             let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
-            let input_shape = read_input_shape_from_textproto(&model_dir)?;
+            let input_contract = read_input_contract_from_textproto(&model_dir)?;
             let device = model_cfg.device.to_tch_device()?;
             let model_path = pt_file.to_string_lossy().into_owned();
 
@@ -94,7 +100,7 @@ impl ModelManager {
             handles.insert(
                 model_cfg.name.clone(),
                 ModelHandle {
-                    input_shape,
+                    input_contract,
                     job_tx,
                     queue_capacity: model_cfg.queue_capacity,
                     occupancy,
@@ -112,10 +118,10 @@ impl ModelManager {
         self.model_names.clone()
     }
 
-    pub fn input_shape(&self, model_name: &str) -> Option<&[i64]> {
+    pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
         self.handles
             .get(model_name)
-            .map(|handle| handle.input_shape.as_slice())
+            .map(|handle| &handle.input_contract)
     }
 
     pub fn enqueue(
@@ -218,7 +224,7 @@ pub fn find_exactly_one_pt_model_file(model_dir: &Path) -> Result<PathBuf, Statu
     }
 }
 
-pub fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Status> {
+pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShapeContract, Status> {
     let config_path = model_dir.join("model_inference.textproto");
     let contents = fs::read_to_string(&config_path).map_err(|err| {
         Status::failed_precondition(format!(
@@ -232,36 +238,27 @@ pub fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Sta
         raw_line: &str,
         config_path: &Path,
     ) -> Result<Vec<i64>, Status> {
-        let trimmed = raw_value.trim().trim_matches('"').trim();
+        let trimmed = raw_value.trim();
         let inner = trimmed
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(trimmed)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                    config_path.to_string_lossy()
+                ))
+            })?
             .trim();
 
-        let dims_str: Vec<&str> = if inner.contains(',') {
-            inner
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else if inner.contains('x') || inner.contains('X') {
-            inner
-                .split(['x', 'X'])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else if inner.split_whitespace().count() > 1 {
-            inner.split_whitespace().collect()
-        } else if inner.is_empty() {
-            Vec::new()
-        } else {
-            vec![inner]
-        };
+        let dims_str: Vec<&str> = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
 
         if dims_str.is_empty() {
             return Err(Status::failed_precondition(format!(
-                "invalid input_shape in {}: '{raw_line}'. expected positive dimensions such as `input_shape: [1, 16]`",
+                "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
                 config_path.to_string_lossy()
             )));
         }
@@ -274,9 +271,9 @@ pub fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Sta
                     config_path.to_string_lossy()
                 ))
             })?;
-            if dim <= 0 {
+            if dim == 0 || dim < -1 {
                 return Err(Status::failed_precondition(format!(
-                    "input_shape dimensions in {} must be positive",
+                    "input_shape dimensions in {} must be positive or -1",
                     config_path.to_string_lossy()
                 )));
             }
@@ -287,21 +284,41 @@ pub fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Sta
     }
 
     let mut shape = Vec::new();
+    let mut max_batch_size = 0i64;
     for raw_line in contents.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || !line.starts_with("input_shape") {
+        if line.is_empty() {
             continue;
         }
 
-        let (_, raw_value) = line.split_once(':').ok_or_else(|| {
+        let (field, raw_value) = line.split_once(':').ok_or_else(|| {
             Status::failed_precondition(format!(
-                "invalid input_shape line in {}: '{raw_line}'",
+                "invalid model_inference line in {}: '{raw_line}'",
                 config_path.to_string_lossy()
             ))
         })?;
 
-        let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
-        shape.extend(dims);
+        match field.trim() {
+            "input_shape" => {
+                let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
+                shape.extend(dims);
+            }
+            "max_batch_size" => {
+                max_batch_size = raw_value.trim().parse::<i64>().map_err(|err| {
+                    Status::failed_precondition(format!(
+                        "failed parsing max_batch_size in {}: {err}",
+                        config_path.to_string_lossy()
+                    ))
+                })?;
+                if max_batch_size < 0 {
+                    return Err(Status::failed_precondition(format!(
+                        "max_batch_size in {} must be >= 0",
+                        config_path.to_string_lossy()
+                    )));
+                }
+            }
+            _ => {}
+        }
     }
 
     if shape.is_empty() {
@@ -311,12 +328,67 @@ pub fn read_input_shape_from_textproto(model_dir: &Path) -> Result<Vec<i64>, Sta
         )));
     }
 
-    Ok(shape)
+    Ok(InputShapeContract {
+        input_shape: shape,
+        max_batch_size,
+    })
+}
+
+impl InputShapeContract {
+    pub fn validate_request_shape(
+        &self,
+        request_shape: &[i64],
+        model_name: &str,
+    ) -> Result<(), Status> {
+        if request_shape.is_empty() {
+            return Err(Status::invalid_argument("tensor chunk shape is required"));
+        }
+        if request_shape.iter().any(|dim| *dim <= 0) {
+            return Err(Status::invalid_argument(
+                "tensor chunk shape dimensions must be positive",
+            ));
+        }
+
+        let expected_rank = self.input_shape.len() + usize::from(self.max_batch_size > 0);
+        if request_shape.len() != expected_rank {
+            return Err(Status::invalid_argument(format!(
+                "input tensor rank mismatch for model '{model_name}': expected {expected_rank}, got {}",
+                request_shape.len()
+            )));
+        }
+
+        let shape_offset = if self.max_batch_size > 0 {
+            let batch_size = request_shape[0];
+            if batch_size > self.max_batch_size {
+                return Err(Status::invalid_argument(format!(
+                    "batch size {batch_size} exceeds max_batch_size {} for model '{model_name}'",
+                    self.max_batch_size
+                )));
+            }
+            1
+        } else {
+            0
+        };
+
+        for (index, expected_dim) in self.input_shape.iter().enumerate() {
+            let actual_dim = request_shape[index + shape_offset];
+            if *expected_dim != -1 && *expected_dim != actual_dim {
+                return Err(Status::invalid_argument(format!(
+                    "input tensor shape mismatch for model '{model_name}' at dimension {}: expected {}, got {}",
+                    index + shape_offset,
+                    expected_dim,
+                    actual_dim
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub fn tensor_from_input_bytes(
     tensor_bytes: &[u8],
-    expected_shape: &[i64],
+    request_shape: &[i64],
     model_name: &str,
 ) -> Result<Tensor, Status> {
     if tensor_bytes.is_empty() {
@@ -335,20 +407,20 @@ pub fn tensor_from_input_bytes(
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
 
-    let expected_numel = expected_shape
+    let expected_numel = request_shape
         .iter()
         .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
         .ok_or_else(|| Status::invalid_argument("tensor shape overflow"))?;
 
     if expected_numel != i64::try_from(values.len()).unwrap_or(-1) {
         return Err(Status::invalid_argument(format!(
-            "input tensor size mismatch for model '{model_name}': expected {expected_numel} values from model_inference.textproto, got {}",
+            "input tensor size mismatch for model '{model_name}': expected {expected_numel} values from request shape, got {}",
             values.len()
         )));
     }
 
     Tensor::f_from_slice(&values)
-        .and_then(|t| t.f_reshape(expected_shape))
+        .and_then(|t| t.f_reshape(request_shape))
         .map_err(|err| {
             Status::invalid_argument(format!(
                 "failed to build input tensor from stream chunks: {err}"
@@ -358,7 +430,9 @@ pub fn tensor_from_input_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::find_exactly_one_pt_model_file;
+    use super::{
+        InputShapeContract, find_exactly_one_pt_model_file, read_input_contract_from_textproto,
+    };
     use crate::config::load_server_config;
     use std::fs;
     use std::path::PathBuf;
@@ -402,5 +476,74 @@ mod tests {
         if model3.is_dir() {
             find_exactly_one_pt_model_file(&model3).expect("model3 should have one .pt file");
         }
+    }
+
+    #[test]
+    fn input_contract_allows_variable_dims_and_max_batch_size() {
+        let base = temp_dir("input-contract");
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"input_shape: [-1, 16]\nmax_batch_size: 8\n",
+        )
+        .expect("write textproto");
+
+        let contract = read_input_contract_from_textproto(&base).expect("parse contract");
+        assert_eq!(
+            contract,
+            InputShapeContract {
+                input_shape: vec![-1, 16],
+                max_batch_size: 8
+            }
+        );
+
+        contract
+            .validate_request_shape(&[4, 10, 16], "model")
+            .expect("shape should match");
+        assert!(
+            contract
+                .validate_request_shape(&[9, 10, 16], "model")
+                .is_err()
+        );
+        assert!(
+            contract
+                .validate_request_shape(&[4, 10, 15], "model")
+                .is_err()
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn input_contract_without_batch_uses_request_shape_directly() {
+        let contract = InputShapeContract {
+            input_shape: vec![-1, 16],
+            max_batch_size: 0,
+        };
+
+        contract
+            .validate_request_shape(&[10, 16], "model")
+            .expect("shape should match");
+        assert!(
+            contract
+                .validate_request_shape(&[1, 10, 16], "model")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn input_contract_allows_multiple_variable_dims() {
+        let contract = InputShapeContract {
+            input_shape: vec![-1, -1, 16],
+            max_batch_size: 4,
+        };
+
+        contract
+            .validate_request_shape(&[2, 5, 7, 16], "model")
+            .expect("shape should match");
+        assert!(
+            contract
+                .validate_request_shape(&[2, 5, 7, 15], "model")
+                .is_err()
+        );
     }
 }

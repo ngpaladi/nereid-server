@@ -48,4 +48,5 @@ message CheckpointResponse {
 
 message ModelInferenceConfig {
     repeated int64 input_shape = 1;
+    int64 max_batch_size = 2;
 }

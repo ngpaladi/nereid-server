@@ -160,17 +160,18 @@ impl Nereid for NereidService {
             return Err(Status::invalid_argument("model_name is required"));
         }
 
-        let expected_shape = self
+        let input_contract = self
             .model_manager
-            .input_shape(&model_name)
+            .input_contract(&model_name)
             .ok_or_else(|| {
                 Status::not_found(format!(
                     "model '{model_name}' is not configured in nereid.yaml"
                 ))
             })?
-            .to_vec();
+            .clone();
 
         let mut tensor_bytes = Vec::<u8>::new();
+        let mut request_shape = None::<Vec<i64>>;
         let mut seen_end_of_tensor = false;
 
         while let Some(message) = stream.message().await.map_err(|err| {
@@ -193,10 +194,20 @@ impl Nereid for NereidService {
                         ));
                     }
 
-                    if !chunk.shape.is_empty() && chunk.shape != expected_shape {
-                        return Err(Status::invalid_argument(
-                            "tensor chunk shape does not match model_inference.textproto",
-                        ));
+                    if chunk.shape.is_empty() {
+                        return Err(Status::invalid_argument("tensor chunk shape is required"));
+                    }
+
+                    input_contract.validate_request_shape(&chunk.shape, &model_name)?;
+
+                    match &request_shape {
+                        Some(shape) if shape != &chunk.shape => {
+                            return Err(Status::invalid_argument(
+                                "tensor chunk shape changed within one checkpoint request",
+                            ));
+                        }
+                        None => request_shape = Some(chunk.shape.clone()),
+                        Some(_) => {}
                     }
 
                     tensor_bytes.extend_from_slice(&chunk.data);
@@ -207,7 +218,9 @@ impl Nereid for NereidService {
             }
         }
 
-        let input_tensor = tensor_from_input_bytes(&tensor_bytes, &expected_shape, &model_name)?;
+        let request_shape =
+            request_shape.ok_or_else(|| Status::invalid_argument("no tensor chunks provided"))?;
+        let input_tensor = tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name)?;
         let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
         let (output_shape, output_bytes) = response_rx.await.map_err(|_| {
             Status::internal(format!(

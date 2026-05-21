@@ -30,13 +30,20 @@ On server startup (if using main.py):
 
 `model_inference.textproto` shape examples:
 ```text
-input_shape: [1, 16]
-# also supported:
-# input_shape: 1
-# input_shape: 16
-# input_shape: "1,16"
-# input_shape: "1x16"
+input_shape: [16]
+max_batch_size: 8
+
+# A request shape of [4, 16] is accepted: batch size 4, input shape [16].
+# A request shape of [9, 16] is rejected because it exceeds max_batch_size.
+
+# input_shape: [-1, 16]  # -1 means this dimension is client-provided.
 ```
+
+`input_shape` excludes batch size. If `max_batch_size` is greater than `0`, the request
+shape from the client must include a leading batch dimension and the server enforces that it is at most
+`max_batch_size`. If `max_batch_size` is `0` or omitted, the request shape must match the
+`input_shape` rank directly. Fixed dimensions must match exactly; `-1` dimensions may be
+any positive value.
 
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).
