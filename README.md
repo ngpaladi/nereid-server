@@ -95,48 +95,9 @@ Model folders are loaded from `server.ml_backends_path` (default example: `ml-ba
 This folder must exist in the project root and contain all ML model folders.
 
 ## Python mock ED client
-The Python client is a small YAML-configured mock ED producer runner. It creates random float32 input tensors and sends them to `Nereid/Checkpoint`.
+The Python client is a YAML-configured mock ED producer runner. It supports fixed shapes, a list of possible shapes, and random shape generation for variable-shape models.
 
-Install dependencies:
-```bash
-python3 -m venv python-client/.venv
-source python-client/.venv/bin/activate
-pip install -r python-client/requirements.txt
-```
-
-Create a local config:
-```bash
-cp python-client/client.yaml.example python-client/client.yaml
-```
-
-Example config (all values are explained in client.yaml.example):
-```yaml
-host: "[::1]"
-port: 50051
-model: "model3"
-shape: [1, 16]
-producers: 1
-inputs_per_producer: 1
-chunk_bytes: 65536
-sleep_seconds: 0
-```
-
-Run from the repository root:
-```bash
-python3 python-client/client.py
-```
-
-To use a different config file:
-```bash
-python3 python-client/client.py --config path/to/client.yaml
-```
-
-Client behavior:
-- starts `producers` separate OS processes
-- opens one persistent gRPC channel per producer
-- sends `inputs_per_producer` separate tensors per producer
-- sends one `Checkpoint` stream per tensor
-- prints status only, without decoding output tensors
+See `python-client/README.md` for installation, configuration, and examples.
 
 ## grpcurl installation
 

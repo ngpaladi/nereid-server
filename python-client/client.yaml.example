@@ -2,6 +2,18 @@ host: "[::1]"
 port: 50051
 model: "model3"
 shape: [1, 16]
+# For variable input tests, replace `shape` with exactly one of:
+#
+# shapes:
+#   - [1, 3, 224, 224]
+#   - [4, 3, 128, 256]
+#   - [8, 3, 480, 640]
+#
+# random_shape:
+#   - [1, 8]      # batch
+#   - 3           # RGB channels
+#   - [128, 512]  # height
+#   - [128, 512]  # width
 producers: 1
 inputs_per_producer: 1
 chunk_bytes: 65536
@@ -15,7 +27,10 @@ sleep_seconds: 0
 # port: gRPC port for the running Nereid server.
 # model: model name to send in CheckpointMeta.
 # This model must exist in the server config (nereid.yaml) and in the folder where the ML models are present.
-# shape: input tensor shape. Must match the model's model_inference.textproto shape.
+# shape: one fixed full request tensor shape.
+# shapes: list of full request tensor shapes; the client picks one per input.
+# random_shape: list of fixed dimensions or [min, max] ranges; the client generates one shape per input.
+# Configure exactly one of shape, shapes, or random_shape.
 # producers: number of mock ED producer processes to run.
 # inputs_per_producer: number of input tensors each producer sends.
 # chunk_bytes: maximum bytes per streamed TensorChunk.

@@ -12,12 +12,17 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 
+ShapeDimSpec = int | tuple[int, int]
+
+
 @dataclass(frozen=True)
 class ClientConfig:
     host: str
     port: int
     model: str
-    shape: list[int]
+    shape: list[int] | None
+    shapes: list[list[int]] | None
+    random_shape: list[ShapeDimSpec] | None
     producers: int
     inputs_per_producer: int
     chunk_bytes: int
@@ -41,6 +46,8 @@ def load_config(path: Path) -> ClientConfig:
         "port",
         "model",
         "shape",
+        "shapes",
+        "random_shape",
         "producers",
         "inputs_per_producer",
         "chunk_bytes",
@@ -54,12 +61,22 @@ def load_config(path: Path) -> ClientConfig:
         host=require_str(raw, "host"),
         port=require_int(raw, "port"),
         model=require_str(raw, "model"),
-        shape=require_shape(raw),
+        shape=optional_shape(raw, "shape"),
+        shapes=optional_shapes(raw, "shapes"),
+        random_shape=optional_random_shape(raw, "random_shape"),
         producers=require_int(raw, "producers"),
         inputs_per_producer=require_int(raw, "inputs_per_producer"),
         chunk_bytes=require_int(raw, "chunk_bytes"),
         sleep_seconds=optional_number(raw, "sleep_seconds", 0),
     )
+
+    shape_modes = [
+        config.shape is not None,
+        config.shapes is not None,
+        config.random_shape is not None,
+    ]
+    if sum(shape_modes) != 1:
+        raise ValueError("exactly one of shape, shapes, or random_shape must be configured")
 
     if config.port < 1 or config.port > 65535:
         raise ValueError("port must be between 1 and 65535")
@@ -89,13 +106,64 @@ def require_int(raw: dict, key: str) -> int:
     return value
 
 
-def require_shape(raw: dict) -> list[int]:
-    value = raw.get("shape")
+def validate_shape(value: object, field: str) -> list[int]:
     if not isinstance(value, list) or not value:
-        raise ValueError("shape must be a non-empty list of positive integers")
+        raise ValueError(f"{field} must be a non-empty list of positive integers")
     if any(isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 for dim in value):
-        raise ValueError("shape must contain only positive integers")
-    return value
+        raise ValueError(f"{field} must contain only positive integers")
+    return list(value)
+
+
+def optional_shape(raw: dict, key: str) -> list[int] | None:
+    if key not in raw:
+        return None
+    return validate_shape(raw.get(key), key)
+
+
+def optional_shapes(raw: dict, key: str) -> list[list[int]] | None:
+    if key not in raw:
+        return None
+    value = raw.get(key)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{key} must be a non-empty list of shapes")
+    return [validate_shape(shape, f"{key}[{index}]") for index, shape in enumerate(value)]
+
+
+def optional_random_shape(raw: dict, key: str) -> list[ShapeDimSpec] | None:
+    if key not in raw:
+        return None
+    value = raw.get(key)
+    if not isinstance(value, list) or not value:
+        raise ValueError(
+            f"{key} must be a non-empty list of fixed dimensions or [min, max] ranges"
+        )
+
+    dims: list[ShapeDimSpec] = []
+    for index, dim in enumerate(value):
+        field = f"{key}[{index}]"
+        if isinstance(dim, bool):
+            raise ValueError(f"{field} must be a positive integer or [min, max] range")
+        if isinstance(dim, int):
+            if dim <= 0:
+                raise ValueError(f"{field} must be positive")
+            dims.append(dim)
+            continue
+
+        if not isinstance(dim, list) or len(dim) != 2:
+            raise ValueError(f"{field} must be a positive integer or [min, max] range")
+        lower, upper = dim
+        if (
+            isinstance(lower, bool)
+            or isinstance(upper, bool)
+            or not isinstance(lower, int)
+            or not isinstance(upper, int)
+        ):
+            raise ValueError(f"{field} range bounds must be integers")
+        if lower <= 0 or upper <= 0 or lower > upper:
+            raise ValueError(f"{field} range must satisfy 0 < min <= max")
+        dims.append((lower, upper))
+
+    return dims
 
 
 def optional_number(raw: dict, key: str, default: float) -> float:
@@ -103,6 +171,27 @@ def optional_number(raw: dict, key: str, default: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number")
     return float(value)
+
+
+def describe_shape_source(config: ClientConfig) -> str:
+    if config.shape is not None:
+        return f"shape={config.shape}"
+    if config.shapes is not None:
+        return f"shapes={config.shapes}"
+    return f"random_shape={config.random_shape}"
+
+
+def choose_shape(config: ClientConfig) -> list[int]:
+    if config.shape is not None:
+        return list(config.shape)
+    if config.shapes is not None:
+        return list(random.choice(config.shapes))
+    if config.random_shape is None:
+        raise RuntimeError("no shape source configured")
+    return [
+        random.randint(dim[0], dim[1]) if isinstance(dim, tuple) else dim
+        for dim in config.random_shape
+    ]
 
 
 def generate_proto_modules(repo_root: Path, out_dir: Path) -> None:
@@ -175,7 +264,7 @@ def run_producer(config: ClientConfig, producer_id: int) -> int:
 
     print(
         f"[{label}] start target={target} model={config.model} "
-        f"inputs={config.inputs_per_producer} shape={config.shape}"
+        f"inputs={config.inputs_per_producer} {describe_shape_source(config)}"
     )
 
     completed = 0
@@ -184,7 +273,8 @@ def run_producer(config: ClientConfig, producer_id: int) -> int:
 
         for index in range(config.inputs_per_producer):
             input_number = index + 1
-            values = random_tensor_values(config.shape)
+            shape = choose_shape(config)
+            values = random_tensor_values(shape)
             data = encode_f32(values)
 
             try:
@@ -192,7 +282,7 @@ def run_producer(config: ClientConfig, producer_id: int) -> int:
                     request_stream(
                         pb2,
                         config.model,
-                        config.shape,
+                        shape,
                         data,
                         config.chunk_bytes,
                     )
@@ -208,13 +298,16 @@ def run_producer(config: ClientConfig, producer_id: int) -> int:
             except grpc.RpcError as err:
                 print(
                     f"[{label}] failed input={input_number} "
-                    f"code={err.code()} details={err.details()}"
+                    f"shape={shape} code={err.code()} details={err.details()}"
                 )
                 return 1
 
             completed += 1
             if completed == config.inputs_per_producer or completed % 100 == 0:
-                print(f"[{label}] ok inputs={completed}/{config.inputs_per_producer}")
+                print(
+                    f"[{label}] ok inputs={completed}/{config.inputs_per_producer} "
+                    f"last_shape={shape}"
+                )
 
             if config.sleep_seconds > 0 and input_number < config.inputs_per_producer:
                 time.sleep(config.sleep_seconds)
