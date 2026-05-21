@@ -29,13 +29,17 @@ pub fn run_forward_pass(
 #[cfg(test)]
 mod tests {
     use super::run_forward_pass;
+    use crate::config::load_server_config;
     use std::path::PathBuf;
     use tch::{CModule, Device, Tensor};
 
     #[test]
     fn run_forward_pass_is_deterministic_for_fixed_input() {
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("ml-backends")
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = load_server_config(&manifest_dir.join("nereid.yaml.example"))
+            .expect("example config should load");
+        let model_path = manifest_dir
+            .join(config.server.ml_backends_path)
             .join("model3")
             .join("mlp.pt");
 

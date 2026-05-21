@@ -43,19 +43,34 @@ impl ModelManager {
     pub fn from_config(config: &ServerConfig) -> Result<Self, Status> {
         let mut model_names = Vec::with_capacity(config.models.len());
         let mut handles = HashMap::with_capacity(config.models.len());
+        let ml_backends_path = Path::new(&config.server.ml_backends_path);
+        let ml_backends_dir = fs::canonicalize(ml_backends_path).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to resolve server.ml_backends_path '{}': {err}",
+                ml_backends_path.display()
+            ))
+        })?;
+        if !ml_backends_dir.is_dir() {
+            return Err(Status::failed_precondition(format!(
+                "server.ml_backends_path '{}' is not a directory",
+                ml_backends_dir.display()
+            )));
+        }
 
         for model_cfg in &config.models {
-            let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_cfg.name))
-                .map_err(|err| {
+            let model_dir =
+                fs::canonicalize(ml_backends_dir.join(&model_cfg.name)).map_err(|err| {
                     Status::failed_precondition(format!(
-                        "failed to resolve model directory for '{}': {err}",
-                        model_cfg.name
+                        "failed to resolve model directory for '{}' under '{}': {err}",
+                        model_cfg.name,
+                        ml_backends_dir.display()
                     ))
                 })?;
             if !model_dir.is_dir() {
                 return Err(Status::failed_precondition(format!(
-                    "configured model '{}' is not a directory under ml-backends",
-                    model_cfg.name
+                    "configured model '{}' is not a directory under '{}'",
+                    model_cfg.name,
+                    ml_backends_dir.display()
                 )));
             }
 
@@ -344,8 +359,9 @@ pub fn tensor_from_input_bytes(
 #[cfg(test)]
 mod tests {
     use super::find_exactly_one_pt_model_file;
+    use crate::config::load_server_config;
     use std::fs;
-    use std::path::Path;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -377,8 +393,11 @@ mod tests {
 
     #[test]
     fn model3_has_single_pt_file_in_fixture() {
-        let model3 = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("ml-backends")
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = load_server_config(&manifest_dir.join("nereid.yaml.example"))
+            .expect("example config should load");
+        let model3 = manifest_dir
+            .join(config.server.ml_backends_path)
             .join("model3");
         if model3.is_dir() {
             find_exactly_one_pt_model_file(&model3).expect("model3 should have one .pt file");

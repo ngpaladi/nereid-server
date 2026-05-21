@@ -22,6 +22,7 @@ pub struct ServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
     pub bind_addr: String,
+    pub ml_backends_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,6 +69,14 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "server.bind_addr must be non-empty",
+        )
+        .into());
+    }
+
+    if config.server.ml_backends_path.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "server.ml_backends_path must be non-empty",
         )
         .into());
     }
@@ -124,6 +133,7 @@ mod tests {
             r#"
 server:
   bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
 models:
   - name: "model3"
     device: "cpu"
@@ -141,6 +151,7 @@ models:
             r#"
 server:
   bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
 models:
   - name: "same"
     device: "cpu"
@@ -161,6 +172,7 @@ models:
             r#"
 server:
   bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
 models:
   - name: "model3"
     device: "cpu"
@@ -178,6 +190,7 @@ models:
             r#"
 server:
   bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
 models:
   - name: "model3"
     device: "metal"
@@ -194,6 +207,7 @@ models:
             r#"
 server:
   bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
 "#,
         );
 
@@ -204,7 +218,24 @@ server:
     fn config_requires_bind_addr() {
         let result = parse_config(
             r#"
-server: {}
+server:
+  ml_backends_path: "ml-backends"
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_requires_ml_backends_path() {
+        let result = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
 models:
   - name: "model3"
     device: "cpu"

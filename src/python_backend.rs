@@ -6,7 +6,6 @@ use std::process::{Command, Stdio};
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use crate::get_model_names;
 use crate::proto::CheckpointResponse;
 
 pub type CheckpointStream =
@@ -40,12 +39,12 @@ fn output_details(output: &std::process::Output) -> String {
     }
 }
 
-pub fn prepare_model_envs() -> Result<(), Box<dyn std::error::Error>> {
-    let models = get_model_names()
-        .map_err(|status| std::io::Error::new(std::io::ErrorKind::Other, status.to_string()))?;
-
-    for model_name in models {
-        let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))?;
+pub fn prepare_model_envs(
+    model_names: &[String],
+    ml_backends_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for model_name in model_names {
+        let model_dir = fs::canonicalize(ml_backends_path.join(model_name))?;
         let requirements = model_dir.join("requirements.txt");
         if !requirements.is_file() {
             return Err(std::io::Error::new(

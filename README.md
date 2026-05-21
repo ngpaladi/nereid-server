@@ -16,7 +16,7 @@ It can handle client requests and spawn a python process to run a sample model a
 Note: Functionality for models containing main.py is temporarily disabled right now.
 
 ## Model folder contract
-Each model must be a folder under `ml-backends/<model_name>/` with:
+Each model must be a folder under `<server.ml_backends_path>/<model_name>/` with:
 - `requirements.txt`
 - `main.py`
 OR
@@ -54,11 +54,13 @@ It is required because the server uses it to:
 - choose execution device per model (`cpu` or `cuda`)
 - size each model request queue (`queue_capacity`)
 - choose the server bind address (`server.bind_addr`)
+- find model folders (`server.ml_backends_path`)
 
 Example (`nereid.yaml.example`):
 ```yaml
 server:
   bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
 
 models:
   - name: "model3"
@@ -82,6 +84,8 @@ cargo run
 ```
 
 Server binds to `server.bind_addr` from `nereid.yaml` (default example: `[::1]:50051`).
+Model folders are loaded from `server.ml_backends_path` (default example: `ml-backends`).
+This folder must exist in the project root and contain all ML model folders.
 
 ## Python mock ED client
 The Python client is a small YAML-configured mock ED producer runner. It creates random float32 input tensors and sends them to `Nereid/Checkpoint`.
