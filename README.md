@@ -89,6 +89,11 @@ Run:
 cargo run
 ```
 
+Run (if using CUDA as device):
+```bash
+TORCH_CUDA_VERSION=cu124 cargo run
+```
+
 Server binds to `server.bind_addr` from `nereid.yaml` (default example: `[::1]:50051`).
 Model folders are loaded from `server.ml_backends_path` (default example: `ml-backends`).
 This folder must exist in the project root and contain all ML model folders.

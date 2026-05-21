@@ -4,11 +4,15 @@
 // and positive queue capacity).
 
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 
 use serde::Deserialize;
-use tch::Device;
+use tch::{Cuda, Device};
 use tonic::Status;
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +49,9 @@ impl ModelDevice {
         match self {
             Self::Cpu => Ok(Device::Cpu),
             Self::Cuda => {
-                if tch::Cuda::is_available() {
+                preload_libtorch_cuda();
+
+                if Cuda::is_available() {
                     Ok(Device::Cuda(0))
                 } else {
                     Err(Status::failed_precondition(
@@ -55,6 +61,50 @@ impl ModelDevice {
             }
         }
     }
+}
+
+fn preload_libtorch_cuda() {
+    #[cfg(target_os = "linux")]
+    {
+        for library in ["libc10_cuda.so", "libtorch_cuda.so"] {
+            if let Err(err) = dlopen_library(library) {
+                eprintln!("failed to preload {library}: {err}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dlopen_library(library: &str) -> Result<(), String> {
+    const RTLD_NOW: c_int = 2;
+    const RTLD_GLOBAL: c_int = 0x100;
+
+    let path = CString::new(library).map_err(|err| err.to_string())?;
+    let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+    if handle.is_null() {
+        Err(dlopen_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dlopen_error() -> String {
+    let error = unsafe { dlerror() };
+    if error.is_null() {
+        "unknown dlopen error".to_owned()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[link(name = "dl")]
+unsafe extern "C" {
+    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+    fn dlerror() -> *const c_char;
 }
 
 pub fn load_server_config(path: &Path) -> Result<ServerConfig, Box<dyn std::error::Error>> {
@@ -121,7 +171,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerConfig, validate_server_config};
+    use super::{validate_server_config, ServerConfig};
 
     fn parse_config(raw: &str) -> Result<ServerConfig, serde_yaml::Error> {
         serde_yaml::from_str(raw)
