@@ -42,20 +42,27 @@ input_shape: [1, 16]
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).
 If this file is missing or invalid, the server does not start.
 
+Create a local config from the versioned example:
+```bash
+cp nereid.yaml.example nereid.yaml
+```
+
+`nereid.yaml` is ignored by Git so each developer can keep local model and device settings.
+
 It is required because the server uses it to:
 - decide which models are exposed via gRPC (`ViewModels` and `Checkpoint`)
 - choose execution device per model (`cpu` or `cuda`)
 - size each model request queue (`queue_capacity`)
 - choose the server bind address (`server.bind_addr`)
 
-Example:
+Example (`nereid.yaml.example`):
 ```yaml
 server:
   bind_addr: "[::1]:50051"
 
 models:
   - name: "model3"
-    device: "cuda"      # "cpu" or "cuda"
+    device: "cpu"       # "cpu" or "cuda"
     queue_capacity: 16  # must be > 0
 ```
 

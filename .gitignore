@@ -32,10 +32,5 @@ python-client/.venv/
 __pycache__/
 **/__pycache__/
 
-# Local runtime config files (examples are kept under docs/)
+# Local runtime config files
 /nereid.yaml
-
-# Keep docs examples versioned
-!/docs/
-!/docs/*.yaml
-!/docs/*.md

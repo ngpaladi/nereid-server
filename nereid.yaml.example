@@ -1,0 +1,11 @@
+server:
+  bind_addr: "[::1]:50051"
+
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+
+  # Add one entry per model folder under ml-backends/<model_name>/.
+  # device can be "cpu" or "cuda".
+  # queue_capacity must be greater than 0.
