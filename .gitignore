@@ -23,3 +23,14 @@ target
 
 # Ignore all ml-backends/folder-name/venv folders
 ml-backends/*/venv
+ml-backends/*
+
+# Generated Python gRPC stubs for local client
+python-client/_generated/
+python-client/client.yaml
+python-client/.venv/
+__pycache__/
+**/__pycache__/
+
+# Local runtime config files
+/nereid.yaml

@@ -1,0 +1,4 @@
+# Per-model inference config (example)
+# Message type: inference.ModelInferenceConfig
+input_shape: [16]
+max_batch_size: 10

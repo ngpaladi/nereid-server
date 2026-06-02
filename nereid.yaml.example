@@ -1,0 +1,14 @@
+server:
+  bind_addr: "[::1]:50051"
+
+  # This folder must exist in the project root and contain all ML model folders.
+  ml_backends_path: "ml-backends"
+
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+
+  # Add one entry per model folder under server.ml_backends_path.
+  # device can be "cpu" or "cuda".
+  # queue_capacity must be greater than 0.

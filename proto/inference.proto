@@ -1,13 +1,10 @@
 syntax = "proto3";
 package inference;
 
-service Health {
+service Nereid {
     rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
-}
-
-service Sonic {
     rpc ViewModels (ViewModelsRequest) returns (ViewModelsResponse);
-    rpc Checkpoint (CheckpointRequest) returns (stream CheckpointResponse);
+    rpc Checkpoint (stream CheckpointRequest) returns (stream CheckpointResponse);
 }
 
 message HealthCheckRequest {}
@@ -23,13 +20,33 @@ message ViewModelsResponse {
 }
 
 message CheckpointRequest {
+    oneof payload {
+        CheckpointMeta meta = 1;
+        TensorChunk chunk = 2;
+    }
+}
+
+message CheckpointMeta {
     string model_name = 1;
-    string data = 2;
-    string output_file = 3;
+    string output_file = 2;
+}
+
+message TensorChunk {
+    string tensor_name = 1;
+    repeated int64 shape = 2;
+    bytes data = 3;
+    uint64 chunk_index = 4;
+    bool end_of_tensor = 5;
 }
 
 message CheckpointResponse {
     string chunk = 1;
     bool done = 2;
     int32 exit_code = 3;
+    TensorChunk output_chunk = 4;
+}
+
+message ModelInferenceConfig {
+    repeated int64 input_shape = 1;
+    int64 max_batch_size = 2;
 }

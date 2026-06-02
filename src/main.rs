@@ -1,151 +1,112 @@
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, transport::Server};
 
-use inference::health_server::{Health, HealthServer};
-use inference::sonic_server::{Sonic, SonicServer};
-use inference::{
-    CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse,
-    ViewModelsRequest, ViewModelsResponse,
+mod config;
+mod inference;
+mod model_runtime;
+
+use config::load_server_config;
+use model_runtime::{ModelManager, tensor_from_input_bytes};
+use proto::nereid_server::{Nereid, NereidServer};
+use proto::{
+    CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse, TensorChunk,
+    ViewModelsRequest, ViewModelsResponse, checkpoint_request::Payload,
 };
 
-pub mod inference {
+pub mod proto {
     tonic::include_proto!("inference");
 }
 
-fn venv_python_path(venv_dir: &Path) -> PathBuf {
-    if cfg!(windows) {
-        venv_dir.join("Scripts").join("python.exe")
-    } else {
-        venv_dir.join("bin").join("python")
-    }
-}
+type CheckpointStream =
+    tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
-fn venv_pip_path(venv_dir: &Path) -> PathBuf {
-    if cfg!(windows) {
-        venv_dir.join("Scripts").join("pip.exe")
-    } else {
-        venv_dir.join("bin").join("pip")
-    }
-}
+fn output_to_stream(
+    model_name: &str,
+    output_shape: Vec<i64>,
+    output_bytes: Vec<u8>,
+) -> CheckpointStream {
+    const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
-fn output_details(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        "no command output".to_string()
-    }
-}
+    let num_chunks = output_bytes.len().div_ceil(OUTPUT_CHUNK_BYTES);
+    let response_capacity = usize::max(2, num_chunks + 2);
+    let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(response_capacity);
 
-fn prepare_model_envs() -> Result<(), Box<dyn std::error::Error>> {
-    let models = get_model_names()
-        .map_err(|status| std::io::Error::new(std::io::ErrorKind::Other, status.to_string()))?;
+    let model_name = model_name.to_string();
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(CheckpointResponse {
+                chunk: format!("Rust inference completed for model '{model_name}'"),
+                done: false,
+                exit_code: 0,
+                output_chunk: None,
+            }))
+            .await;
 
-    for model_name in models {
-        let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))?;
-        let requirements = model_dir.join("requirements.txt");
-        if !requirements.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("requirements.txt not found for model '{model_name}'"),
-            )
-            .into());
-        }
-
-        let venv_dir = model_dir.join("venv");
-        if venv_dir.exists() && !venv_dir.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("path exists but is not a directory: {}", venv_dir.display()),
-            )
-            .into());
-        }
-
-        if !venv_dir.is_dir() {
-            let create_venv = Command::new("python3")
-                .args(["-m", "venv", "venv"])
-                .current_dir(&model_dir)
-                .output()?;
-            if !create_venv.status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "failed to create venv for model '{model_name}': {}",
-                        output_details(&create_venv)
-                    ),
-                )
-                .into());
+        if output_bytes.is_empty() {
+            let _ = tx
+                .send(Ok(CheckpointResponse {
+                    chunk: String::new(),
+                    done: false,
+                    exit_code: 0,
+                    output_chunk: Some(TensorChunk {
+                        tensor_name: "output".to_string(),
+                        shape: output_shape.clone(),
+                        data: Vec::new(),
+                        chunk_index: 0,
+                        end_of_tensor: true,
+                    }),
+                }))
+                .await;
+        } else {
+            for (chunk_index, data_chunk) in output_bytes.chunks(OUTPUT_CHUNK_BYTES).enumerate() {
+                let _ = tx
+                    .send(Ok(CheckpointResponse {
+                        chunk: String::new(),
+                        done: false,
+                        exit_code: 0,
+                        output_chunk: Some(TensorChunk {
+                            tensor_name: "output".to_string(),
+                            shape: output_shape.clone(),
+                            data: data_chunk.to_vec(),
+                            chunk_index: chunk_index as u64,
+                            end_of_tensor: chunk_index + 1 == num_chunks,
+                        }),
+                    }))
+                    .await;
             }
         }
 
-        let pip_path = venv_pip_path(&venv_dir);
-        if !pip_path.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("venv pip not found for model '{model_name}'"),
-            )
-            .into());
-        }
+        let _ = tx
+            .send(Ok(CheckpointResponse {
+                chunk: String::new(),
+                done: true,
+                exit_code: 0,
+                output_chunk: None,
+            }))
+            .await;
+    });
 
-        let install = Command::new(&pip_path)
-            .args(["install", "-r", "requirements.txt"])
-            .current_dir(&model_dir)
-            .output()?;
-        if !install.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "failed to install requirements for model '{model_name}': {}",
-                    output_details(&install)
-                ),
-            )
-            .into());
-        }
-    }
-
-    Ok(())
+    tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
-fn get_model_names() -> Result<Vec<String>, Status> {
-    let entries = match fs::read_dir("ml-backends") {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(Status::internal(format!(
-                "failed to read model directory 'ml-backends': {err}"
-            )));
-        }
-    };
-
-    let mut model_names = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| Status::internal(format!("failed to read model entry: {err}")))?;
-        let file_type = entry.file_type().map_err(|err| {
-            Status::internal(format!("failed to inspect model entry type: {err}"))
-        })?;
-
-        if file_type.is_dir() {
-            model_names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-
-    model_names.sort();
-    Ok(model_names)
+#[derive(Clone)]
+pub struct NereidService {
+    model_manager: Arc<ModelManager>,
 }
 
-#[derive(Debug, Default)]
-pub struct HealthService;
+impl NereidService {
+    fn new(model_manager: Arc<ModelManager>) -> Self {
+        Self { model_manager }
+    }
+}
 
 #[tonic::async_trait]
-impl Health for HealthService {
+impl Nereid for NereidService {
+    type CheckpointStream = CheckpointStream;
+
     async fn health_check(
         &self,
         _request: Request<HealthCheckRequest>,
@@ -154,193 +115,143 @@ impl Health for HealthService {
             status: "ok".to_string(),
         }))
     }
-}
-
-#[derive(Debug, Default)]
-pub struct SonicService;
-
-#[tonic::async_trait]
-impl Sonic for SonicService {
-    type CheckpointStream =
-        tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
     async fn view_models(
         &self,
         _request: Request<ViewModelsRequest>,
     ) -> Result<Response<ViewModelsResponse>, Status> {
-        let mut model_names = get_model_names()?;
-        if model_names.is_empty() {
-            model_names.push("No models found".to_string());
-        }
-
-        Ok(Response::new(ViewModelsResponse { model_names }))
+        Ok(Response::new(ViewModelsResponse {
+            model_names: self.model_manager.configured_models(),
+        }))
     }
 
     async fn checkpoint(
         &self,
-        request: Request<CheckpointRequest>,
+        request: Request<tonic::Streaming<CheckpointRequest>>,
     ) -> Result<Response<Self::CheckpointStream>, Status> {
-        let request = request.into_inner();
-        let model_name = request.model_name.trim().to_string();
+        let mut stream = request.into_inner();
+        let first_message = stream.message().await.map_err(|err| {
+            Status::internal(format!(
+                "failed to read first checkpoint stream message: {err}"
+            ))
+        })?;
+        let first_message = first_message.ok_or_else(|| {
+            Status::invalid_argument(
+                "checkpoint stream is empty; first message must include metadata",
+            )
+        })?;
 
+        let meta = match first_message.payload {
+            Some(Payload::Meta(meta)) => meta,
+            Some(Payload::Chunk(_)) => {
+                return Err(Status::invalid_argument(
+                    "first checkpoint stream message must be metadata",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "first checkpoint stream message has no payload",
+                ));
+            }
+        };
+
+        let model_name = meta.model_name.trim().to_string();
         if model_name.is_empty() {
             return Err(Status::invalid_argument("model_name is required"));
         }
 
-        let model_names = get_model_names()?;
-        if !model_names.iter().any(|name| name == &model_name) {
-            return Err(Status::not_found(format!(
-                "model '{model_name}' was not found in ml-backends"
-            )));
-        }
+        let input_contract = self
+            .model_manager
+            .input_contract(&model_name)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "model '{model_name}' is not configured in nereid.yaml"
+                ))
+            })?
+            .clone();
 
-        let model_dir = fs::canonicalize(Path::new("ml-backends").join(&model_name))
-            .map_err(|err| Status::internal(format!("failed to resolve model path: {err}")))?;
-        let main_py = model_dir.join("main.py");
-        if !main_py.is_file() {
-            return Err(Status::not_found(format!(
-                "main.py not found for model '{model_name}'"
-            )));
-        }
+        let mut tensor_bytes = Vec::<u8>::new();
+        let mut request_shape = None::<Vec<i64>>;
+        let mut seen_end_of_tensor = false;
 
-        let venv_dir = model_dir.join("venv");
-        let python_path = venv_python_path(&venv_dir);
-        if !python_path.is_file() {
-            return Err(Status::not_found(format!(
-                "venv python not found for model '{model_name}'"
-            )));
-        }
-        let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(64);
+        while let Some(message) = stream.message().await.map_err(|err| {
+            Status::internal(format!("failed reading checkpoint stream message: {err}"))
+        })? {
+            let payload = message.payload.ok_or_else(|| {
+                Status::invalid_argument("checkpoint stream message has no payload")
+            })?;
 
-        std::thread::spawn(move || {
-            let mut child = match Command::new(&python_path)
-                .arg("-u")
-                .arg("main.py")
-                .current_dir(&model_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(Status::internal(format!(
-                        "failed to run main.py: {err}"
-                    ))));
-                    return;
+            match payload {
+                Payload::Meta(_) => {
+                    return Err(Status::invalid_argument(
+                        "metadata can only be sent as the first checkpoint stream message",
+                    ));
                 }
-            };
+                Payload::Chunk(chunk) => {
+                    if seen_end_of_tensor {
+                        return Err(Status::invalid_argument(
+                            "received tensor chunk after end_of_tensor=true",
+                        ));
+                    }
 
-            let stdout = match child.stdout.take() {
-                Some(stdout) => stdout,
-                None => {
-                    let _ = tx.blocking_send(Err(Status::internal(
-                        "failed to capture stdout from main.py process",
-                    )));
-                    return;
-                }
-            };
-            let stderr = match child.stderr.take() {
-                Some(stderr) => stderr,
-                None => {
-                    let _ = tx.blocking_send(Err(Status::internal(
-                        "failed to capture stderr from main.py process",
-                    )));
-                    return;
-                }
-            };
+                    if chunk.shape.is_empty() {
+                        return Err(Status::invalid_argument("tensor chunk shape is required"));
+                    }
 
-            let tx_stdout = tx.clone();
-            let stdout_handle = std::thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            if tx_stdout
-                                .blocking_send(Ok(CheckpointResponse {
-                                    chunk: line,
-                                    done: false,
-                                    exit_code: 0,
-                                }))
-                                .is_err()
-                            {
-                                break;
-                            }
+                    input_contract.validate_request_shape(&chunk.shape, &model_name)?;
+
+                    match &request_shape {
+                        Some(shape) if shape != &chunk.shape => {
+                            return Err(Status::invalid_argument(
+                                "tensor chunk shape changed within one checkpoint request",
+                            ));
                         }
-                        Err(err) => {
-                            let _ = tx_stdout.blocking_send(Err(Status::internal(format!(
-                                "failed reading stdout: {err}"
-                            ))));
-                            break;
-                        }
+                        None => request_shape = Some(chunk.shape.clone()),
+                        Some(_) => {}
+                    }
+
+                    tensor_bytes.extend_from_slice(&chunk.data);
+                    if chunk.end_of_tensor {
+                        seen_end_of_tensor = true;
                     }
                 }
-            });
+            }
+        }
 
-            let tx_stderr = tx.clone();
-            let stderr_handle = std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            if tx_stderr
-                                .blocking_send(Ok(CheckpointResponse {
-                                    chunk: format!("stderr: {line}"),
-                                    done: false,
-                                    exit_code: 0,
-                                }))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            let _ = tx_stderr.blocking_send(Err(Status::internal(format!(
-                                "failed reading stderr: {err}"
-                            ))));
-                            break;
-                        }
-                    }
-                }
-            });
+        let request_shape =
+            request_shape.ok_or_else(|| Status::invalid_argument("no tensor chunks provided"))?;
+        let input_tensor = tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name)?;
+        let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
+        let (output_shape, output_bytes) = response_rx.await.map_err(|_| {
+            Status::internal(format!(
+                "worker response channel closed for model '{model_name}'"
+            ))
+        })??;
 
-            let status = match child.wait() {
-                Ok(status) => status,
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(Status::internal(format!(
-                        "failed waiting on main.py process: {err}"
-                    ))));
-                    return;
-                }
-            };
-
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            let _ = tx.blocking_send(Ok(CheckpointResponse {
-                chunk: String::new(),
-                done: true,
-                exit_code: status.code().unwrap_or(-1),
-            }));
-        });
-
-        Ok(Response::new(
-            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
-        ))
+        Ok(Response::new(output_to_stream(
+            &model_name,
+            output_shape,
+            output_bytes,
+        )))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Preparing model environments...");
-    prepare_model_envs()?;
-    println!("Model environments ready. Starting gRPC server...");
-    let addr = "[::1]:50051".parse()?;
-    let health = HealthService;
-    let sonic = SonicService;
+    let config_path = Path::new("nereid.yaml");
+    let config = load_server_config(config_path)?;
+
+    let addr = config.server.bind_addr.parse()?;
+    let model_manager = Arc::new(
+        ModelManager::from_config(&config)
+            .map_err(|status| std::io::Error::other(status.to_string()))?,
+    );
+
+    let nereid = NereidService::new(model_manager);
     println!("gRPC server listening on {}", addr);
 
     Server::builder()
-        .add_service(HealthServer::new(health))
-        .add_service(SonicServer::new(sonic))
+        .add_service(NereidServer::new(nereid))
         .serve(addr)
         .await?;
 
