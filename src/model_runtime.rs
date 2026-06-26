@@ -272,7 +272,7 @@ pub fn detect_backend_kind(
     let is_python =
         model_dir.join("main.py").is_file() && model_dir.join("requirements.txt").is_file();
     let is_rust = model_dir.join("model_inference.textproto").is_file()
-        || model_dir_has_any_pt_file(model_dir);
+        && model_dir_has_any_pt_file(model_dir);
 
     match (is_python, is_rust) {
         (true, true) => Err(Status::failed_precondition(format!(
