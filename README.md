@@ -15,7 +15,9 @@ arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 - `Nereid/Checkpoint` only accepts `model_name` values configured in `nereid.yaml`. The server
   detects each model's backend kind from its folder contents:
   - `main.py` + `requirements.txt` -> runs `main.py` in that model's venv and streams its
-    stdout/stderr lines as output chunks.
+    stdout/stderr lines as output chunks. If the folder also includes a
+    `model_inference.textproto`, the server validates the request tensor against that contract
+    and pipes it into `main.py` on stdin (see [Python input contract](#python-input-contract)).
   - `model_inference.textproto` + `.pt` model -> runs Rust inference for that model and streams
     the output tensor.
 
@@ -23,12 +25,16 @@ arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 Each model must be a folder under `<server.ml_backends_path>/<model_name>/` with:
 - `requirements.txt`
 - `main.py`
+- `model_inference.textproto` (optional — adds input validation, see below)
 OR
 - `model_inference.textproto` (for Rust `.pt` inference models)
 - `.pt` model
 
 A model folder must satisfy exactly one of these contracts; the server fails to start if a
-configured model's folder matches both or neither.
+configured model's folder matches both or neither. A Python model is detected by `main.py` +
+`requirements.txt`; a Rust model by `model_inference.textproto` + a `.pt` file. A Python model
+folder must therefore **not** contain a `.pt` file (that would match both and be rejected as
+ambiguous), but it may carry a `model_inference.textproto` on its own.
 
 On server startup (for models using main.py):
 - If `venv/` exists for a model, it is reused.
@@ -46,11 +52,35 @@ max_batch_size: 8
 # input_shape: [-1, 16]  # -1 means this dimension is client-provided.
 ```
 
-`input_shape` excludes batch size. If `max_batch_size` is greater than `0`, the request
-shape from the client must include a leading batch dimension and the server enforces that it is at most
-`max_batch_size`. If `max_batch_size` is `0` or omitted, the request shape must match the
-`input_shape` rank directly. Fixed dimensions must match exactly; `-1` dimensions may be
-any positive value.
+`input_shape` excludes batch size. If `max_batch_size` is greater than `0`, the request shape
+from the client may include a leading batch dimension, which the server enforces is at most
+`max_batch_size`. A request that omits the batch dimension (sending just the `input_shape` rank)
+is accepted and auto-expanded to batch size 1 — e.g. with `input_shape: [16]` a request shape of
+`[16]` is treated as `[1, 16]`. If `max_batch_size` is `0` or omitted, the request shape must
+match the `input_shape` rank directly. Fixed dimensions must match exactly; `-1` dimensions may
+be any positive value.
+
+### Python input contract
+A Python model folder may include a `model_inference.textproto` (the same format as Rust models).
+When present, the server validates each request tensor against it — rejecting shape/rank/batch
+mismatches with an `InvalidArgument` status *before* launching `main.py` — and then delivers the
+validated tensor to the process:
+- **stdin**: the raw tensor bytes, little-endian `float32`, in row-major order.
+- **`NEREID_INPUT_SHAPE`**: the (batch-normalized) shape as comma-separated dimensions, e.g. `1,16`.
+- **`NEREID_INPUT_DTYPE`**: the element dtype, currently always `float32`.
+
+A minimal `main.py` reading the tensor (no third-party dependencies):
+```python
+import os, struct, sys
+
+shape = [int(d) for d in os.environ["NEREID_INPUT_SHAPE"].split(",")]
+raw = sys.stdin.buffer.read()
+values = struct.unpack("<%df" % (len(raw) // 4), raw)
+# ... reshape `values` to `shape` and run inference ...
+```
+Without a `model_inference.textproto`, a Python model receives no tensor input (stdin is closed)
+and the request stream is simply drained — the original behavior. Note that *output* from a
+Python model is always its stdout/stderr text; the contract governs input only.
 
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -10,6 +10,17 @@ use crate::proto::CheckpointResponse;
 
 pub type CheckpointStream =
     tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
+
+/// A validated input tensor to feed `main.py`. The raw `bytes` are the
+/// little-endian `float32` tensor values; `shape` is the (already
+/// batch-normalized) tensor shape. Delivered to the subprocess on stdin, with
+/// the shape and dtype exposed via the `NEREID_INPUT_SHAPE` /
+/// `NEREID_INPUT_DTYPE` environment variables.
+#[derive(Debug, Clone)]
+pub struct PythonInput {
+    pub shape: Vec<i64>,
+    pub bytes: Vec<u8>,
+}
 
 pub fn venv_python_path(venv_dir: &Path) -> PathBuf {
     if cfg!(windows) {
@@ -111,6 +122,7 @@ pub fn prepare_model_envs(
 pub fn spawn_python_checkpoint_stream(
     model_name: &str,
     model_dir: PathBuf,
+    input: Option<PythonInput>,
 ) -> Result<CheckpointStream, Status> {
     let main_py = model_dir.join("main.py");
     if !main_py.is_file() {
@@ -131,14 +143,33 @@ pub fn spawn_python_checkpoint_stream(
     let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(64);
 
     std::thread::spawn(move || {
-        let mut child = match Command::new(&python_path)
+        let mut command = Command::new(&python_path);
+        command
             .arg("-u")
             .arg("main.py")
             .current_dir(&model_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+
+        // When an input tensor is supplied it is delivered on stdin (raw
+        // little-endian float32), with the shape/dtype advertised via env vars.
+        // Otherwise stdin is closed so `main.py` reads EOF immediately.
+        if let Some(input) = &input {
+            let shape = input
+                .shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            command
+                .env("NEREID_INPUT_SHAPE", shape)
+                .env("NEREID_INPUT_DTYPE", "float32")
+                .stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
+        }
+
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let _ = tx.blocking_send(Err(Status::internal(format!(
@@ -146,6 +177,21 @@ pub fn spawn_python_checkpoint_stream(
                 ))));
                 return;
             }
+        };
+
+        // Stream the input tensor to stdin on a dedicated thread so it runs
+        // concurrently with the stdout/stderr readers (a single-threaded
+        // write-then-read would deadlock once the OS pipe buffer fills). Write
+        // errors (e.g. a `main.py` that ignores stdin and exits) are ignored;
+        // dropping the handle at the end signals EOF.
+        let stdin_handle = match input {
+            Some(input) => child.stdin.take().map(|mut stdin| {
+                std::thread::spawn(move || {
+                    let _ = stdin.write_all(&input.bytes);
+                    let _ = stdin.flush();
+                })
+            }),
+            None => None,
         };
 
         let stdout = match child.stdout.take() {
@@ -235,6 +281,9 @@ pub fn spawn_python_checkpoint_stream(
 
         let _ = stdout_handle.join();
         let _ = stderr_handle.join();
+        if let Some(stdin_handle) = stdin_handle {
+            let _ = stdin_handle.join();
+        }
         let _ = tx.blocking_send(Ok(CheckpointResponse {
             chunk: String::new(),
             done: true,

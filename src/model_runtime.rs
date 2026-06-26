@@ -38,6 +38,7 @@ struct RustModelHandle {
 #[derive(Debug)]
 struct PythonModelHandle {
     model_dir: PathBuf,
+    input_contract: Option<InputShapeContract>,
 }
 
 #[derive(Debug)]
@@ -105,10 +106,23 @@ impl ModelManager {
                         ))
                     })?;
 
+                    // A Python model may optionally ship a
+                    // `model_inference.textproto`; when present it is used to
+                    // validate (and batch-normalize) the input tensor before it
+                    // is piped into `main.py`.
+                    let input_contract = if model_dir.join("model_inference.textproto").is_file() {
+                        Some(read_input_contract_from_textproto(&model_dir)?)
+                    } else {
+                        None
+                    };
+
                     model_names.push(model_cfg.name.clone());
                     handles.insert(
                         model_cfg.name.clone(),
-                        ModelHandle::Python(PythonModelHandle { model_dir }),
+                        ModelHandle::Python(PythonModelHandle {
+                            model_dir,
+                            input_contract,
+                        }),
                     );
                 }
                 DetectedBackendKind::Rust => {
@@ -156,7 +170,7 @@ impl ModelManager {
     pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
         match self.handles.get(model_name)? {
             ModelHandle::Rust(handle) => Some(&handle.input_contract),
-            ModelHandle::Python(_) => None,
+            ModelHandle::Python(handle) => handle.input_contract.as_ref(),
         }
     }
 
