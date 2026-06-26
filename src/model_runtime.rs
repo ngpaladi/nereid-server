@@ -423,6 +423,23 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 }
 
 impl InputShapeContract {
+    /// Whether this contract declares a batch dimension.
+    fn has_batch_dim(&self) -> bool {
+        self.max_batch_size > 0
+    }
+
+    /// The request rank when the (optional) batch dimension is included.
+    fn batched_rank(&self) -> usize {
+        self.input_shape.len() + usize::from(self.has_batch_dim())
+    }
+
+    /// True when a batch dimension is declared but the request omits it, in
+    /// which case it is auto-expanded to batch size 1 (see
+    /// [`Self::normalize_request_shape`]).
+    fn omits_batch_dim(&self, request_shape: &[i64]) -> bool {
+        self.has_batch_dim() && request_shape.len() == self.input_shape.len()
+    }
+
     pub fn validate_request_shape(
         &self,
         request_shape: &[i64],
@@ -437,25 +454,37 @@ impl InputShapeContract {
             ));
         }
 
-        let expected_rank = self.input_shape.len() + usize::from(self.max_batch_size > 0);
-        if request_shape.len() != expected_rank {
+        // A request may either carry the declared batch dimension or omit it
+        // entirely; an omitted batch dimension is auto-expanded to size 1.
+        let shape_offset = if request_shape.len() == self.batched_rank() {
+            if self.has_batch_dim() {
+                let batch_size = request_shape[0];
+                if batch_size > self.max_batch_size {
+                    return Err(Status::invalid_argument(format!(
+                        "batch size {batch_size} exceeds max_batch_size {} for model '{model_name}'",
+                        self.max_batch_size
+                    )));
+                }
+                1
+            } else {
+                0
+            }
+        } else if self.omits_batch_dim(request_shape) {
+            0
+        } else {
+            let allowed = if self.has_batch_dim() {
+                format!(
+                    "expected {} (or {} without the batch dimension)",
+                    self.batched_rank(),
+                    self.input_shape.len()
+                )
+            } else {
+                format!("expected {}", self.batched_rank())
+            };
             return Err(Status::invalid_argument(format!(
-                "input tensor rank mismatch for model '{model_name}': expected {expected_rank}, got {}",
+                "input tensor rank mismatch for model '{model_name}': {allowed}, got {}",
                 request_shape.len()
             )));
-        }
-
-        let shape_offset = if self.max_batch_size > 0 {
-            let batch_size = request_shape[0];
-            if batch_size > self.max_batch_size {
-                return Err(Status::invalid_argument(format!(
-                    "batch size {batch_size} exceeds max_batch_size {} for model '{model_name}'",
-                    self.max_batch_size
-                )));
-            }
-            1
-        } else {
-            0
         };
 
         for (index, expected_dim) in self.input_shape.iter().enumerate() {
@@ -471,6 +500,21 @@ impl InputShapeContract {
         }
 
         Ok(())
+    }
+
+    /// Return the effective tensor shape to feed the model, inserting a leading
+    /// batch dimension of 1 when the request omitted the declared batch
+    /// dimension. Expects `request_shape` to have already passed
+    /// [`Self::validate_request_shape`].
+    pub fn normalize_request_shape(&self, request_shape: Vec<i64>) -> Vec<i64> {
+        if self.omits_batch_dim(&request_shape) {
+            let mut expanded = Vec::with_capacity(request_shape.len() + 1);
+            expanded.push(1);
+            expanded.extend(request_shape);
+            expanded
+        } else {
+            request_shape
+        }
     }
 }
 
@@ -615,6 +659,34 @@ mod tests {
         assert!(
             contract
                 .validate_request_shape(&[1, 10, 16], "model")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn input_contract_auto_expands_missing_batch_dim() {
+        let contract = InputShapeContract {
+            input_shape: vec![16],
+            max_batch_size: 10,
+        };
+
+        // Bare shape (batch omitted) and explicit batch shape both validate.
+        contract
+            .validate_request_shape(&[16], "model")
+            .expect("bare shape should be accepted");
+        contract
+            .validate_request_shape(&[2, 16], "model")
+            .expect("explicit batch shape should be accepted");
+
+        // The bare shape is expanded to a leading batch dimension of 1, while an
+        // explicit batch shape is passed through untouched.
+        assert_eq!(contract.normalize_request_shape(vec![16]), vec![1, 16]);
+        assert_eq!(contract.normalize_request_shape(vec![2, 16]), vec![2, 16]);
+
+        // A genuinely wrong rank is still rejected.
+        assert!(
+            contract
+                .validate_request_shape(&[1, 1, 16], "model")
                 .is_err()
         );
     }

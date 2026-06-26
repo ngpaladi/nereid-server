@@ -228,6 +228,9 @@ impl Nereid for NereidService {
 
         let request_shape =
             request_shape.ok_or_else(|| Status::invalid_argument("no tensor chunks provided"))?;
+        // A request that omits the model's declared batch dimension is expanded
+        // to batch size 1 before inference.
+        let request_shape = input_contract.normalize_request_shape(request_shape);
         let input_tensor = tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name)?;
         let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
         let (output_shape, output_bytes) = response_rx.await.map_err(|_| {
@@ -597,8 +600,10 @@ mod checkpoint_e2e_tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
     }
 
-    /// A rank mismatch — sending `[16]` when the contract expects `[batch, 16]`
-    /// — is rejected with `InvalidArgument`.
+    /// A rank mismatch — sending `[1, 1, 16]` (rank 3) when the contract expects
+    /// `[batch, 16]` (rank 2) or the bare `[16]` (rank 1) — is rejected with
+    /// `InvalidArgument`. Note that the bare `[16]` is *not* a mismatch: it is
+    /// auto-expanded to `[1, 16]` (see `rust_backend_expands_missing_batch_dim`).
     #[tokio::test]
     async fn rust_backend_rejects_rank_mismatch() {
         let ml_backends = fixtures_dir();
@@ -611,13 +616,64 @@ mod checkpoint_e2e_tests {
             &mut client,
             vec![
                 meta("model3"),
-                tensor_chunk(vec![16], f32_le_bytes(&values), true),
+                tensor_chunk(vec![1, 1, 16], f32_le_bytes(&values), true),
             ],
         )
         .await
         .expect_err("rank mismatch must be rejected");
 
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    }
+
+    /// A request that omits the declared batch dimension — sending the bare
+    /// `[16]` when the contract is `input_shape [16]`, `max_batch 10` — is
+    /// accepted and auto-expanded to batch size 1. The result must be identical
+    /// to sending `[1, 16]` explicitly, and the output must carry the inserted
+    /// leading batch dimension of 1.
+    #[tokio::test]
+    async fn rust_backend_expands_missing_batch_dim() {
+        let ml_backends = fixtures_dir();
+        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
+        let mut client = connect(addr).await;
+
+        let explicit = run_checkpoint(
+            &mut client,
+            vec![
+                meta("model3"),
+                tensor_chunk(vec![1, 16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("explicit [1, 16] checkpoint should succeed");
+
+        let expanded = run_checkpoint(
+            &mut client,
+            vec![
+                meta("model3"),
+                tensor_chunk(vec![16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("bare [16] checkpoint should be auto-expanded and succeed");
+
+        assert!(expanded.saw_output_chunk, "expected an output tensor chunk");
+        let shape = expanded.output_shape.clone().expect("expanded output shape");
+        assert_eq!(
+            shape.first().copied(),
+            Some(1),
+            "auto-expanded output must carry a leading batch dimension of 1, got {shape:?}"
+        );
+        assert_eq!(
+            expanded.output_shape, explicit.output_shape,
+            "auto-expanded [16] must yield the same output shape as explicit [1, 16]"
+        );
+        assert_eq!(
+            expanded.output_bytes, explicit.output_bytes,
+            "auto-expanded [16] must yield identical output bytes to explicit [1, 16]"
+        );
     }
 
     /// A batch size above `max_batch_size` (10 for model3) is rejected with
