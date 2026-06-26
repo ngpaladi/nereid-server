@@ -11,6 +11,7 @@ use tonic::Status;
 
 use crate::config::ServerConfig;
 use crate::inference;
+use crate::python_backend;
 
 pub type InferenceOutput = (Vec<i64>, Vec<u8>);
 
@@ -21,11 +22,22 @@ pub struct InputShapeContract {
 }
 
 #[derive(Debug)]
-struct ModelHandle {
+enum ModelHandle {
+    Rust(RustModelHandle),
+    Python(PythonModelHandle),
+}
+
+#[derive(Debug)]
+struct RustModelHandle {
     input_contract: InputShapeContract,
     job_tx: std_mpsc::SyncSender<InferenceJob>,
     queue_capacity: usize,
     occupancy: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct PythonModelHandle {
+    model_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -80,32 +92,55 @@ impl ModelManager {
                 )));
             }
 
-            let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
-            let input_contract = read_input_contract_from_textproto(&model_dir)?;
-            let device = model_cfg.device.to_tch_device()?;
-            let model_path = pt_file.to_string_lossy().into_owned();
+            match detect_backend_kind(&model_dir, &model_cfg.name)? {
+                DetectedBackendKind::Python => {
+                    python_backend::prepare_model_envs(
+                        std::slice::from_ref(&model_cfg.name),
+                        &ml_backends_dir,
+                    )
+                    .map_err(|err| {
+                        Status::failed_precondition(format!(
+                            "failed to prepare python environment for model '{}': {err}",
+                            model_cfg.name
+                        ))
+                    })?;
 
-            let model = CModule::load_on_device(&model_path, device).map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to load .pt model for '{}': {err}",
-                    model_cfg.name
-                ))
-            })?;
+                    model_names.push(model_cfg.name.clone());
+                    handles.insert(
+                        model_cfg.name.clone(),
+                        ModelHandle::Python(PythonModelHandle { model_dir }),
+                    );
+                }
+                DetectedBackendKind::Rust => {
+                    let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
+                    let input_contract = read_input_contract_from_textproto(&model_dir)?;
+                    let device = model_cfg.device.to_tch_device()?;
+                    let model_path = pt_file.to_string_lossy().into_owned();
 
-            let (job_tx, job_rx) = std_mpsc::sync_channel::<InferenceJob>(model_cfg.queue_capacity);
-            let occupancy = Arc::new(AtomicUsize::new(0));
-            spawn_model_worker(model_cfg.name.clone(), model, device, job_rx);
+                    let model = CModule::load_on_device(&model_path, device).map_err(|err| {
+                        Status::failed_precondition(format!(
+                            "failed to load .pt model for '{}': {err}",
+                            model_cfg.name
+                        ))
+                    })?;
 
-            model_names.push(model_cfg.name.clone());
-            handles.insert(
-                model_cfg.name.clone(),
-                ModelHandle {
-                    input_contract,
-                    job_tx,
-                    queue_capacity: model_cfg.queue_capacity,
-                    occupancy,
-                },
-            );
+                    let (job_tx, job_rx) =
+                        std_mpsc::sync_channel::<InferenceJob>(model_cfg.queue_capacity);
+                    let occupancy = Arc::new(AtomicUsize::new(0));
+                    spawn_model_worker(model_cfg.name.clone(), model, device, job_rx);
+
+                    model_names.push(model_cfg.name.clone());
+                    handles.insert(
+                        model_cfg.name.clone(),
+                        ModelHandle::Rust(RustModelHandle {
+                            input_contract,
+                            job_tx,
+                            queue_capacity: model_cfg.queue_capacity,
+                            occupancy,
+                        }),
+                    );
+                }
+            }
         }
 
         Ok(Self {
@@ -119,9 +154,17 @@ impl ModelManager {
     }
 
     pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
-        self.handles
-            .get(model_name)
-            .map(|handle| &handle.input_contract)
+        match self.handles.get(model_name)? {
+            ModelHandle::Rust(handle) => Some(&handle.input_contract),
+            ModelHandle::Python(_) => None,
+        }
+    }
+
+    pub fn python_model_dir(&self, model_name: &str) -> Option<PathBuf> {
+        match self.handles.get(model_name)? {
+            ModelHandle::Python(handle) => Some(handle.model_dir.clone()),
+            ModelHandle::Rust(_) => None,
+        }
     }
 
     pub fn enqueue(
@@ -129,11 +172,19 @@ impl ModelManager {
         model_name: &str,
         input_tensor: Tensor,
     ) -> Result<oneshot::Receiver<Result<InferenceOutput, Status>>, Status> {
-        let handle = self.handles.get(model_name).ok_or_else(|| {
-            Status::not_found(format!(
-                "model '{model_name}' is not configured in nereid.yaml"
-            ))
-        })?;
+        let handle = match self.handles.get(model_name) {
+            Some(ModelHandle::Rust(handle)) => handle,
+            Some(ModelHandle::Python(_)) => {
+                return Err(Status::failed_precondition(format!(
+                    "model '{model_name}' is a python backend and does not support tensor inference"
+                )));
+            }
+            None => {
+                return Err(Status::not_found(format!(
+                    "model '{model_name}' is not configured in nereid.yaml"
+                )));
+            }
+        };
 
         let (response_tx, response_rx) = oneshot::channel();
         let occupancy = handle.occupancy.clone();
@@ -196,6 +247,43 @@ fn spawn_model_worker(
                 job.occupancy.fetch_sub(1, Ordering::SeqCst);
             }
         });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectedBackendKind {
+    Python,
+    Rust,
+}
+
+fn model_dir_has_any_pt_file(model_dir: &Path) -> bool {
+    fs::read_dir(model_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "pt"))
+        })
+        .unwrap_or(false)
+}
+
+pub fn detect_backend_kind(
+    model_dir: &Path,
+    model_name: &str,
+) -> Result<DetectedBackendKind, Status> {
+    let is_python =
+        model_dir.join("main.py").is_file() && model_dir.join("requirements.txt").is_file();
+    let is_rust = model_dir.join("model_inference.textproto").is_file()
+        && model_dir_has_any_pt_file(model_dir);
+
+    match (is_python, is_rust) {
+        (true, true) => Err(Status::failed_precondition(format!(
+            "model '{model_name}' folder contains both main.py and .pt/textproto files; ambiguous backend kind"
+        ))),
+        (false, false) => Err(Status::failed_precondition(format!(
+            "model '{model_name}' folder must contain either (main.py + requirements.txt) or (a .pt model + model_inference.textproto)"
+        ))),
+        (true, false) => Ok(DetectedBackendKind::Python),
+        (false, true) => Ok(DetectedBackendKind::Rust),
+    }
 }
 
 pub fn find_exactly_one_pt_model_file(model_dir: &Path) -> Result<PathBuf, Status> {
@@ -431,7 +519,8 @@ pub fn tensor_from_input_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        InputShapeContract, find_exactly_one_pt_model_file, read_input_contract_from_textproto,
+        DetectedBackendKind, InputShapeContract, detect_backend_kind,
+        find_exactly_one_pt_model_file, read_input_contract_from_textproto,
     };
     use crate::config::load_server_config;
     use std::fs;
@@ -528,6 +617,64 @@ mod tests {
                 .validate_request_shape(&[1, 10, 16], "model")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn detect_backend_kind_recognizes_python_folder() {
+        let base = temp_dir("kind-python");
+        fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
+        fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
+
+        assert_eq!(
+            detect_backend_kind(&base, "model").expect("should detect python"),
+            DetectedBackendKind::Python
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_backend_kind_recognizes_rust_folder() {
+        let base = temp_dir("kind-rust");
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"input_shape: [16]\n",
+        )
+        .expect("write textproto");
+        fs::write(base.join("model.pt"), b"x").expect("write model.pt");
+
+        assert_eq!(
+            detect_backend_kind(&base, "model").expect("should detect rust"),
+            DetectedBackendKind::Rust
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_backend_kind_rejects_ambiguous_folder() {
+        let base = temp_dir("kind-ambiguous");
+        fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
+        fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"input_shape: [16]\n",
+        )
+        .expect("write textproto");
+        fs::write(base.join("model.pt"), b"x").expect("write model.pt");
+
+        assert!(detect_backend_kind(&base, "model").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_backend_kind_rejects_empty_folder() {
+        let base = temp_dir("kind-empty");
+
+        assert!(detect_backend_kind(&base, "model").is_err());
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

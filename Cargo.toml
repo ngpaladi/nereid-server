@@ -16,3 +16,7 @@ serde_yaml = "0.9"
 prost-build = "0.14"
 protoc-bin-vendored = "3"
 tonic-prost-build = "*"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net"] }

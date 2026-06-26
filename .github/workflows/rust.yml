@@ -16,7 +16,22 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    # The Python backend tests have the server build a per-model virtualenv via
+    # `python3 -m venv`, which requires the venv module to be present.
+    - name: Install Python venv support
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-venv
+
     - name: Build
       run: cargo build --verbose
+
+    # The full-stack inference tests (checkpoint_e2e_tests) load TorchScript .pt
+    # models through `tch`, so libtorch's shared libraries must be on the loader
+    # path at runtime. Point LD_LIBRARY_PATH at the libtorch lib/ directory that
+    # `tch` extracted into target/ (the largest, fully-extracted libtorch_cpu.so).
     - name: Run tests
-      run: cargo test --verbose
+      run: |
+        export LD_LIBRARY_PATH="$(dirname "$(find target -name libtorch_cpu.so -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)")":$LD_LIBRARY_PATH
+        cargo test --verbose
