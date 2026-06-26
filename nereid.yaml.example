@@ -10,5 +10,8 @@ models:
     queue_capacity: 16
 
   # Add one entry per model folder under server.ml_backends_path.
-  # device can be "cpu" or "cuda".
+  # device can be "cpu", "cuda" (GPU 0), or "cuda:<index>" for a specific GPU
+  # on multi-GPU systems (e.g. "cuda:1").
   # queue_capacity must be greater than 0.
+  # For models backed by main.py (instead of a .pt file), device and queue_capacity
+  # are still required by this schema but are unused by the server.

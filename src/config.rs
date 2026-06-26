@@ -37,27 +37,55 @@ pub struct ModelConfig {
     pub queue_capacity: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug)]
 pub enum ModelDevice {
     Cpu,
-    Cuda,
+    Cuda(usize),
+}
+
+impl<'de> Deserialize<'de> for ModelDevice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "cpu" => Ok(ModelDevice::Cpu),
+            "cuda" => Ok(ModelDevice::Cuda(0)),
+            other => other
+                .strip_prefix("cuda:")
+                .and_then(|index| index.parse::<usize>().ok())
+                .map(ModelDevice::Cuda)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "invalid device '{other}': expected \"cpu\", \"cuda\", or \"cuda:<index>\""
+                    ))
+                }),
+        }
+    }
 }
 
 impl ModelDevice {
     pub fn to_tch_device(self) -> Result<Device, Status> {
         match self {
             Self::Cpu => Ok(Device::Cpu),
-            Self::Cuda => {
+            Self::Cuda(index) => {
                 preload_libtorch_cuda();
 
-                if Cuda::is_available() {
-                    Ok(Device::Cuda(0))
-                } else {
-                    Err(Status::failed_precondition(
+                if !Cuda::is_available() {
+                    return Err(Status::failed_precondition(
                         "CUDA model configured but CUDA is not available",
-                    ))
+                    ));
                 }
+
+                let device_count = Cuda::device_count();
+                if i64::try_from(index).unwrap_or(i64::MAX) >= device_count {
+                    return Err(Status::failed_precondition(format!(
+                        "cuda device index {index} is out of range; {device_count} CUDA device(s) available"
+                    )));
+                }
+
+                Ok(Device::Cuda(index))
             }
         }
     }
@@ -171,7 +199,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_server_config, ServerConfig};
+    use super::{ModelDevice, ServerConfig, validate_server_config};
 
     fn parse_config(raw: &str) -> Result<ServerConfig, serde_yaml::Error> {
         serde_yaml::from_str(raw)
@@ -244,6 +272,59 @@ server:
 models:
   - name: "model3"
     device: "metal"
+    queue_capacity: 8
+"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_parses_cuda_with_explicit_device_index() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+models:
+  - name: "model3"
+    device: "cuda:1"
+    queue_capacity: 8
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(matches!(config.models[0].device, ModelDevice::Cuda(1)));
+    }
+
+    #[test]
+    fn config_defaults_bare_cuda_to_device_zero() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+models:
+  - name: "model3"
+    device: "cuda"
+    queue_capacity: 8
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(matches!(config.models[0].device, ModelDevice::Cuda(0)));
+    }
+
+    #[test]
+    fn config_rejects_non_numeric_cuda_index() {
+        let result = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+models:
+  - name: "model3"
+    device: "cuda:abc"
     queue_capacity: 8
 "#,
         );
