@@ -125,6 +125,19 @@ This is a known `tch-rs`/`torch-sys` characteristic (libtorch ships as shared li
 no rpath embedded in the final binary), not specific to this project. See the
 [`tch-rs` FAQ](https://github.com/LaurentMazare/tch-rs#faq) for background.
 
+### Using an external libtorch installation
+During a Cargo build, `tch-rs` defaults to downloading a CPU-only build of libtorch, unless
+certain environment variables are set (see
+[the getting started notes](https://github.com/LaurentMazare/tch-rs#getting-started)). It may
+be desirable to instead use an external installation of libtorch, by setting the `LIBTORCH`
+environment variable (see
+[Libtorch Manual Install](https://github.com/LaurentMazare/tch-rs#libtorch-manual-install)) to
+the unpacked location prior to running `cargo build`. Be aware that this must use the precise
+version of libtorch that `tch-rs` expects (v2.5.1 for `tch-rs` v0.18.1), and must use the
+cxx11 ABI (PyTorch additionally provides builds with the pre-cxx11 ABI for older versions,
+including 2.5.1), and must have been built against a CUDA version compatible with the system's
+CUDA libraries and drivers.
+
 ## Python mock ED client
 The Python client is a YAML-configured mock ED producer runner. It supports fixed shapes, a list of possible shapes, and random shape generation for variable-shape models.
 

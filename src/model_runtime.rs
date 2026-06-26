@@ -276,7 +276,7 @@ pub fn detect_backend_kind(
 
     match (is_python, is_rust) {
         (true, true) => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder contains both main.py and .pt/textproto files; ambiguous backend kind"
+            "model '{model_name}' folder contains both a Python backend (main.py + requirements.txt) and a Rust backend (a .pt model + model_inference.textproto); ambiguous backend kind"
         ))),
         (false, false) => Err(Status::failed_precondition(format!(
             "model '{model_name}' folder must contain either (main.py + requirements.txt) or (a .pt model + model_inference.textproto)"
