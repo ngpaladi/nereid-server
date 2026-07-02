@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
@@ -64,6 +65,12 @@ pub fn prepare_model_envs(
     model_names: &[String],
     ml_backends_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize venv creation process-wide: several `ModelManager`s can be built
+    // concurrently (e.g. parallel tests) sharing the same model directory, and
+    // concurrent `python3 -m venv` on one dir races to a half-built venv.
+    static PREPARE_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = PREPARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     for model_name in model_names {
         let model_dir = fs::canonicalize(ml_backends_path.join(model_name))?;
         let requirements = model_dir.join("requirements.txt");
