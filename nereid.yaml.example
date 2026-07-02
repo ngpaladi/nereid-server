@@ -15,3 +15,12 @@ models:
   # queue_capacity must be greater than 0.
   # For models backed by main.py (instead of a .pt file), device and queue_capacity
   # are still required by this schema but are unused by the server.
+  #
+  # backend: "python" | "rust" (optional). When set, it selects the model's
+  # backend explicitly instead of auto-detecting from the folder contents. Use it
+  # to disambiguate a folder that carries files for both backends (e.g. a .pt
+  # model shipped alongside main.py):
+  #   - name: "mymodel"
+  #     device: "cpu"
+  #     queue_capacity: 8
+  #     backend: "python"

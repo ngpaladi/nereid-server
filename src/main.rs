@@ -380,6 +380,7 @@ mod checkpoint_e2e_tests {
             name: name.to_string(),
             device: ModelDevice::Cpu,
             queue_capacity: 4,
+            backend: None,
         }
     }
 

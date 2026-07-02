@@ -30,11 +30,12 @@ OR
 - `model_inference.textproto` (for Rust `.pt` inference models)
 - `.pt` model
 
-A model folder must satisfy exactly one of these contracts; the server fails to start if a
-configured model's folder matches both or neither. A Python model is detected by `main.py` +
-`requirements.txt`; a Rust model by `model_inference.textproto` + a `.pt` file. A Python model
-folder must therefore **not** contain a `.pt` file (that would match both and be rejected as
-ambiguous), but it may carry a `model_inference.textproto` on its own.
+By default the backend is auto-detected: a Python model by `main.py` + `requirements.txt`,
+a Rust model by `model_inference.textproto` + a `.pt` file. If a folder matches both or
+neither, auto-detection fails at startup. To ship files for both backends in one folder
+(e.g. a `.pt` model alongside `main.py`), set `backend: "python"` or `backend: "rust"` on
+that model in `nereid.yaml`; the declared backend is authoritative and only its own
+required files are checked.
 
 On server startup (for models using main.py):
 - If `venv/` exists for a model, it is reused.

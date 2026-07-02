@@ -9,7 +9,7 @@ use tch::{CModule, Device, Tensor};
 use tokio::sync::oneshot;
 use tonic::Status;
 
-use crate::config::ServerConfig;
+use crate::config::{ConfiguredBackend, ServerConfig};
 use crate::inference;
 use crate::python_backend;
 
@@ -93,7 +93,7 @@ impl ModelManager {
                 )));
             }
 
-            match detect_backend_kind(&model_dir, &model_cfg.name)? {
+            match detect_backend_kind(&model_dir, &model_cfg.name, model_cfg.backend)? {
                 DetectedBackendKind::Python => {
                     python_backend::prepare_model_envs(
                         std::slice::from_ref(&model_cfg.name),
@@ -282,15 +282,32 @@ fn model_dir_has_any_pt_file(model_dir: &Path) -> bool {
 pub fn detect_backend_kind(
     model_dir: &Path,
     model_name: &str,
+    declared: Option<ConfiguredBackend>,
 ) -> Result<DetectedBackendKind, Status> {
-    let is_python =
+    let has_python =
         model_dir.join("main.py").is_file() && model_dir.join("requirements.txt").is_file();
-    let is_rust = model_dir.join("model_inference.textproto").is_file()
+    let has_rust = model_dir.join("model_inference.textproto").is_file()
         && model_dir_has_any_pt_file(model_dir);
 
-    match (is_python, is_rust) {
+    // An explicit `backend` in nereid.yaml decides the kind and disambiguates a
+    // folder holding files for both (e.g. a `.pt` alongside `main.py`); we only
+    // verify the chosen backend's own required files are present.
+    if let Some(declared) = declared {
+        return match declared {
+            ConfiguredBackend::Python if has_python => Ok(DetectedBackendKind::Python),
+            ConfiguredBackend::Python => Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"python\" but is missing main.py + requirements.txt"
+            ))),
+            ConfiguredBackend::Rust if has_rust => Ok(DetectedBackendKind::Rust),
+            ConfiguredBackend::Rust => Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"rust\" but is missing a .pt model + model_inference.textproto"
+            ))),
+        };
+    }
+
+    match (has_python, has_rust) {
         (true, true) => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder contains both a Python backend (main.py + requirements.txt) and a Rust backend (a .pt model + model_inference.textproto); ambiguous backend kind"
+            "model '{model_name}' folder contains both a Python backend (main.py + requirements.txt) and a Rust backend (a .pt model + model_inference.textproto); set `backend` in nereid.yaml to disambiguate"
         ))),
         (false, false) => Err(Status::failed_precondition(format!(
             "model '{model_name}' folder must contain either (main.py + requirements.txt) or (a .pt model + model_inference.textproto)"
@@ -580,7 +597,7 @@ mod tests {
         DetectedBackendKind, InputShapeContract, detect_backend_kind,
         find_exactly_one_pt_model_file, read_input_contract_from_textproto,
     };
-    use crate::config::load_server_config;
+    use crate::config::{ConfiguredBackend, load_server_config};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -712,7 +729,7 @@ mod tests {
         fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
 
         assert_eq!(
-            detect_backend_kind(&base, "model").expect("should detect python"),
+            detect_backend_kind(&base, "model", None).expect("should detect python"),
             DetectedBackendKind::Python
         );
 
@@ -730,7 +747,7 @@ mod tests {
         fs::write(base.join("model.pt"), b"x").expect("write model.pt");
 
         assert_eq!(
-            detect_backend_kind(&base, "model").expect("should detect rust"),
+            detect_backend_kind(&base, "model", None).expect("should detect rust"),
             DetectedBackendKind::Rust
         );
 
@@ -749,8 +766,39 @@ mod tests {
         .expect("write textproto");
         fs::write(base.join("model.pt"), b"x").expect("write model.pt");
 
-        assert!(detect_backend_kind(&base, "model").is_err());
+        // Auto-detection (no declared backend) is ambiguous and rejected...
+        assert!(detect_backend_kind(&base, "model", None).is_err());
+        // ...but an explicit backend disambiguates, allowing a `.pt` to live
+        // alongside main.py (and vice versa).
+        assert_eq!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Python))
+                .expect("declared python resolves"),
+            DetectedBackendKind::Python
+        );
+        assert_eq!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Rust))
+                .expect("declared rust resolves"),
+            DetectedBackendKind::Rust
+        );
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_backend_kind_declared_backend_requires_its_files() {
+        // A folder with only Python files but declaring backend "rust" fails.
+        let base = temp_dir("kind-declared-mismatch");
+        fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
+        fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
+        assert!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Rust)).is_err(),
+            "declared rust without a .pt/textproto must fail"
+        );
+        assert_eq!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Python))
+                .expect("declared python matches files"),
+            DetectedBackendKind::Python
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -758,7 +806,7 @@ mod tests {
     fn detect_backend_kind_rejects_empty_folder() {
         let base = temp_dir("kind-empty");
 
-        assert!(detect_backend_kind(&base, "model").is_err());
+        assert!(detect_backend_kind(&base, "model", None).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }
