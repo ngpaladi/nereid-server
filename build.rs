@@ -3,8 +3,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prost_config = prost_build::Config::new();
     prost_config.protoc_executable(protoc);
 
-    tonic_prost_build::configure()
-        .compile_with_config(prost_config, &["proto/inference.proto"], &["proto"])?;
+    tonic_prost_build::configure().compile_with_config(
+        prost_config,
+        &["proto/inference.proto"],
+        &["proto"],
+    )?;
 
     Ok(())
 }
