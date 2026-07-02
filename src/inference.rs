@@ -1,27 +1,79 @@
-use tch::{CModule, Device, IValue, Kind, Tensor};
+use tch::{CModule, Device, IValue, Tensor};
 
+/// A serialized output tensor: `(shape, row-major little-endian bytes, canonical
+/// dtype)`.
+pub type TensorOutput = (Vec<i64>, Vec<u8>, String);
+
+/// Serialize a tensor to `(shape, row-major little-endian bytes, canonical
+/// dtype)`. The dtype is preserved from the tensor's kind, so non-float outputs
+/// (e.g. int64) round-trip unchanged.
+pub fn tensor_to_bytes(tensor: &Tensor) -> Result<TensorOutput, tch::TchError> {
+    let tensor = tensor.to_device(Device::Cpu).contiguous();
+    let shape = tensor.size();
+    let kind = tensor.kind();
+    let dtype = crate::dtype::canonical_from_kind(kind)
+        .ok_or_else(|| tch::TchError::Torch(format!("unsupported output tensor kind {kind:?}")))?
+        .to_string();
+
+    let flat = tensor.reshape([-1]);
+    let numel = flat.numel();
+    let mut bytes = vec![0u8; numel * kind.elt_size_in_bytes()];
+    flat.copy_data_u8(&mut bytes, numel);
+    Ok((shape, bytes, dtype))
+}
+
+/// Run the model's single-input forward pass, preserving the input tensor's
+/// dtype (no forced cast to float), and return the output tensor serialized by
+/// [`tensor_to_bytes`].
 pub fn run_forward_pass(
     model: &CModule,
     device: Device,
     input_tensor: &Tensor,
-) -> Result<(Vec<i64>, Vec<u8>), tch::TchError> {
-    let input_tensor = input_tensor.to_device(device).to_kind(Kind::Float);
+) -> Result<TensorOutput, tch::TchError> {
+    let input_tensor = input_tensor.to_device(device);
     let output = model.forward_is(&[IValue::Tensor(input_tensor)])?;
 
     match output {
-        IValue::Tensor(tensor) => {
-            let output_tensor = tensor.to_device(Device::Cpu).to_kind(Kind::Float);
-            let shape = output_tensor.size();
-            let flat = output_tensor.reshape([-1]);
-            let values = Vec::<f32>::try_from(&flat)?;
-            let mut bytes = Vec::with_capacity(values.len() * 4);
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            Ok((shape, bytes))
-        }
+        IValue::Tensor(tensor) => tensor_to_bytes(&tensor),
         other => Err(tch::TchError::Torch(format!(
             "model output was non-tensor: {other:?}"
+        ))),
+    }
+}
+
+/// Run a multi-input forward pass. The model receives all `inputs` positionally
+/// and may return a single tensor or a tuple of tensors; each output is
+/// serialized by [`tensor_to_bytes`]. Used by the additive named-multi-tensor
+/// path — the single-tensor [`run_forward_pass`] is untouched.
+pub fn run_multi_forward_pass(
+    model: &CModule,
+    device: Device,
+    inputs: Vec<Tensor>,
+) -> Result<Vec<TensorOutput>, tch::TchError> {
+    let ivalues: Vec<IValue> = inputs
+        .into_iter()
+        .map(|t| IValue::Tensor(t.to_device(device)))
+        .collect();
+    let output = model.forward_is(&ivalues)?;
+
+    match output {
+        IValue::Tensor(tensor) => Ok(vec![tensor_to_bytes(&tensor)?]),
+        IValue::Tuple(items) => {
+            let mut outputs = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    IValue::Tensor(tensor) => outputs.push(tensor_to_bytes(&tensor)?),
+                    other => {
+                        return Err(tch::TchError::Torch(format!(
+                            "model tuple output element is non-tensor: {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(outputs)
+        }
+        other => Err(tch::TchError::Torch(format!(
+            "model output was neither tensor nor tuple: {other:?}"
         ))),
     }
 }
@@ -59,11 +111,12 @@ mod tests {
             Device::Cpu,
         )
         .expect("model should load");
-        let (baseline_shape, baseline_bytes) = run_forward_pass(&model, Device::Cpu, &input_tensor)
-            .expect("initial forward pass succeeds");
+        let (baseline_shape, baseline_bytes, _dtype) =
+            run_forward_pass(&model, Device::Cpu, &input_tensor)
+                .expect("initial forward pass succeeds");
 
         for i in 0..1000 {
-            let (shape, bytes) = run_forward_pass(&model, Device::Cpu, &input_tensor)
+            let (shape, bytes, _dtype) = run_forward_pass(&model, Device::Cpu, &input_tensor)
                 .unwrap_or_else(|err| panic!("forward pass {i} failed: {err}"));
             assert_eq!(shape, baseline_shape, "shape changed at iteration {i}");
             assert_eq!(

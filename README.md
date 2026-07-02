@@ -7,7 +7,46 @@ The server supports PyTorch models exported in TorchScript (.pt) format, as well
 arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 
 ## Proto
-- `proto/inference.proto`
+- `proto/inference.proto` — the native Nereid service.
+- `proto/grpc_service.proto` — the Triton-compatible KServe v2 surface (see below).
+
+## Triton compatibility (KServe v2)
+The server also exposes NVIDIA Triton's `inference.GRPCInferenceService` on the same bind
+address, so a stock `tritonclient` (or any KServe v2 speaker) can drive nereid without code
+changes. The package, service name, RPC names, and message field numbers in
+`proto/grpc_service.proto` are vendored verbatim from
+[Triton's `grpc_service.proto`](https://github.com/triton-inference-server/common/blob/main/protobuf/grpc_service.proto),
+so the wire format is byte-compatible. This is **wire**-parity, not authoring-parity: models
+are still written against nereid's own contracts (a `.pt` file or a `main.py`).
+
+**Implemented RPCs:** `ServerLive`, `ServerReady`, `ModelReady`, `ServerMetadata`,
+`ModelMetadata`, unary `ModelInfer`, and streaming `ModelStreamInfer`. Both backends are
+servable:
+- **Rust `.pt`** — single-tensor and multi-tensor (nested `input {}`/`output {}` blocks in
+  the textproto); datatypes are the libtorch kinds (`FP16/32/64`, `INT8/16/32/64`, `UINT8`,
+  `BOOL`, `BF16`).
+- **Python `main.py`** — every reply is a typed tensor (the same `NEREID_OUTPUT_PATH` framed
+  contract the native `Nereid/Checkpoint` path uses); byte-passthrough over any fixed-width
+  KServe dtype.
+
+The request datatype must match the model's declared `data_type` (default `FP32`). nereid
+serves a single implicit model version, `"1"`. **Not implemented (deferred):** Rust
+`UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror, Prometheus metrics, and the
+repository/config/statistics RPCs.
+
+### Verifying compatibility
+Wire compatibility is established by a **stock `tritonclient`** (built from Triton's own proto
+stubs, not nereid's vendored copy) — not by nereid's own client/server round-trip, which only
+proves self-consistency. The committed checker `scripts/triton_compat_check.py` runs that
+cross-implementation check across the example models:
+```bash
+pip install -r scripts/requirements.txt
+# with a nereid.yaml exposing pymul, pyaddint, rustint, multi and model3, server running:
+python scripts/triton_compat_check.py --url 127.0.0.1:50051 \
+    --model pymul:mul --model pyaddint:addint --model rustint:addint64 --model model3 \
+    --multi multi --stream pymul
+# -> ... rustint: output == input+1 (int64) ✓ ... multi (sum, prod) == (a+b, a*b) ✓ ... TRITON_COMPAT_OK
+```
 
 ## Server behavior
 - `Nereid/HealthCheck` returns status `ok`.

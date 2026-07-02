@@ -1,0 +1,23 @@
+# Multi-tensor Rust .pt model: (sum, prod) = (a + b, a * b).
+# Message type: inference.ModelConfig (nested input {} / output {} blocks)
+max_batch_size: 4
+input {
+  name: "a"
+  data_type: "FP32"
+  dims: [4]
+}
+input {
+  name: "b"
+  data_type: "FP32"
+  dims: [4]
+}
+output {
+  name: "sum"
+  data_type: "FP32"
+  dims: [4]
+}
+output {
+  name: "prod"
+  data_type: "FP32"
+  dims: [4]
+}

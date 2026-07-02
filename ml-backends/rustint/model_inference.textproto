@@ -1,0 +1,5 @@
+# Non-float Rust .pt model: output = input + 1 (int64).
+# Message type: inference.ModelInferenceConfig
+input_shape: [4]
+max_batch_size: 4
+data_type: INT64
