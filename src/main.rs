@@ -10,7 +10,7 @@ mod model_runtime;
 mod python_backend;
 
 use config::load_server_config;
-use model_runtime::{ModelManager, tensor_from_input_bytes};
+use model_runtime::{InputShapeContract, ModelManager, tensor_from_input_bytes};
 use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
     CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse, TensorChunk,
@@ -93,6 +93,72 @@ fn output_to_stream(
     tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+/// Drain the tensor chunks of a checkpoint stream, validating each chunk's shape
+/// against `contract` and reassembling the data. Returns the concatenated
+/// little-endian float32 bytes and the effective (batch-normalized) request
+/// shape. Shared by the Rust inference path and the Python path (when a Python
+/// model declares an input contract).
+async fn collect_input_tensor(
+    stream: &mut tonic::Streaming<CheckpointRequest>,
+    contract: &InputShapeContract,
+    model_name: &str,
+) -> Result<(Vec<u8>, Vec<i64>), Status> {
+    let mut tensor_bytes = Vec::<u8>::new();
+    let mut request_shape = None::<Vec<i64>>;
+    let mut seen_end_of_tensor = false;
+
+    while let Some(message) = stream.message().await.map_err(|err| {
+        Status::internal(format!("failed reading checkpoint stream message: {err}"))
+    })? {
+        let payload = message
+            .payload
+            .ok_or_else(|| Status::invalid_argument("checkpoint stream message has no payload"))?;
+
+        match payload {
+            Payload::Meta(_) => {
+                return Err(Status::invalid_argument(
+                    "metadata can only be sent as the first checkpoint stream message",
+                ));
+            }
+            Payload::Chunk(chunk) => {
+                if seen_end_of_tensor {
+                    return Err(Status::invalid_argument(
+                        "received tensor chunk after end_of_tensor=true",
+                    ));
+                }
+
+                if chunk.shape.is_empty() {
+                    return Err(Status::invalid_argument("tensor chunk shape is required"));
+                }
+
+                contract.validate_request_shape(&chunk.shape, model_name)?;
+
+                match &request_shape {
+                    Some(shape) if shape != &chunk.shape => {
+                        return Err(Status::invalid_argument(
+                            "tensor chunk shape changed within one checkpoint request",
+                        ));
+                    }
+                    None => request_shape = Some(chunk.shape.clone()),
+                    Some(_) => {}
+                }
+
+                tensor_bytes.extend_from_slice(&chunk.data);
+                if chunk.end_of_tensor {
+                    seen_end_of_tensor = true;
+                }
+            }
+        }
+    }
+
+    let request_shape =
+        request_shape.ok_or_else(|| Status::invalid_argument("no tensor chunks provided"))?;
+    // A request that omits the model's declared batch dimension is expanded to
+    // batch size 1 before inference.
+    let request_shape = contract.normalize_request_shape(request_shape);
+    Ok((tensor_bytes, request_shape))
+}
+
 #[derive(Clone)]
 pub struct NereidService {
     model_manager: Arc<ModelManager>,
@@ -162,9 +228,41 @@ impl Nereid for NereidService {
         }
 
         if let Some(model_dir) = self.model_manager.python_model_dir(&model_name) {
-            tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
-            let python_stream =
-                python_backend::spawn_python_checkpoint_stream(&model_name, model_dir)?;
+            // Every Python model has a required contract declaring output_shape.
+            // When it also declares input_shape, the validated tensor is piped
+            // in on stdin; otherwise the request stream is drained and no tensor
+            // is sent. Either way, main.py replies with a typed output tensor.
+            let contract = self
+                .model_manager
+                .input_contract(&model_name)
+                .ok_or_else(|| {
+                    Status::internal(format!(
+                        "Python model '{model_name}' is missing its contract"
+                    ))
+                })?
+                .clone();
+
+            let (input, expected_batch) = if contract.has_input() {
+                let (bytes, shape) =
+                    collect_input_tensor(&mut stream, &contract, &model_name).await?;
+                let batch = if contract.max_batch_size() > 0 {
+                    shape.first().copied()
+                } else {
+                    None
+                };
+                (Some(python_backend::PythonInput { shape, bytes }), batch)
+            } else {
+                tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
+                (None, None)
+            };
+
+            let python_stream = python_backend::spawn_python_checkpoint_stream(
+                &model_name,
+                model_dir,
+                input,
+                contract,
+                expected_batch,
+            )?;
             return Ok(Response::new(python_stream));
         }
 
@@ -178,56 +276,8 @@ impl Nereid for NereidService {
             })?
             .clone();
 
-        let mut tensor_bytes = Vec::<u8>::new();
-        let mut request_shape = None::<Vec<i64>>;
-        let mut seen_end_of_tensor = false;
-
-        while let Some(message) = stream.message().await.map_err(|err| {
-            Status::internal(format!("failed reading checkpoint stream message: {err}"))
-        })? {
-            let payload = message.payload.ok_or_else(|| {
-                Status::invalid_argument("checkpoint stream message has no payload")
-            })?;
-
-            match payload {
-                Payload::Meta(_) => {
-                    return Err(Status::invalid_argument(
-                        "metadata can only be sent as the first checkpoint stream message",
-                    ));
-                }
-                Payload::Chunk(chunk) => {
-                    if seen_end_of_tensor {
-                        return Err(Status::invalid_argument(
-                            "received tensor chunk after end_of_tensor=true",
-                        ));
-                    }
-
-                    if chunk.shape.is_empty() {
-                        return Err(Status::invalid_argument("tensor chunk shape is required"));
-                    }
-
-                    input_contract.validate_request_shape(&chunk.shape, &model_name)?;
-
-                    match &request_shape {
-                        Some(shape) if shape != &chunk.shape => {
-                            return Err(Status::invalid_argument(
-                                "tensor chunk shape changed within one checkpoint request",
-                            ));
-                        }
-                        None => request_shape = Some(chunk.shape.clone()),
-                        Some(_) => {}
-                    }
-
-                    tensor_bytes.extend_from_slice(&chunk.data);
-                    if chunk.end_of_tensor {
-                        seen_end_of_tensor = true;
-                    }
-                }
-            }
-        }
-
-        let request_shape =
-            request_shape.ok_or_else(|| Status::invalid_argument("no tensor chunks provided"))?;
+        let (tensor_bytes, request_shape) =
+            collect_input_tensor(&mut stream, &input_contract, &model_name).await?;
         let input_tensor = tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name)?;
         let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
         let (output_shape, output_bytes) = response_rx.await.map_err(|_| {
@@ -283,9 +333,7 @@ mod checkpoint_e2e_tests {
     use crate::inference::run_forward_pass;
     use proto::checkpoint_request::Payload;
     use proto::nereid_client::NereidClient;
-    use proto::{
-        CheckpointMeta, HealthCheckRequest, TensorChunk, ViewModelsRequest,
-    };
+    use proto::{CheckpointMeta, HealthCheckRequest, TensorChunk, ViewModelsRequest};
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -349,6 +397,7 @@ mod checkpoint_e2e_tests {
             name: name.to_string(),
             device: ModelDevice::Cpu,
             queue_capacity: 4,
+            backend: None,
         }
     }
 
@@ -402,9 +451,7 @@ mod checkpoint_e2e_tests {
         client: &mut NereidClient<tonic::transport::Channel>,
         requests: Vec<CheckpointRequest>,
     ) -> Result<Collected, Status> {
-        let response = client
-            .checkpoint(tokio_stream::iter(requests))
-            .await?;
+        let response = client.checkpoint(tokio_stream::iter(requests)).await?;
         let mut stream = response.into_inner();
 
         let mut collected = Collected::default();
@@ -425,17 +472,85 @@ mod checkpoint_e2e_tests {
         Ok(collected)
     }
 
-    /// Create a self-contained Python backend fixture under a fresh temp
+    /// A tail appended to every Python fixture's `main.py`: writes the unit
+    /// output tensor `[42.0]` (shape `[1]`) to `NEREID_OUTPUT_PATH`, satisfying
+    /// the "every Python reply is a typed tensor" contract. It runs after the
+    /// fixture's own body, so a body that `sys.exit`s first never reaches it.
+    const WRITE_UNIT_TENSOR: &str = "
+import os as _os, struct as _struct
+with open(_os.environ['NEREID_OUTPUT_PATH'], 'wb') as _f:
+    _f.write(b'float32 1\\n')
+    _f.write(_struct.pack('<f', 42.0))
+";
+
+    /// Create a self-contained *output-only* Python backend fixture (declares
+    /// only `output_shape: [1]`, consumes no input tensor) under a fresh temp
     /// `ml-backends` dir. An empty `requirements.txt` keeps the venv build that
-    /// `ModelManager::from_config` performs cheap. Returns `(ml_backends, name)`.
+    /// `ModelManager::from_config` performs cheap. The unit-tensor tail is
+    /// appended so the model satisfies the tensor-reply contract.
     fn make_python_model(prefix: &str, name: &str, main_py: &str) -> (PathBuf, String) {
+        make_python_model_with_contract(prefix, name, "output_shape: [1]\n", main_py)
+    }
+
+    /// Like [`make_python_model`], but with a caller-supplied
+    /// `model_inference.textproto` (e.g. declaring `input_shape` so the request
+    /// tensor is validated and piped into `main.py` on stdin). The textproto
+    /// must declare `output_shape` — required for every Python model.
+    fn make_python_model_with_contract(
+        prefix: &str,
+        name: &str,
+        textproto: &str,
+        main_py: &str,
+    ) -> (PathBuf, String) {
+        let ml_backends = temp_dir(prefix);
+        let model_dir = ml_backends.join(name);
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::write(model_dir.join("requirements.txt"), b"\n").expect("write requirements.txt");
+        let main_py = format!("{main_py}{WRITE_UNIT_TENSOR}");
+        std::fs::write(model_dir.join("main.py"), main_py.as_bytes()).expect("write main.py");
+        std::fs::write(
+            model_dir.join("model_inference.textproto"),
+            textproto.as_bytes(),
+        )
+        .expect("write textproto");
+        (ml_backends, name.to_string())
+    }
+
+    /// Like [`make_python_model_with_contract`] but writes `main.py` verbatim
+    /// (no appended unit-tensor tail), for fixtures that produce their own
+    /// output tensor.
+    fn make_python_model_raw(
+        prefix: &str,
+        name: &str,
+        textproto: &str,
+        main_py: &str,
+    ) -> (PathBuf, String) {
         let ml_backends = temp_dir(prefix);
         let model_dir = ml_backends.join(name);
         std::fs::create_dir_all(&model_dir).expect("create model dir");
         std::fs::write(model_dir.join("requirements.txt"), b"\n").expect("write requirements.txt");
         std::fs::write(model_dir.join("main.py"), main_py.as_bytes()).expect("write main.py");
+        std::fs::write(
+            model_dir.join("model_inference.textproto"),
+            textproto.as_bytes(),
+        )
+        .expect("write textproto");
         (ml_backends, name.to_string())
     }
+
+    /// A `main.py` that reads the float32 tensor from stdin (no numpy, so the
+    /// venv stays cheap) and echoes back values derived from the bytes: the
+    /// advertised shape, the element count, and the sum. The derived sum is what
+    /// proves the tensor arrived intact and in order.
+    const STDIN_ECHO_MAIN_PY: &str = "\
+import os, struct, sys
+raw = sys.stdin.buffer.read()
+count = len(raw) // 4
+values = struct.unpack('<%df' % count, raw) if count else ()
+print('shape:', os.environ.get('NEREID_INPUT_SHAPE', ''))
+print('count:', count)
+print('sum:', sum(values))
+";
 
     // ---------------------------------------------------------------------
     // Rust backend (TorchScript .pt): model3, input_shape [16], max_batch 10
@@ -484,7 +599,10 @@ mod checkpoint_e2e_tests {
 
         assert!(collected.saw_done, "stream must end with done=true");
         assert_eq!(collected.exit_code, 0, "Rust backend exit code");
-        assert!(collected.saw_output_chunk, "expected an output tensor chunk");
+        assert!(
+            collected.saw_output_chunk,
+            "expected an output tensor chunk"
+        );
         assert_eq!(
             collected.output_shape.as_deref(),
             Some(expected_shape.as_slice()),
@@ -502,7 +620,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn rust_backend_chunked_input_matches_single_chunk() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let input_values: Vec<f32> = (0..16).map(|v| v as f32).collect();
         let all_bytes = f32_le_bytes(&input_values);
@@ -532,7 +653,10 @@ mod checkpoint_e2e_tests {
         .await
         .expect("chunked checkpoint should succeed");
 
-        assert!(chunked.saw_output_chunk, "expected output from chunked input");
+        assert!(
+            chunked.saw_output_chunk,
+            "expected output from chunked input"
+        );
         assert_eq!(
             chunked.output_shape, single.output_shape,
             "chunked input must yield the same output shape"
@@ -548,7 +672,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn rust_backend_supports_batch_dimension() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let batch = 2i64;
         let values: Vec<f32> = (0..(batch * 16)).map(|v| v as f32).collect();
@@ -579,7 +706,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn rust_backend_rejects_shape_mismatch() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let values: Vec<f32> = (0..15).map(|v| v as f32).collect();
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
@@ -597,12 +727,17 @@ mod checkpoint_e2e_tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
     }
 
-    /// A rank mismatch — sending `[16]` when the contract expects `[batch, 16]`
-    /// — is rejected with `InvalidArgument`.
+    /// A rank mismatch — sending `[1, 1, 16]` (rank 3) when the contract expects
+    /// `[batch, 16]` (rank 2) or the bare `[16]` (rank 1) — is rejected with
+    /// `InvalidArgument`. Note that the bare `[16]` is *not* a mismatch: it is
+    /// auto-expanded to `[1, 16]` (see `rust_backend_expands_missing_batch_dim`).
     #[tokio::test]
     async fn rust_backend_rejects_rank_mismatch() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
@@ -611,7 +746,7 @@ mod checkpoint_e2e_tests {
             &mut client,
             vec![
                 meta("model3"),
-                tensor_chunk(vec![16], f32_le_bytes(&values), true),
+                tensor_chunk(vec![1, 1, 16], f32_le_bytes(&values), true),
             ],
         )
         .await
@@ -620,12 +755,72 @@ mod checkpoint_e2e_tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
     }
 
+    /// A request that omits the declared batch dimension — sending the bare
+    /// `[16]` when the contract is `input_shape [16]`, `max_batch 10` — is
+    /// accepted and auto-expanded to batch size 1. The result must be identical
+    /// to sending `[1, 16]` explicitly, and the output must carry the inserted
+    /// leading batch dimension of 1.
+    #[tokio::test]
+    async fn rust_backend_expands_missing_batch_dim() {
+        let ml_backends = fixtures_dir();
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
+
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
+        let mut client = connect(addr).await;
+
+        let explicit = run_checkpoint(
+            &mut client,
+            vec![
+                meta("model3"),
+                tensor_chunk(vec![1, 16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("explicit [1, 16] checkpoint should succeed");
+
+        let expanded = run_checkpoint(
+            &mut client,
+            vec![
+                meta("model3"),
+                tensor_chunk(vec![16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("bare [16] checkpoint should be auto-expanded and succeed");
+
+        assert!(expanded.saw_output_chunk, "expected an output tensor chunk");
+        let shape = expanded
+            .output_shape
+            .clone()
+            .expect("expanded output shape");
+        assert_eq!(
+            shape.first().copied(),
+            Some(1),
+            "auto-expanded output must carry a leading batch dimension of 1, got {shape:?}"
+        );
+        assert_eq!(
+            expanded.output_shape, explicit.output_shape,
+            "auto-expanded [16] must yield the same output shape as explicit [1, 16]"
+        );
+        assert_eq!(
+            expanded.output_bytes, explicit.output_bytes,
+            "auto-expanded [16] must yield identical output bytes to explicit [1, 16]"
+        );
+    }
+
     /// A batch size above `max_batch_size` (10 for model3) is rejected with
     /// `InvalidArgument`.
     #[tokio::test]
     async fn rust_backend_rejects_batch_over_max() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let batch = 11i64;
         let values: Vec<f32> = (0..(batch * 16)).map(|v| v as f32).collect();
@@ -737,6 +932,227 @@ mod checkpoint_e2e_tests {
         let _ = std::fs::remove_dir_all(&ml_backends);
     }
 
+    /// When a Python model declares an input contract, the validated tensor is
+    /// piped into `main.py` on stdin. The fixture echoes the shape/count/sum it
+    /// reads back; asserting on the derived sum proves the bytes arrived intact
+    /// and in order, not merely that the process ran.
+    #[tokio::test]
+    async fn python_backend_receives_validated_tensor_on_stdin() {
+        let (ml_backends, name) = make_python_model_with_contract(
+            "python-stdin",
+            "e2e_python_stdin",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
+            STDIN_ECHO_MAIN_PY,
+        );
+
+        // Values 0..16 sum to 120; the Python side prints them as a float.
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let collected = run_checkpoint(
+            &mut client,
+            vec![
+                meta(&name),
+                tensor_chunk(vec![1, 16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("python checkpoint with tensor should succeed");
+
+        assert!(collected.saw_done, "stream must end with done=true");
+        assert_eq!(collected.exit_code, 0, "successful main.py exits 0");
+        assert!(
+            collected.lines.iter().any(|l| l == "shape: 1,16"),
+            "main.py should see the advertised shape, got {:?}",
+            collected.lines
+        );
+        assert!(
+            collected.lines.iter().any(|l| l == "count: 16"),
+            "main.py should read all 16 values, got {:?}",
+            collected.lines
+        );
+        assert!(
+            collected.lines.iter().any(|l| l == "sum: 120.0"),
+            "main.py should compute the sum of the received bytes, got {:?}",
+            collected.lines
+        );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    /// The tensor-reply contract end to end with checkable math: a Python model
+    /// reads the input tensor, sums it, and writes the sum as its output tensor.
+    /// The server must stream that tensor back as an `output_chunk`. Asserting
+    /// the decoded value equals the known sum proves the reply tensor is the
+    /// model's real output, not merely that some tensor came back.
+    #[tokio::test]
+    async fn python_backend_streams_computed_output_tensor() {
+        // Reads float32 stdin, writes the sum back as a [1] float32 tensor.
+        let main_py = "\
+import os, struct, sys
+raw = sys.stdin.buffer.read()
+count = len(raw) // 4
+values = struct.unpack('<%df' % count, raw) if count else ()
+total = float(sum(values))
+with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
+    f.write(b'float32 1\\n')
+    f.write(struct.pack('<f', total))
+";
+        let (ml_backends, name) = make_python_model_raw(
+            "python-computed-output",
+            "e2e_python_computed",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
+            main_py,
+        );
+
+        // Values 0..16 sum to 120.
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let collected = run_checkpoint(
+            &mut client,
+            vec![
+                meta(&name),
+                tensor_chunk(vec![1, 16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("python checkpoint with computed output should succeed");
+
+        assert!(collected.saw_done, "stream must end with done=true");
+        assert_eq!(collected.exit_code, 0);
+        assert!(
+            collected.saw_output_chunk,
+            "expected a typed output tensor chunk from the Python model"
+        );
+        assert_eq!(
+            collected.output_shape.as_deref(),
+            Some([1].as_slice()),
+            "output tensor shape"
+        );
+        let output: Vec<f32> = collected
+            .output_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            output,
+            vec![120.0],
+            "output tensor must equal the input sum"
+        );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    /// A contract on a Python model lets the server reject a shape mismatch with
+    /// `InvalidArgument` before ever launching `main.py` — the reviewer's
+    /// motivation for giving Python backends a contract.
+    #[tokio::test]
+    async fn python_backend_rejects_shape_mismatch() {
+        let (ml_backends, name) = make_python_model_with_contract(
+            "python-stdin-reject",
+            "e2e_python_stdin_reject",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
+            STDIN_ECHO_MAIN_PY,
+        );
+
+        // Contract expects a trailing dim of 16; send 15.
+        let values: Vec<f32> = (0..15).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let status = run_checkpoint(
+            &mut client,
+            vec![
+                meta(&name),
+                tensor_chunk(vec![1, 15], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect_err("shape mismatch must be rejected");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    /// The batch-dimension auto-expansion applies to the Python path too: a bare
+    /// `[16]` is expanded to `[1, 16]` before being advertised to `main.py`.
+    #[tokio::test]
+    async fn python_backend_expands_missing_batch_dim() {
+        let (ml_backends, name) = make_python_model_with_contract(
+            "python-stdin-expand",
+            "e2e_python_stdin_expand",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
+            STDIN_ECHO_MAIN_PY,
+        );
+
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let collected = run_checkpoint(
+            &mut client,
+            vec![
+                meta(&name),
+                tensor_chunk(vec![16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("bare [16] python checkpoint should be auto-expanded and succeed");
+
+        assert!(
+            collected.lines.iter().any(|l| l == "shape: 1,16"),
+            "auto-expanded shape must be advertised as 1,16, got {:?}",
+            collected.lines
+        );
+        assert!(
+            collected.lines.iter().any(|l| l == "sum: 120.0"),
+            "main.py should still receive all values, got {:?}",
+            collected.lines
+        );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    /// A `main.py` that never reads stdin must not hang the response, even when
+    /// the input tensor is larger than the OS pipe buffer. The server writes
+    /// stdin on a dedicated thread (which blocks, then sees `BrokenPipe` when the
+    /// process exits) so the stdout reader and terminal `done` still flow. The
+    /// tensor here is ~800 KB — well past the typical 64 KB pipe buffer — so a
+    /// naive write-then-read would deadlock.
+    #[tokio::test]
+    async fn python_backend_unread_large_stdin_does_not_deadlock() {
+        let (ml_backends, name) = make_python_model_with_contract(
+            "python-stdin-unread",
+            "e2e_python_stdin_unread",
+            "input_shape: [200000]\nmax_batch_size: 1\noutput_shape: [1]\n",
+            // Note: never reads stdin.
+            "print('ignored stdin')\n",
+        );
+
+        let values = vec![0.0f32; 200_000];
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let collected = run_checkpoint(
+            &mut client,
+            vec![
+                meta(&name),
+                tensor_chunk(vec![1, 200_000], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("checkpoint must complete even when main.py ignores a large stdin");
+
+        assert!(collected.saw_done, "stream must end with done=true");
+        assert_eq!(collected.exit_code, 0, "main.py exits 0");
+        assert!(
+            collected.lines.iter().any(|l| l == "ignored stdin"),
+            "stdout must still flow while stdin is unread, got {:?}",
+            collected.lines
+        );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
     // ---------------------------------------------------------------------
     // Backend-agnostic protocol surface
     // ---------------------------------------------------------------------
@@ -746,7 +1162,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn view_models_and_health_check() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
         let mut client = connect(addr).await;
@@ -770,7 +1189,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn unknown_model_returns_not_found() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
         let mut client = connect(addr).await;
@@ -793,7 +1215,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn first_message_must_be_metadata() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
         let mut client = connect(addr).await;
@@ -813,7 +1238,10 @@ mod checkpoint_e2e_tests {
     #[tokio::test]
     async fn empty_stream_is_rejected() {
         let ml_backends = fixtures_dir();
-        assert!(ml_backends.join("model3").is_dir(), "model3 fixture missing");
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
 
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
         let mut client = connect(addr).await;

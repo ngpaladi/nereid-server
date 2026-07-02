@@ -35,6 +35,35 @@ pub struct ModelConfig {
     pub name: String,
     pub device: ModelDevice,
     pub queue_capacity: usize,
+    /// Optional explicit backend selector. When set, it decides the model's
+    /// backend (and disambiguates a folder that contains files for both — e.g.
+    /// a `.pt` alongside `main.py`). When absent, the backend is auto-detected
+    /// from the folder contents.
+    #[serde(default)]
+    pub backend: Option<ConfiguredBackend>,
+}
+
+/// An explicitly-declared backend kind in `nereid.yaml` (`backend: "python"` or
+/// `backend: "rust"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfiguredBackend {
+    Python,
+    Rust,
+}
+
+impl<'de> Deserialize<'de> for ConfiguredBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "python" => Ok(ConfiguredBackend::Python),
+            "rust" => Ok(ConfiguredBackend::Rust),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid backend '{other}': expected \"python\" or \"rust\""
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

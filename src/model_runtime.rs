@@ -9,7 +9,7 @@ use tch::{CModule, Device, Tensor};
 use tokio::sync::oneshot;
 use tonic::Status;
 
-use crate::config::ServerConfig;
+use crate::config::{ConfiguredBackend, ServerConfig};
 use crate::inference;
 use crate::python_backend;
 
@@ -17,7 +17,13 @@ pub type InferenceOutput = (Vec<i64>, Vec<u8>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputShapeContract {
-    input_shape: Vec<i64>,
+    /// Declared input tensor shape (excluding batch). `None` for a model that
+    /// consumes no tensor input (e.g. an output-only Python producer).
+    input_shape: Option<Vec<i64>>,
+    /// Declared output tensor shape (excluding batch). Required for Python
+    /// models — every Python reply is a typed tensor written to
+    /// `NEREID_OUTPUT_PATH` and validated/streamed against this.
+    output_shape: Option<Vec<i64>>,
     max_batch_size: i64,
 }
 
@@ -38,6 +44,9 @@ struct RustModelHandle {
 #[derive(Debug)]
 struct PythonModelHandle {
     model_dir: PathBuf,
+    /// Required for Python models: declares the output tensor (and optionally an
+    /// input tensor). Every Python reply is a typed tensor.
+    contract: InputShapeContract,
 }
 
 #[derive(Debug)]
@@ -92,7 +101,7 @@ impl ModelManager {
                 )));
             }
 
-            match detect_backend_kind(&model_dir, &model_cfg.name)? {
+            match detect_backend_kind(&model_dir, &model_cfg.name, model_cfg.backend)? {
                 DetectedBackendKind::Python => {
                     python_backend::prepare_model_envs(
                         std::slice::from_ref(&model_cfg.name),
@@ -105,15 +114,42 @@ impl ModelManager {
                         ))
                     })?;
 
+                    // A Python model must ship a `model_inference.textproto`
+                    // that declares `output_shape`: every reply is a typed
+                    // output tensor. An `input_shape` is optional (a model may
+                    // consume no tensor input).
+                    if !model_dir.join("model_inference.textproto").is_file() {
+                        return Err(Status::failed_precondition(format!(
+                            "Python model '{}' must include a model_inference.textproto declaring output_shape",
+                            model_cfg.name
+                        )));
+                    }
+                    let contract = read_input_contract_from_textproto(&model_dir)?;
+                    if contract.output_shape().is_none() {
+                        return Err(Status::failed_precondition(format!(
+                            "Python model '{}' must declare output_shape in model_inference.textproto (every reply is a typed tensor)",
+                            model_cfg.name
+                        )));
+                    }
+
                     model_names.push(model_cfg.name.clone());
                     handles.insert(
                         model_cfg.name.clone(),
-                        ModelHandle::Python(PythonModelHandle { model_dir }),
+                        ModelHandle::Python(PythonModelHandle {
+                            model_dir,
+                            contract,
+                        }),
                     );
                 }
                 DetectedBackendKind::Rust => {
                     let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
                     let input_contract = read_input_contract_from_textproto(&model_dir)?;
+                    if !input_contract.has_input() {
+                        return Err(Status::failed_precondition(format!(
+                            "Rust model '{}' must declare input_shape in model_inference.textproto",
+                            model_cfg.name
+                        )));
+                    }
                     let device = model_cfg.device.to_tch_device()?;
                     let model_path = pt_file.to_string_lossy().into_owned();
 
@@ -156,7 +192,7 @@ impl ModelManager {
     pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
         match self.handles.get(model_name)? {
             ModelHandle::Rust(handle) => Some(&handle.input_contract),
-            ModelHandle::Python(_) => None,
+            ModelHandle::Python(handle) => Some(&handle.contract),
         }
     }
 
@@ -268,15 +304,32 @@ fn model_dir_has_any_pt_file(model_dir: &Path) -> bool {
 pub fn detect_backend_kind(
     model_dir: &Path,
     model_name: &str,
+    declared: Option<ConfiguredBackend>,
 ) -> Result<DetectedBackendKind, Status> {
-    let is_python =
+    let has_python =
         model_dir.join("main.py").is_file() && model_dir.join("requirements.txt").is_file();
-    let is_rust = model_dir.join("model_inference.textproto").is_file()
+    let has_rust = model_dir.join("model_inference.textproto").is_file()
         && model_dir_has_any_pt_file(model_dir);
 
-    match (is_python, is_rust) {
+    // An explicit `backend` in nereid.yaml decides the kind and disambiguates a
+    // folder holding files for both (e.g. a `.pt` alongside `main.py`); we only
+    // verify the chosen backend's own required files are present.
+    if let Some(declared) = declared {
+        return match declared {
+            ConfiguredBackend::Python if has_python => Ok(DetectedBackendKind::Python),
+            ConfiguredBackend::Python => Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"python\" but is missing main.py + requirements.txt"
+            ))),
+            ConfiguredBackend::Rust if has_rust => Ok(DetectedBackendKind::Rust),
+            ConfiguredBackend::Rust => Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"rust\" but is missing a .pt model + model_inference.textproto"
+            ))),
+        };
+    }
+
+    match (has_python, has_rust) {
         (true, true) => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder contains both main.py and .pt/textproto files; ambiguous backend kind"
+            "model '{model_name}' folder contains both a Python backend (main.py + requirements.txt) and a Rust backend (a .pt model + model_inference.textproto); set `backend` in nereid.yaml to disambiguate"
         ))),
         (false, false) => Err(Status::failed_precondition(format!(
             "model '{model_name}' folder must contain either (main.py + requirements.txt) or (a .pt model + model_inference.textproto)"
@@ -322,6 +375,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
     })?;
 
     fn parse_shape_dims(
+        field: &str,
         raw_value: &str,
         raw_line: &str,
         config_path: &Path,
@@ -332,7 +386,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
             .and_then(|s| s.strip_suffix(']'))
             .ok_or_else(|| {
                 Status::failed_precondition(format!(
-                    "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                    "invalid {field} in {}: '{raw_line}'. expected bracketed dimensions such as `{field}: [1, 16]`",
                     config_path.to_string_lossy()
                 ))
             })?
@@ -346,7 +400,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
         if dims_str.is_empty() {
             return Err(Status::failed_precondition(format!(
-                "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                "invalid {field} in {}: '{raw_line}'. expected bracketed dimensions such as `{field}: [1, 16]`",
                 config_path.to_string_lossy()
             )));
         }
@@ -355,13 +409,13 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         for dim_str in dims_str {
             let dim = dim_str.parse::<i64>().map_err(|err| {
                 Status::failed_precondition(format!(
-                    "failed parsing input_shape dimension '{dim_str}' in {}: {err}",
+                    "failed parsing {field} dimension '{dim_str}' in {}: {err}",
                     config_path.to_string_lossy()
                 ))
             })?;
             if dim == 0 || dim < -1 {
                 return Err(Status::failed_precondition(format!(
-                    "input_shape dimensions in {} must be positive or -1",
+                    "{field} dimensions in {} must be positive or -1",
                     config_path.to_string_lossy()
                 )));
             }
@@ -371,7 +425,8 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         Ok(dims)
     }
 
-    let mut shape = Vec::new();
+    let mut input_shape = None::<Vec<i64>>;
+    let mut output_shape = None::<Vec<i64>>;
     let mut max_batch_size = 0i64;
     for raw_line in contents.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -388,8 +443,20 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
         match field.trim() {
             "input_shape" => {
-                let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
-                shape.extend(dims);
+                input_shape = Some(parse_shape_dims(
+                    "input_shape",
+                    raw_value,
+                    raw_line,
+                    &config_path,
+                )?);
+            }
+            "output_shape" => {
+                output_shape = Some(parse_shape_dims(
+                    "output_shape",
+                    raw_value,
+                    raw_line,
+                    &config_path,
+                )?);
             }
             "max_batch_size" => {
                 max_batch_size = raw_value.trim().parse::<i64>().map_err(|err| {
@@ -409,25 +476,61 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         }
     }
 
-    if shape.is_empty() {
+    if input_shape.is_none() && output_shape.is_none() {
         return Err(Status::failed_precondition(format!(
-            "{} must contain at least one input_shape field",
+            "{} must declare input_shape and/or output_shape",
             config_path.to_string_lossy()
         )));
     }
 
     Ok(InputShapeContract {
-        input_shape: shape,
+        input_shape,
+        output_shape,
         max_batch_size,
     })
 }
 
 impl InputShapeContract {
+    /// The declared output shape (excluding batch), if declared.
+    pub fn output_shape(&self) -> Option<&[i64]> {
+        self.output_shape.as_deref()
+    }
+
+    /// Whether the model consumes a tensor input (has a declared `input_shape`).
+    pub fn has_input(&self) -> bool {
+        self.input_shape.is_some()
+    }
+
+    /// The declared maximum batch size (`0` when no batch dimension is declared).
+    pub fn max_batch_size(&self) -> i64 {
+        self.max_batch_size
+    }
+
+    /// Whether this contract declares a batch dimension.
+    fn has_batch_dim(&self) -> bool {
+        self.max_batch_size > 0
+    }
+
+    /// The request rank when the (optional) batch dimension is included.
+    fn batched_rank(&self, input_shape: &[i64]) -> usize {
+        input_shape.len() + usize::from(self.has_batch_dim())
+    }
+
+    /// True when a batch dimension is declared but the request omits it, in
+    /// which case it is auto-expanded to batch size 1 (see
+    /// [`Self::normalize_request_shape`]).
+    fn omits_batch_dim(&self, input_shape: &[i64], request_shape: &[i64]) -> bool {
+        self.has_batch_dim() && request_shape.len() == input_shape.len()
+    }
+
     pub fn validate_request_shape(
         &self,
         request_shape: &[i64],
         model_name: &str,
     ) -> Result<(), Status> {
+        let input_shape = self.input_shape.as_deref().ok_or_else(|| {
+            Status::internal(format!("model '{model_name}' declares no input tensor"))
+        })?;
         if request_shape.is_empty() {
             return Err(Status::invalid_argument("tensor chunk shape is required"));
         }
@@ -437,28 +540,40 @@ impl InputShapeContract {
             ));
         }
 
-        let expected_rank = self.input_shape.len() + usize::from(self.max_batch_size > 0);
-        if request_shape.len() != expected_rank {
+        // A request may either carry the declared batch dimension or omit it
+        // entirely; an omitted batch dimension is auto-expanded to size 1.
+        let shape_offset = if request_shape.len() == self.batched_rank(input_shape) {
+            if self.has_batch_dim() {
+                let batch_size = request_shape[0];
+                if batch_size > self.max_batch_size {
+                    return Err(Status::invalid_argument(format!(
+                        "batch size {batch_size} exceeds max_batch_size {} for model '{model_name}'",
+                        self.max_batch_size
+                    )));
+                }
+                1
+            } else {
+                0
+            }
+        } else if self.omits_batch_dim(input_shape, request_shape) {
+            0
+        } else {
+            let allowed = if self.has_batch_dim() {
+                format!(
+                    "expected {} (or {} without the batch dimension)",
+                    self.batched_rank(input_shape),
+                    input_shape.len()
+                )
+            } else {
+                format!("expected {}", self.batched_rank(input_shape))
+            };
             return Err(Status::invalid_argument(format!(
-                "input tensor rank mismatch for model '{model_name}': expected {expected_rank}, got {}",
+                "input tensor rank mismatch for model '{model_name}': {allowed}, got {}",
                 request_shape.len()
             )));
-        }
-
-        let shape_offset = if self.max_batch_size > 0 {
-            let batch_size = request_shape[0];
-            if batch_size > self.max_batch_size {
-                return Err(Status::invalid_argument(format!(
-                    "batch size {batch_size} exceeds max_batch_size {} for model '{model_name}'",
-                    self.max_batch_size
-                )));
-            }
-            1
-        } else {
-            0
         };
 
-        for (index, expected_dim) in self.input_shape.iter().enumerate() {
+        for (index, expected_dim) in input_shape.iter().enumerate() {
             let actual_dim = request_shape[index + shape_offset];
             if *expected_dim != -1 && *expected_dim != actual_dim {
                 return Err(Status::invalid_argument(format!(
@@ -472,6 +587,75 @@ impl InputShapeContract {
 
         Ok(())
     }
+
+    /// Validate a Python model's *output* tensor shape (as written to
+    /// `NEREID_OUTPUT_PATH`) against the declared `output_shape`. A declared
+    /// batch dimension may be present or omitted; when present and
+    /// `expected_batch` is `Some`, it must match the request's batch. `-1`
+    /// declared dims match anything. Returns `Status::internal` on mismatch — a
+    /// wrong-shaped reply is a model bug.
+    pub fn validate_output_shape(
+        &self,
+        actual: &[i64],
+        expected_batch: Option<i64>,
+        model_name: &str,
+    ) -> Result<(), Status> {
+        let Some(declared) = self.output_shape.as_deref() else {
+            return Ok(());
+        };
+
+        let offset = if self.has_batch_dim() && actual.len() == declared.len() + 1 {
+            1
+        } else if actual.len() == declared.len() {
+            0
+        } else {
+            return Err(Status::internal(format!(
+                "model '{model_name}' output rank mismatch: declared {} dims, got {}",
+                declared.len(),
+                actual.len()
+            )));
+        };
+
+        if offset == 1
+            && let Some(expected) = expected_batch
+            && actual[0] != expected
+        {
+            return Err(Status::internal(format!(
+                "model '{model_name}' output batch size {} does not match input batch size {expected}",
+                actual[0]
+            )));
+        }
+
+        for (index, expected_dim) in declared.iter().enumerate() {
+            let actual_dim = actual[index + offset];
+            if *expected_dim != -1 && *expected_dim != actual_dim {
+                return Err(Status::internal(format!(
+                    "model '{model_name}' output shape mismatch at dimension {}: declared {}, got {}",
+                    index + offset,
+                    expected_dim,
+                    actual_dim
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return the effective tensor shape to feed the model, inserting a leading
+    /// batch dimension of 1 when the request omitted the declared batch
+    /// dimension. Expects `request_shape` to have already passed
+    /// [`Self::validate_request_shape`].
+    pub fn normalize_request_shape(&self, request_shape: Vec<i64>) -> Vec<i64> {
+        match self.input_shape.as_deref() {
+            Some(input_shape) if self.omits_batch_dim(input_shape, &request_shape) => {
+                let mut expanded = Vec::with_capacity(request_shape.len() + 1);
+                expanded.push(1);
+                expanded.extend(request_shape);
+                expanded
+            }
+            _ => request_shape,
+        }
+    }
 }
 
 pub fn tensor_from_input_bytes(
@@ -484,7 +668,7 @@ pub fn tensor_from_input_bytes(
             "no tensor chunk data provided for Rust inference model",
         ));
     }
-    if tensor_bytes.len() % 4 != 0 {
+    if !tensor_bytes.len().is_multiple_of(4) {
         return Err(Status::invalid_argument(
             "tensor chunk bytes must be a multiple of 4 for float32",
         ));
@@ -522,7 +706,7 @@ mod tests {
         DetectedBackendKind, InputShapeContract, detect_backend_kind,
         find_exactly_one_pt_model_file, read_input_contract_from_textproto,
     };
-    use crate::config::load_server_config;
+    use crate::config::{ConfiguredBackend, load_server_config};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -580,7 +764,8 @@ mod tests {
         assert_eq!(
             contract,
             InputShapeContract {
-                input_shape: vec![-1, 16],
+                input_shape: Some(vec![-1, 16]),
+                output_shape: None,
                 max_batch_size: 8
             }
         );
@@ -605,7 +790,8 @@ mod tests {
     #[test]
     fn input_contract_without_batch_uses_request_shape_directly() {
         let contract = InputShapeContract {
-            input_shape: vec![-1, 16],
+            input_shape: Some(vec![-1, 16]),
+            output_shape: None,
             max_batch_size: 0,
         };
 
@@ -620,13 +806,42 @@ mod tests {
     }
 
     #[test]
+    fn input_contract_auto_expands_missing_batch_dim() {
+        let contract = InputShapeContract {
+            input_shape: Some(vec![16]),
+            output_shape: None,
+            max_batch_size: 10,
+        };
+
+        // Bare shape (batch omitted) and explicit batch shape both validate.
+        contract
+            .validate_request_shape(&[16], "model")
+            .expect("bare shape should be accepted");
+        contract
+            .validate_request_shape(&[2, 16], "model")
+            .expect("explicit batch shape should be accepted");
+
+        // The bare shape is expanded to a leading batch dimension of 1, while an
+        // explicit batch shape is passed through untouched.
+        assert_eq!(contract.normalize_request_shape(vec![16]), vec![1, 16]);
+        assert_eq!(contract.normalize_request_shape(vec![2, 16]), vec![2, 16]);
+
+        // A genuinely wrong rank is still rejected.
+        assert!(
+            contract
+                .validate_request_shape(&[1, 1, 16], "model")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn detect_backend_kind_recognizes_python_folder() {
         let base = temp_dir("kind-python");
         fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
         fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
 
         assert_eq!(
-            detect_backend_kind(&base, "model").expect("should detect python"),
+            detect_backend_kind(&base, "model", None).expect("should detect python"),
             DetectedBackendKind::Python
         );
 
@@ -644,7 +859,7 @@ mod tests {
         fs::write(base.join("model.pt"), b"x").expect("write model.pt");
 
         assert_eq!(
-            detect_backend_kind(&base, "model").expect("should detect rust"),
+            detect_backend_kind(&base, "model", None).expect("should detect rust"),
             DetectedBackendKind::Rust
         );
 
@@ -663,8 +878,39 @@ mod tests {
         .expect("write textproto");
         fs::write(base.join("model.pt"), b"x").expect("write model.pt");
 
-        assert!(detect_backend_kind(&base, "model").is_err());
+        // Auto-detection (no declared backend) is ambiguous and rejected...
+        assert!(detect_backend_kind(&base, "model", None).is_err());
+        // ...but an explicit backend disambiguates, allowing a `.pt` to live
+        // alongside main.py (and vice versa).
+        assert_eq!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Python))
+                .expect("declared python resolves"),
+            DetectedBackendKind::Python
+        );
+        assert_eq!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Rust))
+                .expect("declared rust resolves"),
+            DetectedBackendKind::Rust
+        );
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_backend_kind_declared_backend_requires_its_files() {
+        // A folder with only Python files but declaring backend "rust" fails.
+        let base = temp_dir("kind-declared-mismatch");
+        fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
+        fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
+        assert!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Rust)).is_err(),
+            "declared rust without a .pt/textproto must fail"
+        );
+        assert_eq!(
+            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Python))
+                .expect("declared python matches files"),
+            DetectedBackendKind::Python
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -672,7 +918,7 @@ mod tests {
     fn detect_backend_kind_rejects_empty_folder() {
         let base = temp_dir("kind-empty");
 
-        assert!(detect_backend_kind(&base, "model").is_err());
+        assert!(detect_backend_kind(&base, "model", None).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -680,7 +926,8 @@ mod tests {
     #[test]
     fn input_contract_allows_multiple_variable_dims() {
         let contract = InputShapeContract {
-            input_shape: vec![-1, -1, 16],
+            input_shape: Some(vec![-1, -1, 16]),
+            output_shape: None,
             max_batch_size: 4,
         };
 

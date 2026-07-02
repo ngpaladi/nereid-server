@@ -10,6 +10,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Style/lint gate: fails the build on unformatted code or clippy warnings, so
+  # cosmetic reformatting can't creep into functional diffs.
+  lint:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install rustfmt and clippy
+      run: rustup component add rustfmt clippy
+
+    - name: Check formatting
+      run: cargo fmt --all --check
+
+    - name: Clippy (deny warnings)
+      run: cargo clippy --all-targets -- -D warnings
+
   build:
 
     runs-on: ubuntu-latest

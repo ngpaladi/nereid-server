@@ -13,9 +13,13 @@ arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 - `Nereid/HealthCheck` returns status `ok`.
 - `Nereid/ViewModels` returns model names configured in `nereid.yaml`.
 - `Nereid/Checkpoint` only accepts `model_name` values configured in `nereid.yaml`. The server
-  detects each model's backend kind from its folder contents:
-  - `main.py` + `requirements.txt` -> runs `main.py` in that model's venv and streams its
-    stdout/stderr lines as output chunks.
+  detects each model's backend kind from its folder contents (or from an explicit `backend` in
+  `nereid.yaml`):
+  - `main.py` + `requirements.txt` -> runs `main.py` in that model's venv, streams its
+    stdout/stderr lines as text chunks, and streams the model's typed output tensor as
+    `output_chunk`s. A Python model must ship a `model_inference.textproto` declaring
+    `output_shape` (see [Python tensor contract](#python-tensor-contract)); if it also declares
+    `input_shape`, the validated request tensor is piped into `main.py` on stdin.
   - `model_inference.textproto` + `.pt` model -> runs Rust inference for that model and streams
     the output tensor.
 
@@ -23,12 +27,17 @@ arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 Each model must be a folder under `<server.ml_backends_path>/<model_name>/` with:
 - `requirements.txt`
 - `main.py`
+- `model_inference.textproto` declaring `output_shape` (required — see below)
 OR
 - `model_inference.textproto` (for Rust `.pt` inference models)
 - `.pt` model
 
-A model folder must satisfy exactly one of these contracts; the server fails to start if a
-configured model's folder matches both or neither.
+By default the backend is auto-detected: a Python model by `main.py` + `requirements.txt`,
+a Rust model by `model_inference.textproto` + a `.pt` file. If a folder matches both or
+neither, auto-detection fails at startup. To ship files for both backends in one folder
+(e.g. a `.pt` model alongside `main.py`), set `backend: "python"` or `backend: "rust"` on
+that model in `nereid.yaml`; the declared backend is authoritative and only its own
+required files are checked.
 
 On server startup (for models using main.py):
 - If `venv/` exists for a model, it is reused.
@@ -46,11 +55,45 @@ max_batch_size: 8
 # input_shape: [-1, 16]  # -1 means this dimension is client-provided.
 ```
 
-`input_shape` excludes batch size. If `max_batch_size` is greater than `0`, the request
-shape from the client must include a leading batch dimension and the server enforces that it is at most
-`max_batch_size`. If `max_batch_size` is `0` or omitted, the request shape must match the
-`input_shape` rank directly. Fixed dimensions must match exactly; `-1` dimensions may be
-any positive value.
+`input_shape` excludes batch size. If `max_batch_size` is greater than `0`, the request shape
+from the client may include a leading batch dimension, which the server enforces is at most
+`max_batch_size`. A request that omits the batch dimension (sending just the `input_shape` rank)
+is accepted and auto-expanded to batch size 1 — e.g. with `input_shape: [16]` a request shape of
+`[16]` is treated as `[1, 16]`. If `max_batch_size` is `0` or omitted, the request shape must
+match the `input_shape` rank directly. Fixed dimensions must match exactly; `-1` dimensions may
+be any positive value.
+
+### Python tensor contract
+Every Python model **must** ship a `model_inference.textproto` declaring `output_shape`: each
+reply is a typed output tensor. `input_shape` is optional — a model may consume no tensor input.
+
+**Input (optional).** When `input_shape` is declared, the server validates each request tensor
+against it — rejecting shape/rank/batch mismatches with `InvalidArgument` *before* launching
+`main.py` — and delivers the validated tensor to the process:
+- **stdin**: the raw tensor bytes, little-endian `float32`, row-major.
+- **`NEREID_INPUT_SHAPE`**: the (batch-normalized) shape, comma-separated, e.g. `1,16`.
+- **`NEREID_INPUT_DTYPE`**: the element dtype, currently always `float32`.
+
+**Output (required).** `main.py` writes its output tensor to the file named by
+**`NEREID_OUTPUT_PATH`** in a self-describing framed format: a UTF-8 header line
+`"float32 d0,d1,...\n"` followed by the raw little-endian `float32` bytes. The server validates
+it against the declared `output_shape` (and the request batch size) and streams it back as
+`CheckpointResponse.output_chunk`s. stdout/stderr remain available as streamed text log chunks.
+
+A minimal `main.py` (no third-party dependencies) reading an input tensor and replying with one:
+```python
+import os, struct, sys
+
+raw = sys.stdin.buffer.read()  # present when input_shape is declared
+values = struct.unpack("<%df" % (len(raw) // 4), raw) if raw else ()
+result = [float(sum(values))]  # ... run inference ...
+
+with open(os.environ["NEREID_OUTPUT_PATH"], "wb") as f:
+    f.write(("float32 %d\n" % len(result)).encode("utf-8"))
+    f.write(struct.pack("<%df" % len(result), *result))
+```
+See `ml-backends/model1` and `ml-backends/model2` for complete examples. A Python model that
+exits 0 without writing a valid output tensor is a contract violation and the request fails.
 
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).
@@ -124,6 +167,19 @@ export LD_LIBRARY_PATH=$(dirname "$(find target -name libtorch_cpu.so -printf '%
 This is a known `tch-rs`/`torch-sys` characteristic (libtorch ships as shared libraries with
 no rpath embedded in the final binary), not specific to this project. See the
 [`tch-rs` FAQ](https://github.com/LaurentMazare/tch-rs#faq) for background.
+
+### Using an external libtorch installation
+During a Cargo build, `tch-rs` defaults to downloading a CPU-only build of libtorch, unless
+certain environment variables are set (see
+[the getting started notes](https://github.com/LaurentMazare/tch-rs#getting-started)). It may
+be desirable to instead use an external installation of libtorch, by setting the `LIBTORCH`
+environment variable (see
+[Libtorch Manual Install](https://github.com/LaurentMazare/tch-rs#libtorch-manual-install)) to
+the unpacked location prior to running `cargo build`. Be aware that this must use the precise
+version of libtorch that `tch-rs` expects (v2.5.1 for `tch-rs` v0.18.1), and must use the
+cxx11 ABI (PyTorch additionally provides builds with the pre-cxx11 ABI for older versions,
+including 2.5.1), and must have been built against a CUDA version compatible with the system's
+CUDA libraries and drivers.
 
 ## Python mock ED client
 The Python client is a YAML-configured mock ED producer runner. It supports fixed shapes, a list of possible shapes, and random shape generation for variable-shape models.
