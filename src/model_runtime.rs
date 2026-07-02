@@ -17,7 +17,13 @@ pub type InferenceOutput = (Vec<i64>, Vec<u8>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputShapeContract {
-    input_shape: Vec<i64>,
+    /// Declared input tensor shape (excluding batch). `None` for a model that
+    /// consumes no tensor input (e.g. an output-only Python producer).
+    input_shape: Option<Vec<i64>>,
+    /// Declared output tensor shape (excluding batch). Required for Python
+    /// models — every Python reply is a typed tensor written to
+    /// `NEREID_OUTPUT_PATH` and validated/streamed against this.
+    output_shape: Option<Vec<i64>>,
     max_batch_size: i64,
 }
 
@@ -38,7 +44,9 @@ struct RustModelHandle {
 #[derive(Debug)]
 struct PythonModelHandle {
     model_dir: PathBuf,
-    input_contract: Option<InputShapeContract>,
+    /// Required for Python models: declares the output tensor (and optionally an
+    /// input tensor). Every Python reply is a typed tensor.
+    contract: InputShapeContract,
 }
 
 #[derive(Debug)]
@@ -106,28 +114,42 @@ impl ModelManager {
                         ))
                     })?;
 
-                    // A Python model may optionally ship a
-                    // `model_inference.textproto`; when present it is used to
-                    // validate (and batch-normalize) the input tensor before it
-                    // is piped into `main.py`.
-                    let input_contract = if model_dir.join("model_inference.textproto").is_file() {
-                        Some(read_input_contract_from_textproto(&model_dir)?)
-                    } else {
-                        None
-                    };
+                    // A Python model must ship a `model_inference.textproto`
+                    // that declares `output_shape`: every reply is a typed
+                    // output tensor. An `input_shape` is optional (a model may
+                    // consume no tensor input).
+                    if !model_dir.join("model_inference.textproto").is_file() {
+                        return Err(Status::failed_precondition(format!(
+                            "Python model '{}' must include a model_inference.textproto declaring output_shape",
+                            model_cfg.name
+                        )));
+                    }
+                    let contract = read_input_contract_from_textproto(&model_dir)?;
+                    if contract.output_shape().is_none() {
+                        return Err(Status::failed_precondition(format!(
+                            "Python model '{}' must declare output_shape in model_inference.textproto (every reply is a typed tensor)",
+                            model_cfg.name
+                        )));
+                    }
 
                     model_names.push(model_cfg.name.clone());
                     handles.insert(
                         model_cfg.name.clone(),
                         ModelHandle::Python(PythonModelHandle {
                             model_dir,
-                            input_contract,
+                            contract,
                         }),
                     );
                 }
                 DetectedBackendKind::Rust => {
                     let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
                     let input_contract = read_input_contract_from_textproto(&model_dir)?;
+                    if !input_contract.has_input() {
+                        return Err(Status::failed_precondition(format!(
+                            "Rust model '{}' must declare input_shape in model_inference.textproto",
+                            model_cfg.name
+                        )));
+                    }
                     let device = model_cfg.device.to_tch_device()?;
                     let model_path = pt_file.to_string_lossy().into_owned();
 
@@ -170,7 +192,7 @@ impl ModelManager {
     pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
         match self.handles.get(model_name)? {
             ModelHandle::Rust(handle) => Some(&handle.input_contract),
-            ModelHandle::Python(handle) => handle.input_contract.as_ref(),
+            ModelHandle::Python(handle) => Some(&handle.contract),
         }
     }
 
@@ -353,6 +375,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
     })?;
 
     fn parse_shape_dims(
+        field: &str,
         raw_value: &str,
         raw_line: &str,
         config_path: &Path,
@@ -363,7 +386,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
             .and_then(|s| s.strip_suffix(']'))
             .ok_or_else(|| {
                 Status::failed_precondition(format!(
-                    "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                    "invalid {field} in {}: '{raw_line}'. expected bracketed dimensions such as `{field}: [1, 16]`",
                     config_path.to_string_lossy()
                 ))
             })?
@@ -377,7 +400,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
         if dims_str.is_empty() {
             return Err(Status::failed_precondition(format!(
-                "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                "invalid {field} in {}: '{raw_line}'. expected bracketed dimensions such as `{field}: [1, 16]`",
                 config_path.to_string_lossy()
             )));
         }
@@ -386,13 +409,13 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         for dim_str in dims_str {
             let dim = dim_str.parse::<i64>().map_err(|err| {
                 Status::failed_precondition(format!(
-                    "failed parsing input_shape dimension '{dim_str}' in {}: {err}",
+                    "failed parsing {field} dimension '{dim_str}' in {}: {err}",
                     config_path.to_string_lossy()
                 ))
             })?;
             if dim == 0 || dim < -1 {
                 return Err(Status::failed_precondition(format!(
-                    "input_shape dimensions in {} must be positive or -1",
+                    "{field} dimensions in {} must be positive or -1",
                     config_path.to_string_lossy()
                 )));
             }
@@ -402,7 +425,8 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         Ok(dims)
     }
 
-    let mut shape = Vec::new();
+    let mut input_shape = None::<Vec<i64>>;
+    let mut output_shape = None::<Vec<i64>>;
     let mut max_batch_size = 0i64;
     for raw_line in contents.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -419,8 +443,20 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
         match field.trim() {
             "input_shape" => {
-                let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
-                shape.extend(dims);
+                input_shape = Some(parse_shape_dims(
+                    "input_shape",
+                    raw_value,
+                    raw_line,
+                    &config_path,
+                )?);
+            }
+            "output_shape" => {
+                output_shape = Some(parse_shape_dims(
+                    "output_shape",
+                    raw_value,
+                    raw_line,
+                    &config_path,
+                )?);
             }
             "max_batch_size" => {
                 max_batch_size = raw_value.trim().parse::<i64>().map_err(|err| {
@@ -440,35 +476,51 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         }
     }
 
-    if shape.is_empty() {
+    if input_shape.is_none() && output_shape.is_none() {
         return Err(Status::failed_precondition(format!(
-            "{} must contain at least one input_shape field",
+            "{} must declare input_shape and/or output_shape",
             config_path.to_string_lossy()
         )));
     }
 
     Ok(InputShapeContract {
-        input_shape: shape,
+        input_shape,
+        output_shape,
         max_batch_size,
     })
 }
 
 impl InputShapeContract {
+    /// The declared output shape (excluding batch), if declared.
+    pub fn output_shape(&self) -> Option<&[i64]> {
+        self.output_shape.as_deref()
+    }
+
+    /// Whether the model consumes a tensor input (has a declared `input_shape`).
+    pub fn has_input(&self) -> bool {
+        self.input_shape.is_some()
+    }
+
+    /// The declared maximum batch size (`0` when no batch dimension is declared).
+    pub fn max_batch_size(&self) -> i64 {
+        self.max_batch_size
+    }
+
     /// Whether this contract declares a batch dimension.
     fn has_batch_dim(&self) -> bool {
         self.max_batch_size > 0
     }
 
     /// The request rank when the (optional) batch dimension is included.
-    fn batched_rank(&self) -> usize {
-        self.input_shape.len() + usize::from(self.has_batch_dim())
+    fn batched_rank(&self, input_shape: &[i64]) -> usize {
+        input_shape.len() + usize::from(self.has_batch_dim())
     }
 
     /// True when a batch dimension is declared but the request omits it, in
     /// which case it is auto-expanded to batch size 1 (see
     /// [`Self::normalize_request_shape`]).
-    fn omits_batch_dim(&self, request_shape: &[i64]) -> bool {
-        self.has_batch_dim() && request_shape.len() == self.input_shape.len()
+    fn omits_batch_dim(&self, input_shape: &[i64], request_shape: &[i64]) -> bool {
+        self.has_batch_dim() && request_shape.len() == input_shape.len()
     }
 
     pub fn validate_request_shape(
@@ -476,6 +528,9 @@ impl InputShapeContract {
         request_shape: &[i64],
         model_name: &str,
     ) -> Result<(), Status> {
+        let input_shape = self.input_shape.as_deref().ok_or_else(|| {
+            Status::internal(format!("model '{model_name}' declares no input tensor"))
+        })?;
         if request_shape.is_empty() {
             return Err(Status::invalid_argument("tensor chunk shape is required"));
         }
@@ -487,7 +542,7 @@ impl InputShapeContract {
 
         // A request may either carry the declared batch dimension or omit it
         // entirely; an omitted batch dimension is auto-expanded to size 1.
-        let shape_offset = if request_shape.len() == self.batched_rank() {
+        let shape_offset = if request_shape.len() == self.batched_rank(input_shape) {
             if self.has_batch_dim() {
                 let batch_size = request_shape[0];
                 if batch_size > self.max_batch_size {
@@ -500,17 +555,17 @@ impl InputShapeContract {
             } else {
                 0
             }
-        } else if self.omits_batch_dim(request_shape) {
+        } else if self.omits_batch_dim(input_shape, request_shape) {
             0
         } else {
             let allowed = if self.has_batch_dim() {
                 format!(
                     "expected {} (or {} without the batch dimension)",
-                    self.batched_rank(),
-                    self.input_shape.len()
+                    self.batched_rank(input_shape),
+                    input_shape.len()
                 )
             } else {
-                format!("expected {}", self.batched_rank())
+                format!("expected {}", self.batched_rank(input_shape))
             };
             return Err(Status::invalid_argument(format!(
                 "input tensor rank mismatch for model '{model_name}': {allowed}, got {}",
@@ -518,7 +573,7 @@ impl InputShapeContract {
             )));
         };
 
-        for (index, expected_dim) in self.input_shape.iter().enumerate() {
+        for (index, expected_dim) in input_shape.iter().enumerate() {
             let actual_dim = request_shape[index + shape_offset];
             if *expected_dim != -1 && *expected_dim != actual_dim {
                 return Err(Status::invalid_argument(format!(
@@ -533,18 +588,72 @@ impl InputShapeContract {
         Ok(())
     }
 
+    /// Validate a Python model's *output* tensor shape (as written to
+    /// `NEREID_OUTPUT_PATH`) against the declared `output_shape`. A declared
+    /// batch dimension may be present or omitted; when present and
+    /// `expected_batch` is `Some`, it must match the request's batch. `-1`
+    /// declared dims match anything. Returns `Status::internal` on mismatch — a
+    /// wrong-shaped reply is a model bug.
+    pub fn validate_output_shape(
+        &self,
+        actual: &[i64],
+        expected_batch: Option<i64>,
+        model_name: &str,
+    ) -> Result<(), Status> {
+        let Some(declared) = self.output_shape.as_deref() else {
+            return Ok(());
+        };
+
+        let offset = if self.has_batch_dim() && actual.len() == declared.len() + 1 {
+            1
+        } else if actual.len() == declared.len() {
+            0
+        } else {
+            return Err(Status::internal(format!(
+                "model '{model_name}' output rank mismatch: declared {} dims, got {}",
+                declared.len(),
+                actual.len()
+            )));
+        };
+
+        if offset == 1
+            && let Some(expected) = expected_batch
+            && actual[0] != expected
+        {
+            return Err(Status::internal(format!(
+                "model '{model_name}' output batch size {} does not match input batch size {expected}",
+                actual[0]
+            )));
+        }
+
+        for (index, expected_dim) in declared.iter().enumerate() {
+            let actual_dim = actual[index + offset];
+            if *expected_dim != -1 && *expected_dim != actual_dim {
+                return Err(Status::internal(format!(
+                    "model '{model_name}' output shape mismatch at dimension {}: declared {}, got {}",
+                    index + offset,
+                    expected_dim,
+                    actual_dim
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Return the effective tensor shape to feed the model, inserting a leading
     /// batch dimension of 1 when the request omitted the declared batch
     /// dimension. Expects `request_shape` to have already passed
     /// [`Self::validate_request_shape`].
     pub fn normalize_request_shape(&self, request_shape: Vec<i64>) -> Vec<i64> {
-        if self.omits_batch_dim(&request_shape) {
-            let mut expanded = Vec::with_capacity(request_shape.len() + 1);
-            expanded.push(1);
-            expanded.extend(request_shape);
-            expanded
-        } else {
-            request_shape
+        match self.input_shape.as_deref() {
+            Some(input_shape) if self.omits_batch_dim(input_shape, &request_shape) => {
+                let mut expanded = Vec::with_capacity(request_shape.len() + 1);
+                expanded.push(1);
+                expanded.extend(request_shape);
+                expanded
+            }
+            _ => request_shape,
         }
     }
 }
@@ -655,7 +764,8 @@ mod tests {
         assert_eq!(
             contract,
             InputShapeContract {
-                input_shape: vec![-1, 16],
+                input_shape: Some(vec![-1, 16]),
+                output_shape: None,
                 max_batch_size: 8
             }
         );
@@ -680,7 +790,8 @@ mod tests {
     #[test]
     fn input_contract_without_batch_uses_request_shape_directly() {
         let contract = InputShapeContract {
-            input_shape: vec![-1, 16],
+            input_shape: Some(vec![-1, 16]),
+            output_shape: None,
             max_batch_size: 0,
         };
 
@@ -697,7 +808,8 @@ mod tests {
     #[test]
     fn input_contract_auto_expands_missing_batch_dim() {
         let contract = InputShapeContract {
-            input_shape: vec![16],
+            input_shape: Some(vec![16]),
+            output_shape: None,
             max_batch_size: 10,
         };
 
@@ -814,7 +926,8 @@ mod tests {
     #[test]
     fn input_contract_allows_multiple_variable_dims() {
         let contract = InputShapeContract {
-            input_shape: vec![-1, -1, 16],
+            input_shape: Some(vec![-1, -1, 16]),
+            output_shape: None,
             max_batch_size: 4,
         };
 

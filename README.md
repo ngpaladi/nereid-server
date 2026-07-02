@@ -13,11 +13,13 @@ arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 - `Nereid/HealthCheck` returns status `ok`.
 - `Nereid/ViewModels` returns model names configured in `nereid.yaml`.
 - `Nereid/Checkpoint` only accepts `model_name` values configured in `nereid.yaml`. The server
-  detects each model's backend kind from its folder contents:
-  - `main.py` + `requirements.txt` -> runs `main.py` in that model's venv and streams its
-    stdout/stderr lines as output chunks. If the folder also includes a
-    `model_inference.textproto`, the server validates the request tensor against that contract
-    and pipes it into `main.py` on stdin (see [Python input contract](#python-input-contract)).
+  detects each model's backend kind from its folder contents (or from an explicit `backend` in
+  `nereid.yaml`):
+  - `main.py` + `requirements.txt` -> runs `main.py` in that model's venv, streams its
+    stdout/stderr lines as text chunks, and streams the model's typed output tensor as
+    `output_chunk`s. A Python model must ship a `model_inference.textproto` declaring
+    `output_shape` (see [Python tensor contract](#python-tensor-contract)); if it also declares
+    `input_shape`, the validated request tensor is piped into `main.py` on stdin.
   - `model_inference.textproto` + `.pt` model -> runs Rust inference for that model and streams
     the output tensor.
 
@@ -25,7 +27,7 @@ arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
 Each model must be a folder under `<server.ml_backends_path>/<model_name>/` with:
 - `requirements.txt`
 - `main.py`
-- `model_inference.textproto` (optional — adds input validation, see below)
+- `model_inference.textproto` declaring `output_shape` (required — see below)
 OR
 - `model_inference.textproto` (for Rust `.pt` inference models)
 - `.pt` model
@@ -61,27 +63,37 @@ is accepted and auto-expanded to batch size 1 — e.g. with `input_shape: [16]` 
 match the `input_shape` rank directly. Fixed dimensions must match exactly; `-1` dimensions may
 be any positive value.
 
-### Python input contract
-A Python model folder may include a `model_inference.textproto` (the same format as Rust models).
-When present, the server validates each request tensor against it — rejecting shape/rank/batch
-mismatches with an `InvalidArgument` status *before* launching `main.py` — and then delivers the
-validated tensor to the process:
-- **stdin**: the raw tensor bytes, little-endian `float32`, in row-major order.
-- **`NEREID_INPUT_SHAPE`**: the (batch-normalized) shape as comma-separated dimensions, e.g. `1,16`.
+### Python tensor contract
+Every Python model **must** ship a `model_inference.textproto` declaring `output_shape`: each
+reply is a typed output tensor. `input_shape` is optional — a model may consume no tensor input.
+
+**Input (optional).** When `input_shape` is declared, the server validates each request tensor
+against it — rejecting shape/rank/batch mismatches with `InvalidArgument` *before* launching
+`main.py` — and delivers the validated tensor to the process:
+- **stdin**: the raw tensor bytes, little-endian `float32`, row-major.
+- **`NEREID_INPUT_SHAPE`**: the (batch-normalized) shape, comma-separated, e.g. `1,16`.
 - **`NEREID_INPUT_DTYPE`**: the element dtype, currently always `float32`.
 
-A minimal `main.py` reading the tensor (no third-party dependencies):
+**Output (required).** `main.py` writes its output tensor to the file named by
+**`NEREID_OUTPUT_PATH`** in a self-describing framed format: a UTF-8 header line
+`"float32 d0,d1,...\n"` followed by the raw little-endian `float32` bytes. The server validates
+it against the declared `output_shape` (and the request batch size) and streams it back as
+`CheckpointResponse.output_chunk`s. stdout/stderr remain available as streamed text log chunks.
+
+A minimal `main.py` (no third-party dependencies) reading an input tensor and replying with one:
 ```python
 import os, struct, sys
 
-shape = [int(d) for d in os.environ["NEREID_INPUT_SHAPE"].split(",")]
-raw = sys.stdin.buffer.read()
-values = struct.unpack("<%df" % (len(raw) // 4), raw)
-# ... reshape `values` to `shape` and run inference ...
+raw = sys.stdin.buffer.read()  # present when input_shape is declared
+values = struct.unpack("<%df" % (len(raw) // 4), raw) if raw else ()
+result = [float(sum(values))]  # ... run inference ...
+
+with open(os.environ["NEREID_OUTPUT_PATH"], "wb") as f:
+    f.write(("float32 %d\n" % len(result)).encode("utf-8"))
+    f.write(struct.pack("<%df" % len(result), *result))
 ```
-Without a `model_inference.textproto`, a Python model receives no tensor input (stdin is closed)
-and the request stream is simply drained — the original behavior. Note that *output* from a
-Python model is always its stdout/stderr text; the contract governs input only.
+See `ml-backends/model1` and `ml-backends/model2` for complete examples. A Python model that
+exits 0 without writing a valid output tensor is a contract violation and the request fails.
 
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).

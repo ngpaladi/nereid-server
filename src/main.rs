@@ -228,24 +228,41 @@ impl Nereid for NereidService {
         }
 
         if let Some(model_dir) = self.model_manager.python_model_dir(&model_name) {
-            // A Python model that declares an input contract receives the
-            // validated tensor on stdin; a contract-less Python model keeps the
-            // original behavior of draining the stream and running `main.py`
-            // with no tensor input.
-            let input = match self.model_manager.input_contract(&model_name) {
-                Some(contract) => {
-                    let contract = contract.clone();
-                    let (bytes, shape) =
-                        collect_input_tensor(&mut stream, &contract, &model_name).await?;
-                    Some(python_backend::PythonInput { shape, bytes })
-                }
-                None => {
-                    tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
+            // Every Python model has a required contract declaring output_shape.
+            // When it also declares input_shape, the validated tensor is piped
+            // in on stdin; otherwise the request stream is drained and no tensor
+            // is sent. Either way, main.py replies with a typed output tensor.
+            let contract = self
+                .model_manager
+                .input_contract(&model_name)
+                .ok_or_else(|| {
+                    Status::internal(format!(
+                        "Python model '{model_name}' is missing its contract"
+                    ))
+                })?
+                .clone();
+
+            let (input, expected_batch) = if contract.has_input() {
+                let (bytes, shape) =
+                    collect_input_tensor(&mut stream, &contract, &model_name).await?;
+                let batch = if contract.max_batch_size() > 0 {
+                    shape.first().copied()
+                } else {
                     None
-                }
+                };
+                (Some(python_backend::PythonInput { shape, bytes }), batch)
+            } else {
+                tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
+                (None, None)
             };
-            let python_stream =
-                python_backend::spawn_python_checkpoint_stream(&model_name, model_dir, input)?;
+
+            let python_stream = python_backend::spawn_python_checkpoint_stream(
+                &model_name,
+                model_dir,
+                input,
+                contract,
+                expected_batch,
+            )?;
             return Ok(Response::new(python_stream));
         }
 
@@ -455,34 +472,70 @@ mod checkpoint_e2e_tests {
         Ok(collected)
     }
 
-    /// Create a self-contained Python backend fixture under a fresh temp
+    /// A tail appended to every Python fixture's `main.py`: writes the unit
+    /// output tensor `[42.0]` (shape `[1]`) to `NEREID_OUTPUT_PATH`, satisfying
+    /// the "every Python reply is a typed tensor" contract. It runs after the
+    /// fixture's own body, so a body that `sys.exit`s first never reaches it.
+    const WRITE_UNIT_TENSOR: &str = "
+import os as _os, struct as _struct
+with open(_os.environ['NEREID_OUTPUT_PATH'], 'wb') as _f:
+    _f.write(b'float32 1\\n')
+    _f.write(_struct.pack('<f', 42.0))
+";
+
+    /// Create a self-contained *output-only* Python backend fixture (declares
+    /// only `output_shape: [1]`, consumes no input tensor) under a fresh temp
     /// `ml-backends` dir. An empty `requirements.txt` keeps the venv build that
-    /// `ModelManager::from_config` performs cheap. Returns `(ml_backends, name)`.
+    /// `ModelManager::from_config` performs cheap. The unit-tensor tail is
+    /// appended so the model satisfies the tensor-reply contract.
     fn make_python_model(prefix: &str, name: &str, main_py: &str) -> (PathBuf, String) {
-        let ml_backends = temp_dir(prefix);
-        let model_dir = ml_backends.join(name);
-        std::fs::create_dir_all(&model_dir).expect("create model dir");
-        std::fs::write(model_dir.join("requirements.txt"), b"\n").expect("write requirements.txt");
-        std::fs::write(model_dir.join("main.py"), main_py.as_bytes()).expect("write main.py");
-        (ml_backends, name.to_string())
+        make_python_model_with_contract(prefix, name, "output_shape: [1]\n", main_py)
     }
 
-    /// Like [`make_python_model`], but the model also ships a
-    /// `model_inference.textproto`, which makes the server validate the input
-    /// tensor and pipe it into `main.py` on stdin.
+    /// Like [`make_python_model`], but with a caller-supplied
+    /// `model_inference.textproto` (e.g. declaring `input_shape` so the request
+    /// tensor is validated and piped into `main.py` on stdin). The textproto
+    /// must declare `output_shape` — required for every Python model.
     fn make_python_model_with_contract(
         prefix: &str,
         name: &str,
         textproto: &str,
         main_py: &str,
     ) -> (PathBuf, String) {
-        let (ml_backends, name) = make_python_model(prefix, name, main_py);
+        let ml_backends = temp_dir(prefix);
+        let model_dir = ml_backends.join(name);
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::write(model_dir.join("requirements.txt"), b"\n").expect("write requirements.txt");
+        let main_py = format!("{main_py}{WRITE_UNIT_TENSOR}");
+        std::fs::write(model_dir.join("main.py"), main_py.as_bytes()).expect("write main.py");
         std::fs::write(
-            ml_backends.join(&name).join("model_inference.textproto"),
+            model_dir.join("model_inference.textproto"),
             textproto.as_bytes(),
         )
         .expect("write textproto");
-        (ml_backends, name)
+        (ml_backends, name.to_string())
+    }
+
+    /// Like [`make_python_model_with_contract`] but writes `main.py` verbatim
+    /// (no appended unit-tensor tail), for fixtures that produce their own
+    /// output tensor.
+    fn make_python_model_raw(
+        prefix: &str,
+        name: &str,
+        textproto: &str,
+        main_py: &str,
+    ) -> (PathBuf, String) {
+        let ml_backends = temp_dir(prefix);
+        let model_dir = ml_backends.join(name);
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::write(model_dir.join("requirements.txt"), b"\n").expect("write requirements.txt");
+        std::fs::write(model_dir.join("main.py"), main_py.as_bytes()).expect("write main.py");
+        std::fs::write(
+            model_dir.join("model_inference.textproto"),
+            textproto.as_bytes(),
+        )
+        .expect("write textproto");
+        (ml_backends, name.to_string())
     }
 
     /// A `main.py` that reads the float32 tensor from stdin (no numpy, so the
@@ -888,7 +941,7 @@ print('sum:', sum(values))
         let (ml_backends, name) = make_python_model_with_contract(
             "python-stdin",
             "e2e_python_stdin",
-            "input_shape: [16]\nmax_batch_size: 10\n",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
             STDIN_ECHO_MAIN_PY,
         );
 
@@ -927,6 +980,70 @@ print('sum:', sum(values))
         let _ = std::fs::remove_dir_all(&ml_backends);
     }
 
+    /// The tensor-reply contract end to end with checkable math: a Python model
+    /// reads the input tensor, sums it, and writes the sum as its output tensor.
+    /// The server must stream that tensor back as an `output_chunk`. Asserting
+    /// the decoded value equals the known sum proves the reply tensor is the
+    /// model's real output, not merely that some tensor came back.
+    #[tokio::test]
+    async fn python_backend_streams_computed_output_tensor() {
+        // Reads float32 stdin, writes the sum back as a [1] float32 tensor.
+        let main_py = "\
+import os, struct, sys
+raw = sys.stdin.buffer.read()
+count = len(raw) // 4
+values = struct.unpack('<%df' % count, raw) if count else ()
+total = float(sum(values))
+with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
+    f.write(b'float32 1\\n')
+    f.write(struct.pack('<f', total))
+";
+        let (ml_backends, name) = make_python_model_raw(
+            "python-computed-output",
+            "e2e_python_computed",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
+            main_py,
+        );
+
+        // Values 0..16 sum to 120.
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let collected = run_checkpoint(
+            &mut client,
+            vec![
+                meta(&name),
+                tensor_chunk(vec![1, 16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("python checkpoint with computed output should succeed");
+
+        assert!(collected.saw_done, "stream must end with done=true");
+        assert_eq!(collected.exit_code, 0);
+        assert!(
+            collected.saw_output_chunk,
+            "expected a typed output tensor chunk from the Python model"
+        );
+        assert_eq!(
+            collected.output_shape.as_deref(),
+            Some([1].as_slice()),
+            "output tensor shape"
+        );
+        let output: Vec<f32> = collected
+            .output_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            output,
+            vec![120.0],
+            "output tensor must equal the input sum"
+        );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
     /// A contract on a Python model lets the server reject a shape mismatch with
     /// `InvalidArgument` before ever launching `main.py` — the reviewer's
     /// motivation for giving Python backends a contract.
@@ -935,7 +1052,7 @@ print('sum:', sum(values))
         let (ml_backends, name) = make_python_model_with_contract(
             "python-stdin-reject",
             "e2e_python_stdin_reject",
-            "input_shape: [16]\nmax_batch_size: 10\n",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
             STDIN_ECHO_MAIN_PY,
         );
 
@@ -965,7 +1082,7 @@ print('sum:', sum(values))
         let (ml_backends, name) = make_python_model_with_contract(
             "python-stdin-expand",
             "e2e_python_stdin_expand",
-            "input_shape: [16]\nmax_batch_size: 10\n",
+            "input_shape: [16]\nmax_batch_size: 10\noutput_shape: [1]\n",
             STDIN_ECHO_MAIN_PY,
         );
 
@@ -1007,7 +1124,7 @@ print('sum:', sum(values))
         let (ml_backends, name) = make_python_model_with_contract(
             "python-stdin-unread",
             "e2e_python_stdin_unread",
-            "input_shape: [200000]\nmax_batch_size: 1\n",
+            "input_shape: [200000]\nmax_batch_size: 1\noutput_shape: [1]\n",
             // Note: never reads stdin.
             "print('ignored stdin')\n",
         );
