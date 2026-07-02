@@ -542,7 +542,7 @@ pub fn tensor_from_input_bytes(
             "no tensor chunk data provided for Rust inference model",
         ));
     }
-    if tensor_bytes.len() % 4 != 0 {
+    if !tensor_bytes.len().is_multiple_of(4) {
         return Err(Status::invalid_argument(
             "tensor chunk bytes must be a multiple of 4 for float32",
         ));

@@ -67,10 +67,10 @@ pub fn prepare_model_envs(
 
         let venv_dir = model_dir.join("venv");
         if venv_dir.exists() && !venv_dir.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("path exists but is not a directory: {}", venv_dir.display()),
-            )
+            return Err(std::io::Error::other(format!(
+                "path exists but is not a directory: {}",
+                venv_dir.display()
+            ))
             .into());
         }
 
@@ -80,13 +80,10 @@ pub fn prepare_model_envs(
                 .current_dir(&model_dir)
                 .output()?;
             if !create_venv.status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "failed to create venv for model '{model_name}': {}",
-                        output_details(&create_venv)
-                    ),
-                )
+                return Err(std::io::Error::other(format!(
+                    "failed to create venv for model '{model_name}': {}",
+                    output_details(&create_venv)
+                ))
                 .into());
             }
         }
@@ -105,13 +102,10 @@ pub fn prepare_model_envs(
             .current_dir(&model_dir)
             .output()?;
         if !install.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "failed to install requirements for model '{model_name}': {}",
-                    output_details(&install)
-                ),
-            )
+            return Err(std::io::Error::other(format!(
+                "failed to install requirements for model '{model_name}': {}",
+                output_details(&install)
+            ))
             .into());
         }
     }
