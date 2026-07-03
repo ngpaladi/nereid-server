@@ -468,12 +468,17 @@ impl TritonService {
             (shape, bytes, out_kserve.to_string())
         };
 
-        // Honor the client's requested output name if it asked for one.
-        let output_name = request
-            .outputs
-            .first()
-            .map(|o| o.name.clone())
-            .unwrap_or_else(|| "output".to_string());
+        // The output tensor name is fixed (`output`). If the client requested outputs,
+        // it must request exactly that name.
+        let output_name = if request.outputs.is_empty() {
+            "output".to_string()
+        } else if request.outputs.len() == 1 && request.outputs[0].name == "output" {
+            "output".to_string()
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "model '{model_name}' has a single output tensor named 'output'"
+            )));
+        };
 
         Ok(ModelInferResponse {
             model_name,
