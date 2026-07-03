@@ -166,8 +166,8 @@ impl GrpcInferenceService for TritonService {
 
         // Advertise the declared output shape when the model provides one
         // (Python tensor models via `output_shape`); otherwise fall back to a
-        // fully-variable shape, since a Rust model's output isn't known until
-        // inference runs. A declared batch dimension is surfaced as leading -1.
+        // single variable dimension (`[-1]`) since Rust models may not declare an
+        // output shape today. A declared batch dimension is surfaced as leading -1.
         let output_shape = contract
             .and_then(|contract| {
                 contract.output_shape().map(|declared| {
