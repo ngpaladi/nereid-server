@@ -251,7 +251,7 @@ fn parse_framed_tensor(
 pub fn run_python_inference(
     model_name: &str,
     model_dir: PathBuf,
-    input: PythonInput,
+    input: Option<PythonInput>,
 ) -> Result<(Vec<i64>, Vec<u8>, String), Status> {
     let main_py = model_dir.join("main.py");
     if !main_py.is_file() {
@@ -268,32 +268,43 @@ pub fn run_python_inference(
     }
 
     let output_path = unique_output_path(model_name);
-    let shape = input
-        .shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    // The output dtype hint defaults to float32 for an output-only model.
+    let output_dtype = input
+        .as_ref()
+        .map(|i| i.dtype.clone())
+        .unwrap_or_else(|| "float32".to_string());
 
     let mut command = Command::new(&python_path);
     command
         .arg("-u")
         .arg("main.py")
         .current_dir(&model_dir)
-        .env("NEREID_INPUT_SHAPE", shape)
-        .env("NEREID_INPUT_DTYPE", &input.dtype)
         .env("NEREID_OUTPUT_PATH", &output_path)
-        .env("NEREID_OUTPUT_DTYPE", &input.dtype)
-        .stdin(Stdio::piped())
+        .env("NEREID_OUTPUT_DTYPE", &output_dtype)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A model with a declared input receives the validated tensor on stdin;
+    // an output-only model gets no input (stdin closed).
+    if let Some(input) = &input {
+        let shape = input
+            .shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        command
+            .env("NEREID_INPUT_SHAPE", shape)
+            .env("NEREID_INPUT_DTYPE", &input.dtype)
+            .stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
 
-    let (mut child, stdin_handle) =
-        spawn_with_optional_stdin(command, Some(input)).map_err(|err| {
-            Status::internal(format!(
-                "failed to run main.py for model '{model_name}': {err}"
-            ))
-        })?;
+    let (mut child, stdin_handle) = spawn_with_optional_stdin(command, input).map_err(|err| {
+        Status::internal(format!(
+            "failed to run main.py for model '{model_name}': {err}"
+        ))
+    })?;
 
     // Drain both pipes concurrently so a chatty model can't wedge the child by
     // filling a pipe buffer while we wait on the other stream.

@@ -563,6 +563,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
     })?;
 
     fn parse_shape_dims(
+        field: &str,
         raw_value: &str,
         raw_line: &str,
         config_path: &Path,
@@ -573,7 +574,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
             .and_then(|s| s.strip_suffix(']'))
             .ok_or_else(|| {
                 Status::failed_precondition(format!(
-                    "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                    "invalid {field} in {}: '{raw_line}'. expected bracketed dimensions such as `{field}: [1, 16]`",
                     config_path.to_string_lossy()
                 ))
             })?
@@ -587,7 +588,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
         if dims_str.is_empty() {
             return Err(Status::failed_precondition(format!(
-                "invalid input_shape in {}: '{raw_line}'. expected bracketed dimensions such as `input_shape: [1, 16]`",
+                "invalid {field} in {}: '{raw_line}'. expected bracketed dimensions such as `{field}: [1, 16]`",
                 config_path.to_string_lossy()
             )));
         }
@@ -596,13 +597,13 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
         for dim_str in dims_str {
             let dim = dim_str.parse::<i64>().map_err(|err| {
                 Status::failed_precondition(format!(
-                    "failed parsing input_shape dimension '{dim_str}' in {}: {err}",
+                    "failed parsing {field} dimension '{dim_str}' in {}: {err}",
                     config_path.to_string_lossy()
                 ))
             })?;
             if dim == 0 || dim < -1 {
                 return Err(Status::failed_precondition(format!(
-                    "input_shape dimensions in {} must be positive or -1",
+                    "{field} dimensions in {} must be positive or -1",
                     config_path.to_string_lossy()
                 )));
             }
@@ -631,10 +632,15 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
         match field.trim() {
             "input_shape" => {
-                input_shape = Some(parse_shape_dims(raw_value, raw_line, &config_path)?);
+                input_shape = Some(parse_shape_dims(
+                    "input_shape",
+                    raw_value,
+                    raw_line,
+                    &config_path,
+                )?);
             }
             "output_shape" => {
-                let dims = parse_shape_dims(raw_value, raw_line, &config_path)?;
+                let dims = parse_shape_dims("output_shape", raw_value, raw_line, &config_path)?;
                 output_shape = Some(dims);
             }
             "data_type" => {
@@ -1216,6 +1222,24 @@ mod tests {
         assert!(
             read_multi_contract_from_textproto(&base).is_err(),
             "input without dims must be rejected"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn invalid_output_shape_error_names_output_shape() {
+        let base = temp_dir("bad-output-shape");
+        // A malformed output_shape must report `output_shape`, not `input_shape`.
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"output_shape: not-a-list\n",
+        )
+        .expect("write textproto");
+        let err = read_input_contract_from_textproto(&base).expect_err("should reject");
+        assert!(
+            err.message().contains("output_shape"),
+            "error should name output_shape, got: {}",
+            err.message()
         );
         let _ = fs::remove_dir_all(&base);
     }

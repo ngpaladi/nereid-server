@@ -283,91 +283,128 @@ impl TritonService {
         // Every configured Python model declares `output_shape` (enforced at
         // startup), so all Python models are tensor-capable over ModelInfer.
 
-        // MVP: exactly one input tensor.
-        if request.inputs.len() != 1 {
-            return Err(Status::invalid_argument(format!(
-                "expected exactly one input tensor for model '{model_name}', got {}",
-                request.inputs.len()
-            )));
-        }
-        let input = &request.inputs[0];
-
         let contract = contract.ok_or_else(|| {
             Status::internal(format!(
                 "model '{model_name}' is missing its input contract"
             ))
         })?;
 
-        // The request datatype must match the model's declared datatype
-        // (default FP32). The Rust `.pt` path runs float inference only; the
-        // Python path is byte-passthrough and accepts any fixed-width dtype.
-        let expected_dt = contract.input_datatype();
-        if input.datatype != expected_dt {
-            return Err(Status::invalid_argument(format!(
-                "datatype mismatch for model '{model_name}': expected {expected_dt}, got '{}'",
-                input.datatype
-            )));
-        }
-        let (elem_size, canonical_dtype) =
-            dtype::kserve_fixed_width(expected_dt).ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "unsupported datatype '{expected_dt}' for model '{model_name}'"
-                ))
-            })?;
-
-        // Raw bytes (preferred, row-major little-endian) take precedence over
-        // the typed `contents`. KServe pairs raw_input_contents positionally
-        // with inputs, so a single input means a single raw buffer. Typed
-        // `contents` is supported only for FP32; other dtypes must use raw.
-        let input_bytes = if !request.raw_input_contents.is_empty() {
-            if request.raw_input_contents.len() != 1 {
-                return Err(Status::invalid_argument(
-                    "raw_input_contents must hold exactly one buffer for a single input",
-                ));
+        // A model with a declared input consumes exactly one input tensor; an
+        // output-only model (Python, no `input_shape`) consumes none — matching
+        // what `model_metadata` advertises. `py_input`/`rust_tensor` carry the
+        // built input for the respective backend.
+        let (py_input, rust_tensor, expected_batch) = if contract.has_input() {
+            if request.inputs.len() != 1 {
+                return Err(Status::invalid_argument(format!(
+                    "model '{model_name}' expects one input tensor, got {}",
+                    request.inputs.len()
+                )));
             }
-            request.raw_input_contents.into_iter().next().unwrap()
-        } else if expected_dt == FP32 {
-            match &input.contents {
-                Some(contents) => contents
-                    .fp32_contents
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect(),
-                None => {
+            let input = &request.inputs[0];
+
+            // The request datatype must match the model's declared datatype
+            // (default FP32). The Rust `.pt` path runs the libtorch kinds; the
+            // Python path is byte-passthrough over any fixed-width dtype.
+            let expected_dt = contract.input_datatype();
+            if input.datatype != expected_dt {
+                return Err(Status::invalid_argument(format!(
+                    "datatype mismatch for model '{model_name}': expected {expected_dt}, got '{}'",
+                    input.datatype
+                )));
+            }
+            let (elem_size, canonical_dtype) =
+                dtype::kserve_fixed_width(expected_dt).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "unsupported datatype '{expected_dt}' for model '{model_name}'"
+                    ))
+                })?;
+
+            // Raw bytes (row-major little-endian) take precedence over the typed
+            // `contents`. KServe pairs raw_input_contents positionally with
+            // inputs, so a single input means a single raw buffer. Typed
+            // `contents` is supported only for FP32; other dtypes must use raw.
+            let input_shape = input.shape.clone();
+            let input_bytes = if !request.raw_input_contents.is_empty() {
+                if request.raw_input_contents.len() != 1 {
                     return Err(Status::invalid_argument(
-                        "input tensor has neither raw_input_contents nor contents",
+                        "raw_input_contents must hold exactly one buffer for a single input",
                     ));
                 }
+                request.raw_input_contents.into_iter().next().unwrap()
+            } else if expected_dt == FP32 {
+                match &input.contents {
+                    Some(contents) => contents
+                        .fp32_contents
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                    None => {
+                        return Err(Status::invalid_argument(
+                            "input tensor has neither raw_input_contents nor contents",
+                        ));
+                    }
+                }
+            } else {
+                return Err(Status::invalid_argument(format!(
+                    "datatype '{expected_dt}' requires raw_input_contents (typed contents is FP32-only)"
+                )));
+            };
+
+            // Validate and batch-normalize the requested shape exactly as the
+            // native Checkpoint path does.
+            contract.validate_request_shape(&input_shape, &model_name)?;
+            let request_shape = contract.normalize_request_shape(input_shape);
+
+            // The raw buffer must be exactly one element per shape slot.
+            let numel = request_shape
+                .iter()
+                .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
+                .ok_or_else(|| Status::invalid_argument("input tensor shape overflow"))?;
+            let expected_bytes = (numel as usize).saturating_mul(elem_size);
+            if input_bytes.len() != expected_bytes {
+                return Err(Status::invalid_argument(format!(
+                    "input byte length {} does not match shape {request_shape:?} \u{d7} \
+                     {elem_size} bytes ({expected_bytes}) for model '{model_name}'",
+                    input_bytes.len()
+                )));
+            }
+
+            let expected_batch = if contract.max_batch_size() > 0 {
+                request_shape.first().copied()
+            } else {
+                None
+            };
+
+            if is_python {
+                let py_input = PythonInput {
+                    shape: request_shape,
+                    bytes: input_bytes,
+                    dtype: canonical_dtype.to_string(),
+                };
+                (Some(py_input), None, expected_batch)
+            } else {
+                // The Rust `.pt` path builds a tensor of the declared dtype's
+                // libtorch kind; dtypes with no libtorch kind (uint16/32/64) are
+                // rejected here.
+                let kind = dtype::kind_from_canonical(canonical_dtype).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "Rust .pt model '{model_name}' does not support datatype {expected_dt} \
+                         (no libtorch kind)"
+                    ))
+                })?;
+                let tensor =
+                    tensor_from_input_bytes(&input_bytes, &request_shape, &model_name, kind)?;
+                (None, Some(tensor), expected_batch)
             }
         } else {
-            return Err(Status::invalid_argument(format!(
-                "datatype '{expected_dt}' requires raw_input_contents (typed contents is FP32-only)"
-            )));
-        };
-
-        // Validate and batch-normalize the requested shape exactly as the
-        // native Checkpoint path does.
-        contract.validate_request_shape(&input.shape, &model_name)?;
-        let request_shape = contract.normalize_request_shape(input.shape.clone());
-
-        // The raw buffer must be exactly one element per shape slot.
-        let numel = request_shape
-            .iter()
-            .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
-            .ok_or_else(|| Status::invalid_argument("input tensor shape overflow"))?;
-        let expected_bytes = (numel as usize).saturating_mul(elem_size);
-        if input_bytes.len() != expected_bytes {
-            return Err(Status::invalid_argument(format!(
-                "input byte length {} does not match shape {request_shape:?} \u{d7} {elem_size} \
-                 bytes ({expected_bytes}) for model '{model_name}'",
-                input_bytes.len()
-            )));
-        }
-
-        let expected_batch = if contract.max_batch_size() > 0 {
-            request_shape.first().copied()
-        } else {
-            None
+            // Output-only model (Python): no input tensor expected.
+            if !request.inputs.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "model '{model_name}' declares no input tensor but {} were provided",
+                    request.inputs.len()
+                )));
+            }
+            (None, None, None)
         };
 
         let (output_shape, output_bytes, output_dt) = if is_python {
@@ -391,11 +428,6 @@ impl TritonService {
                         "Python model '{model_name}' has no model directory"
                     ))
                 })?;
-            let py_input = PythonInput {
-                shape: request_shape,
-                bytes: input_bytes,
-                dtype: canonical_dtype.to_string(),
-            };
             let name = model_name.clone();
             let (shape, bytes, out_canonical) = tokio::task::spawn_blocking(move || {
                 run_python_inference(&name, model_dir, py_input)
@@ -414,17 +446,9 @@ impl TritonService {
             })?;
             (shape, bytes, out_kserve.to_string())
         } else {
-            // The Rust `.pt` path builds a tensor of the declared dtype's
-            // libtorch kind; datatypes with no libtorch kind (uint16/32/64) are
-            // rejected here.
-            let kind = dtype::kind_from_canonical(canonical_dtype).ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "Rust .pt model '{model_name}' does not support datatype {expected_dt} \
-                     (no libtorch kind)"
-                ))
+            let input_tensor = rust_tensor.ok_or_else(|| {
+                Status::internal(format!("Rust model '{model_name}' has no input tensor"))
             })?;
-            let input_tensor =
-                tensor_from_input_bytes(&input_bytes, &request_shape, &model_name, kind)?;
             let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
             let (shape, bytes, out_canonical) = response_rx.await.map_err(|_| {
                 Status::internal(format!(
@@ -490,6 +514,9 @@ impl TritonService {
                 "raw_input_contents length must equal the number of input tensors",
             ));
         }
+        // Map input tensors by name. Reject duplicate names: with
+        // raw_input_contents paired positionally, a silent last-wins overwrite
+        // could bind the wrong raw buffer to a tensor name.
         let mut by_name: HashMap<&str, (&InferInputTensor, usize)> =
             HashMap::with_capacity(request.inputs.len());
         for (i, inp) in request.inputs.iter().enumerate() {
@@ -1293,6 +1320,96 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(got, expected, "pyaddint must compute input + 1 in int32");
+    }
+
+    /// An output-only Python model (declares `output_shape`, no `input_shape`)
+    /// is servable over ModelInfer with zero inputs — matching what
+    /// `model_metadata` advertises. Reads no stdin, writes a [2] tensor.
+    #[tokio::test]
+    async fn python_output_only_model_infer() {
+        let main_py = "\
+import os, struct
+with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
+    f.write(b'float32 2\\n')
+    f.write(struct.pack('<2f', 7.0, 8.0))
+";
+        let (ml_backends, name) =
+            make_temp_python_model("output-only", main_py, "output_shape: [2]\n");
+        let addr = spawn_triton_server_at(ml_backends.clone(), &name).await;
+        let mut client = connect(addr).await;
+
+        // Metadata advertises no inputs, one output.
+        let meta = client
+            .model_metadata(ModelMetadataRequest {
+                name: name.clone(),
+                version: String::new(),
+            })
+            .await
+            .expect("metadata")
+            .into_inner();
+        assert!(meta.inputs.is_empty(), "output-only model has no inputs");
+        assert_eq!(meta.outputs.len(), 1);
+
+        // Infer with zero inputs returns the model's tensor.
+        let response = client
+            .model_infer(ModelInferRequest {
+                model_name: name.clone(),
+                model_version: String::new(),
+                id: String::new(),
+                parameters: Default::default(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                raw_input_contents: Vec::new(),
+            })
+            .await
+            .expect("output-only model_infer should succeed")
+            .into_inner();
+        assert_eq!(response.outputs[0].shape, vec![2]);
+        let got: Vec<f32> = response.raw_output_contents[0]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, vec![7.0, 8.0]);
+
+        // Sending an input to an output-only model is rejected.
+        let status = client
+            .model_infer(infer_request(&name, vec![1, 2], f32_le_bytes(&[1.0, 2.0])))
+            .await
+            .expect_err("unexpected input must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    /// Duplicate input tensor names in a multi-tensor request are rejected
+    /// (rather than silently binding the wrong positional raw buffer).
+    #[tokio::test]
+    async fn multi_tensor_rejects_duplicate_input_names() {
+        let addr = spawn_triton_server("multi").await;
+        let mut client = connect(addr).await;
+        let dup = InferInputTensor {
+            name: "a".to_string(),
+            datatype: FP32.to_string(),
+            shape: vec![1, 4],
+            parameters: Default::default(),
+            contents: None,
+        };
+        let status = client
+            .model_infer(ModelInferRequest {
+                model_name: "multi".to_string(),
+                model_version: String::new(),
+                id: String::new(),
+                parameters: Default::default(),
+                inputs: vec![dup.clone(), dup],
+                outputs: Vec::new(),
+                raw_input_contents: vec![
+                    f32_le_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                    f32_le_bytes(&[5.0, 6.0, 7.0, 8.0]),
+                ],
+            })
+            .await
+            .expect_err("duplicate input name must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
     }
 
     /// Metadata reflects a non-float declared datatype.
