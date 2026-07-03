@@ -350,8 +350,11 @@ pub fn run_python_inference(
         )));
     }
 
-    let raw = fs::read(&output_path).map_err(|err| {
-        let _ = fs::remove_file(&output_path);
+    // Read then remove unconditionally (best-effort) so the temp file never
+    // leaks — on read success, read failure, or a later parse failure.
+    let raw = fs::read(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let raw = raw.map_err(|err| {
         Status::failed_precondition(format!(
             "model '{model_name}' declares a tensor output contract but wrote no readable tensor \
              to NEREID_OUTPUT_PATH ({err}){}",
@@ -362,11 +365,26 @@ pub fn run_python_inference(
     parse_framed_tensor(&raw, model_name)
 }
 
-/// Read a child pipe to EOF, discarding read errors (best-effort diagnostics).
+/// Read a child pipe to EOF (so the process can't wedge on a full pipe),
+/// retaining at most `DRAIN_CAP` bytes for diagnostics — a chatty or
+/// runaway model can't grow this unboundedly. Read errors are discarded.
 fn drain(stream: Option<impl Read>) -> Vec<u8> {
+    const DRAIN_CAP: usize = 64 * 1024;
     let mut buf = Vec::new();
     if let Some(mut stream) = stream {
-        let _ = stream.read_to_end(&mut buf);
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if buf.len() < DRAIN_CAP {
+                        let take = n.min(DRAIN_CAP - buf.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                    }
+                    // Keep reading past the cap to EOF so the child isn't wedged.
+                }
+            }
+        }
     }
     buf
 }
@@ -557,7 +575,16 @@ pub fn spawn_python_checkpoint_stream(
         let _ = fs::remove_file(&output_path);
         let tensor = tensor
             .and_then(|raw| parse_framed_tensor(&raw, &model_name))
-            .and_then(|(shape, bytes, _dtype)| {
+            .and_then(|(shape, bytes, dtype)| {
+                // The Checkpoint TensorChunk carries no dtype and is float32 by
+                // contract; reject a non-float32 reply rather than streaming
+                // mislabeled bytes to native clients.
+                if dtype != "float32" {
+                    return Err(Status::failed_precondition(format!(
+                        "Python model '{model_name}' wrote a '{dtype}' output tensor, but the \
+                         Checkpoint path only supports float32"
+                    )));
+                }
                 contract
                     .validate_output_shape(&shape, expected_batch, &model_name)
                     .map(|()| (shape, bytes))

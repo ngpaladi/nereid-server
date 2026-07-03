@@ -402,11 +402,15 @@ impl TritonService {
                 (None, Some(tensor), expected_batch)
             }
         } else {
-            // Output-only model (Python): no input tensor expected.
-            if !request.inputs.is_empty() {
+            // Output-only model (Python): no input tensor expected. Reject both
+            // declared inputs and raw buffers (KServe pairs raw_input_contents
+            // positionally with inputs, so any is stray client data).
+            if !request.inputs.is_empty() || !request.raw_input_contents.is_empty() {
                 return Err(Status::invalid_argument(format!(
-                    "model '{model_name}' declares no input tensor but {} were provided",
-                    request.inputs.len()
+                    "model '{model_name}' declares no input tensor but the request carries \
+                     {} input(s) and {} raw buffer(s)",
+                    request.inputs.len(),
+                    request.raw_input_contents.len()
                 )));
             }
             (None, None, None)
@@ -537,6 +541,20 @@ impl TritonService {
                 )));
             }
         }
+        // Reject inputs not declared by the model (silently dropping client data
+        // is worse than an explicit error).
+        let declared_inputs: HashSet<&str> =
+            contract.inputs.iter().map(|s| s.name.as_str()).collect();
+        if let Some(unknown) = request
+            .inputs
+            .iter()
+            .find(|inp| !declared_inputs.contains(inp.name.as_str()))
+        {
+            return Err(Status::invalid_argument(format!(
+                "model '{model_name}' has no input '{}'",
+                unknown.name
+            )));
+        }
 
         // Build one tensor per declared input, in contract order.
         let mut input_tensors = Vec::with_capacity(contract.inputs.len());
@@ -643,9 +661,23 @@ impl TritonService {
         }
 
         // Return all declared outputs, or the client-requested subset if any.
+        // A requested name that isn't a declared output is rejected rather than
+        // silently omitted (consistent with the single-tensor path).
         let requested: Option<HashSet<&str>> = if request.outputs.is_empty() {
             None
         } else {
+            let declared_outputs: HashSet<&str> =
+                contract.outputs.iter().map(|o| o.name.as_str()).collect();
+            if let Some(unknown) = request
+                .outputs
+                .iter()
+                .find(|o| !declared_outputs.contains(o.name.as_str()))
+            {
+                return Err(Status::invalid_argument(format!(
+                    "model '{model_name}' has no output '{}'",
+                    unknown.name
+                )));
+            }
             Some(request.outputs.iter().map(|o| o.name.as_str()).collect())
         };
 
@@ -1434,6 +1466,21 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             .expect_err("unexpected input must be rejected");
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
 
+        // Stray raw_input_contents (with zero declared inputs) is also rejected.
+        let status = client
+            .model_infer(ModelInferRequest {
+                model_name: name.clone(),
+                model_version: String::new(),
+                id: String::new(),
+                parameters: Default::default(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                raw_input_contents: vec![f32_le_bytes(&[1.0, 2.0])],
+            })
+            .await
+            .expect_err("stray raw buffer must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
         let _ = std::fs::remove_dir_all(&ml_backends);
     }
 
@@ -1465,6 +1512,75 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             })
             .await
             .expect_err("duplicate input name must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    }
+
+    /// A multi-tensor request naming an input not declared by the model is
+    /// rejected rather than silently dropped.
+    #[tokio::test]
+    async fn multi_tensor_rejects_unknown_input_name() {
+        let addr = spawn_triton_server("multi").await;
+        let mut client = connect(addr).await;
+        let mk = |name: &str| InferInputTensor {
+            name: name.to_string(),
+            datatype: FP32.to_string(),
+            shape: vec![1, 4],
+            parameters: Default::default(),
+            contents: None,
+        };
+        // Declared inputs are "a" and "b"; add a stray "c".
+        let status = client
+            .model_infer(ModelInferRequest {
+                model_name: "multi".to_string(),
+                model_version: String::new(),
+                id: String::new(),
+                parameters: Default::default(),
+                inputs: vec![mk("a"), mk("b"), mk("c")],
+                outputs: Vec::new(),
+                raw_input_contents: vec![
+                    f32_le_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                    f32_le_bytes(&[5.0, 6.0, 7.0, 8.0]),
+                    f32_le_bytes(&[9.0, 9.0, 9.0, 9.0]),
+                ],
+            })
+            .await
+            .expect_err("unknown input name must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    }
+
+    /// A multi-tensor request asking for an output not declared by the model is
+    /// rejected rather than silently omitted.
+    #[tokio::test]
+    async fn multi_tensor_rejects_unknown_output_name() {
+        use crate::proto::model_infer_request::InferRequestedOutputTensor;
+        let addr = spawn_triton_server("multi").await;
+        let mut client = connect(addr).await;
+        let mk = |name: &str| InferInputTensor {
+            name: name.to_string(),
+            datatype: FP32.to_string(),
+            shape: vec![1, 4],
+            parameters: Default::default(),
+            contents: None,
+        };
+        let status = client
+            .model_infer(ModelInferRequest {
+                model_name: "multi".to_string(),
+                model_version: String::new(),
+                id: String::new(),
+                parameters: Default::default(),
+                inputs: vec![mk("a"), mk("b")],
+                // Declared outputs are "sum"/"prod"; request an unknown one.
+                outputs: vec![InferRequestedOutputTensor {
+                    name: "not_an_output".to_string(),
+                    parameters: Default::default(),
+                }],
+                raw_input_contents: vec![
+                    f32_le_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                    f32_le_bytes(&[5.0, 6.0, 7.0, 8.0]),
+                ],
+            })
+            .await
+            .expect_err("unknown output name must be rejected");
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
     }
 

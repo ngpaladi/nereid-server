@@ -1062,6 +1062,33 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
         let _ = std::fs::remove_dir_all(&ml_backends);
     }
 
+    /// The native Checkpoint TensorChunk carries no dtype and is float32 by
+    /// contract. A Python model that writes a non-float32 framed output (here
+    /// int32) is rejected rather than streaming mislabeled bytes to the client.
+    #[tokio::test]
+    async fn python_backend_rejects_non_float32_output() {
+        let main_py = "\
+import os, struct
+with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
+    f.write(b'int32 2\\n')
+    f.write(struct.pack('<2i', 3, 4))
+";
+        let (ml_backends, name) = make_python_model_raw(
+            "checkpoint-int32",
+            "e2e_checkpoint_int32",
+            "output_shape: [2]\n",
+            main_py,
+        );
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let status = run_checkpoint(&mut client, vec![meta(&name)])
+            .await
+            .expect_err("non-float32 Checkpoint output must be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
     /// A contract on a Python model lets the server reject a shape mismatch with
     /// `InvalidArgument` before ever launching `main.py` — the reviewer's
     /// motivation for giving Python backends a contract.
