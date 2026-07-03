@@ -490,12 +490,16 @@ impl TritonService {
                 "raw_input_contents length must equal the number of input tensors",
             ));
         }
-        let by_name: HashMap<&str, (&InferInputTensor, usize)> = request
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, inp)| (inp.name.as_str(), (inp, i)))
-            .collect();
+        let mut by_name: HashMap<&str, (&InferInputTensor, usize)> =
+            HashMap::with_capacity(request.inputs.len());
+        for (i, inp) in request.inputs.iter().enumerate() {
+            if by_name.insert(inp.name.as_str(), (inp, i)).is_some() {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate input tensor name '{}' in request for model '{model_name}'",
+                    inp.name
+                )));
+            }
+        }
 
         // Build one tensor per declared input, in contract order.
         let mut input_tensors = Vec::with_capacity(contract.inputs.len());
