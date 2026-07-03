@@ -10,10 +10,10 @@
 // `//@@` doc comments from upstream are stripped for brevity; nothing on the
 // wire changes.
 //
-// This is the MVP subset only — it intentionally omits ModelStreamInfer,
-// ModelConfig/repository/statistics/shared-memory/trace/log RPCs, and the
-// `import "model_config.proto"` they require. Add them back from upstream as
-// parity work proceeds (see README "Triton compatibility").
+// This is the MVP subset only — it intentionally omits ModelConfig/repository/
+// statistics/shared-memory/trace/log RPCs, and the `import "model_config.proto"`
+// they require. Add them back from upstream as parity work proceeds (see README
+// "Triton compatibility").
 
 syntax = "proto3";
 
