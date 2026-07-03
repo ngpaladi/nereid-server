@@ -468,17 +468,17 @@ impl TritonService {
             (shape, bytes, out_kserve.to_string())
         };
 
-        // The output tensor name is fixed (`output`). If the client requested outputs,
-        // it must request exactly that name.
-        let output_name = if request.outputs.is_empty() {
-            "output".to_string()
-        } else if request.outputs.len() == 1 && request.outputs[0].name == "output" {
-            "output".to_string()
-        } else {
+        // The single-tensor model's only output is named "output" (as advertised
+        // by ModelMetadata). If the client requested specific outputs, each must
+        // reference that name — reject unknown names rather than silently
+        // renaming the returned tensor.
+        const OUTPUT_NAME: &str = "output";
+        if let Some(unknown) = request.outputs.iter().find(|o| o.name != OUTPUT_NAME) {
             return Err(Status::invalid_argument(format!(
-                "model '{model_name}' has a single output tensor named 'output'"
+                "model '{model_name}' has no output '{}'; its only output is '{OUTPUT_NAME}'",
+                unknown.name
             )));
-        };
+        }
 
         Ok(ModelInferResponse {
             model_name,
@@ -486,7 +486,7 @@ impl TritonService {
             id: request.id,
             parameters: Default::default(),
             outputs: vec![InferOutputTensor {
-                name: output_name,
+                name: OUTPUT_NAME.to_string(),
                 datatype: output_dt,
                 shape: output_shape,
                 parameters: Default::default(),
@@ -962,6 +962,52 @@ mod triton_e2e_tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(got, expected, "pymul must compute input * 2 + 1");
+    }
+
+    /// The client may request the model's output by its real name (`output`) —
+    /// which returns a tensor named `output` — but requesting an unknown output
+    /// name is rejected rather than silently renamed.
+    #[tokio::test]
+    async fn model_infer_validates_requested_output_name() {
+        use crate::proto::model_infer_request::InferRequestedOutputTensor;
+        assert!(fixtures_dir().join("model3").is_dir(), "model3 missing");
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let addr = spawn_triton_server("model3").await;
+        let mut client = connect(addr).await;
+
+        let request = |out_name: &str| ModelInferRequest {
+            model_name: "model3".to_string(),
+            model_version: String::new(),
+            id: String::new(),
+            parameters: Default::default(),
+            inputs: vec![InferInputTensor {
+                name: "input".to_string(),
+                datatype: FP32.to_string(),
+                shape: vec![1, 16],
+                parameters: Default::default(),
+                contents: None,
+            }],
+            outputs: vec![InferRequestedOutputTensor {
+                name: out_name.to_string(),
+                parameters: Default::default(),
+            }],
+            raw_input_contents: vec![f32_le_bytes(&values)],
+        };
+
+        // Requesting the real output name works and the tensor keeps that name.
+        let ok = client
+            .model_infer(request("output"))
+            .await
+            .expect("requesting 'output' should succeed")
+            .into_inner();
+        assert_eq!(ok.outputs[0].name, "output");
+
+        // Requesting an unknown output name is rejected.
+        let status = client
+            .model_infer(request("not_a_real_output"))
+            .await
+            .expect_err("unknown requested output must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
     }
 
     /// Create an inline temp Python model under a fresh `ml-backends` dir and

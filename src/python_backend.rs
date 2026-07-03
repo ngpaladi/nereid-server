@@ -18,11 +18,12 @@ pub type CheckpointStream =
 /// Output tensor chunk size for the Checkpoint stream (mirrors the Rust path).
 const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
-/// A validated input tensor to feed `main.py`. The raw `bytes` are the
-/// little-endian `float32` tensor values; `shape` is the (already
-/// batch-normalized) tensor shape. Delivered to the subprocess on stdin, with
-/// the shape and dtype exposed via the `NEREID_INPUT_SHAPE` /
-/// `NEREID_INPUT_DTYPE` environment variables.
+/// A validated input tensor to feed `main.py`. The raw `bytes` are the tensor
+/// values in row-major little-endian order for the element type named by
+/// `dtype` (always `float32` on the Checkpoint path; any fixed-width dtype on
+/// the ModelInfer path); `shape` is the (already batch-normalized) tensor shape.
+/// Delivered to the subprocess on stdin, with the shape and dtype exposed via
+/// the `NEREID_INPUT_SHAPE` / `NEREID_INPUT_DTYPE` environment variables.
 #[derive(Debug, Clone)]
 pub struct PythonInput {
     pub shape: Vec<i64>,
@@ -357,7 +358,6 @@ pub fn run_python_inference(
             stderr_suffix("; stderr: ")
         ))
     })?;
-    let _ = fs::remove_file(&output_path);
 
     parse_framed_tensor(&raw, model_name)
 }
