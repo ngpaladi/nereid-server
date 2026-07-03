@@ -24,7 +24,12 @@ are still written against nereid's own contracts (a `.pt` file or a `main.py`).
 servable:
 - **Rust `.pt`** — single-tensor and multi-tensor (nested `input {}`/`output {}` blocks in
   the textproto); datatypes are the libtorch kinds (`FP16/32/64`, `INT8/16/32/64`, `UINT8`,
-  `BOOL`, `BF16`).
+  `BOOL`, `BF16`). `FP32` and `INT64` are verified end-to-end against a stock `tritonclient`;
+  tensor (de)serialization is byte-generic and unit-tested for every listed kind (including
+  the 2-byte `FP16`/`BF16`).
+  - For a **multi-tensor** model, the request's named inputs are bound in the order the
+    textproto lists them and passed positionally to the model's `forward()` — so the
+    `input {}` blocks must be ordered to match `forward(a, b, ...)`'s parameter order.
 - **Python `main.py`** — every reply is a typed tensor (the same `NEREID_OUTPUT_PATH` framed
   contract the native `Nereid/Checkpoint` path uses); byte-passthrough over any fixed-width
   KServe dtype.

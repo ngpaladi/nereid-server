@@ -695,6 +695,16 @@ impl TritonService {
                     spec.name
                 ))
             })?;
+            // The returned dtype must match what the contract declares (and
+            // ModelMetadata advertises) — a mismatch is a model/config bug, not
+            // a silently-mislabeled tensor.
+            if kserve != spec.dtype {
+                return Err(Status::internal(format!(
+                    "model '{model_name}' output '{}' returned dtype {kserve} but the contract \
+                     declares {}",
+                    spec.name, spec.dtype
+                )));
+            }
             out_tensors.push(InferOutputTensor {
                 name: spec.name.clone(),
                 datatype: kserve.to_string(),
@@ -1582,6 +1592,64 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             .await
             .expect_err("unknown output name must be rejected");
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    }
+
+    /// A multi-tensor model whose returned output dtype contradicts its declared
+    /// contract is rejected rather than serving a mislabeled tensor. Uses the
+    /// real `multi` `.pt` (returns FP32) with a textproto that declares `sum` as
+    /// INT32.
+    #[tokio::test]
+    async fn multi_tensor_rejects_output_dtype_mismatch() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let ml_backends = std::env::temp_dir().join(format!("nereid-multi-dtype-{nanos}"));
+        let dir = ml_backends.join("m");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::copy(
+            fixtures_dir().join("multi").join("mmodel.pt"),
+            dir.join("mmodel.pt"),
+        )
+        .expect("copy .pt");
+        std::fs::write(
+            dir.join("model_inference.textproto"),
+            "max_batch_size: 4\n\
+             input {\n  name: \"a\"\n  data_type: \"FP32\"\n  dims: [4]\n}\n\
+             input {\n  name: \"b\"\n  data_type: \"FP32\"\n  dims: [4]\n}\n\
+             output {\n  name: \"sum\"\n  data_type: \"INT32\"\n  dims: [4]\n}\n\
+             output {\n  name: \"prod\"\n  data_type: \"FP32\"\n  dims: [4]\n}\n",
+        )
+        .expect("write textproto");
+
+        let addr = spawn_triton_server_at(ml_backends.clone(), "m").await;
+        let mut client = connect(addr).await;
+        let mk = |name: &str| InferInputTensor {
+            name: name.to_string(),
+            datatype: FP32.to_string(),
+            shape: vec![1, 4],
+            parameters: Default::default(),
+            contents: None,
+        };
+        let status = client
+            .model_infer(ModelInferRequest {
+                model_name: "m".to_string(),
+                model_version: String::new(),
+                id: String::new(),
+                parameters: Default::default(),
+                inputs: vec![mk("a"), mk("b")],
+                outputs: Vec::new(),
+                raw_input_contents: vec![
+                    f32_le_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                    f32_le_bytes(&[5.0, 6.0, 7.0, 8.0]),
+                ],
+            })
+            .await
+            .expect_err("output dtype mismatch must be rejected");
+        assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
     }
 
     /// Metadata reflects a non-float declared datatype.

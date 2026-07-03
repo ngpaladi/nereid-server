@@ -80,10 +80,43 @@ pub fn run_multi_forward_pass(
 
 #[cfg(test)]
 mod tests {
-    use super::run_forward_pass;
+    use super::{run_forward_pass, tensor_to_bytes};
     use crate::config::load_server_config;
+    use crate::model_runtime::tensor_from_input_bytes;
     use std::path::PathBuf;
-    use tch::{CModule, Device, Tensor};
+    use tch::{CModule, Device, Kind, Tensor};
+
+    /// Serialization must round-trip byte-for-byte for the non-float libtorch
+    /// kinds — especially the 2-byte types with no native Rust element type
+    /// (`Half`, `BFloat16`), where a wrong element size would silently corrupt
+    /// output. `tensor_to_bytes` (copy_data_u8) and `tensor_from_input_bytes`
+    /// (from_data_size) are both byte-generic, so this exercises 1/2/4/8-byte
+    /// widths without needing a per-dtype `.pt` fixture.
+    #[test]
+    fn tensor_bytes_round_trip_across_kinds() {
+        let values = [1.0f64, 2.0, 3.0, 4.0];
+        for (kind, canonical, elt) in [
+            (Kind::Int16, "int16", 2usize),
+            (Kind::Int, "int32", 4),
+            (Kind::Int64, "int64", 8),
+            (Kind::Int8, "int8", 1),
+            (Kind::Half, "float16", 2),
+            (Kind::BFloat16, "bfloat16", 2),
+            (Kind::Double, "float64", 8),
+        ] {
+            let tensor = Tensor::from_slice(&values).reshape([2, 2]).to_kind(kind);
+            let (shape, bytes, dtype) = tensor_to_bytes(&tensor).expect("serialize");
+            assert_eq!(dtype, canonical, "dtype label for {kind:?}");
+            assert_eq!(shape, vec![2, 2]);
+            assert_eq!(bytes.len(), 4 * elt, "byte width for {kind:?}");
+
+            // Rebuild the tensor from those bytes and re-serialize: byte-identical
+            // means the element size and layout survived the round trip.
+            let rebuilt = tensor_from_input_bytes(&bytes, &shape, "m", kind).expect("deserialize");
+            let (_, bytes2, _) = tensor_to_bytes(&rebuilt).expect("re-serialize");
+            assert_eq!(bytes, bytes2, "round-trip bytes for {kind:?}");
+        }
+    }
 
     #[test]
     fn run_forward_pass_is_deterministic_for_fixed_input() {
