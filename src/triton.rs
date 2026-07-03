@@ -256,7 +256,10 @@ impl TritonService {
     /// selection, datatype validation, shape/batch normalization, backend
     /// dispatch (Rust `.pt` queue or Python subprocess with backpressure), and
     /// output validation.
-    async fn infer_once(&self, request: ModelInferRequest) -> Result<ModelInferResponse, Status> {
+    async fn infer_once(
+        &self,
+        mut request: ModelInferRequest,
+    ) -> Result<ModelInferResponse, Status> {
         let model_name = request.model_name.trim().to_string();
         if model_name.is_empty() {
             return Err(Status::invalid_argument("model_name is required"));
@@ -330,7 +333,9 @@ impl TritonService {
                         "raw_input_contents must hold exactly one buffer for a single input",
                     ));
                 }
-                request.raw_input_contents.into_iter().next().unwrap()
+                // Take the single buffer without partially moving `request`
+                // (its `id`/`outputs` are still read below).
+                request.raw_input_contents.remove(0)
             } else if expected_dt == FP32 {
                 match &input.contents {
                     Some(contents) => contents
