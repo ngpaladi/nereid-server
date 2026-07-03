@@ -350,6 +350,7 @@ pub fn run_python_inference(
     }
 
     let raw = fs::read(&output_path).map_err(|err| {
+        let _ = fs::remove_file(&output_path);
         Status::failed_precondition(format!(
             "model '{model_name}' declares a tensor output contract but wrote no readable tensor \
              to NEREID_OUTPUT_PATH ({err}){}",
