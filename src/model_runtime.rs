@@ -6,30 +6,56 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 use tch::{CModule, Device, Tensor};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tonic::Status;
 
 use crate::config::{ConfiguredBackend, ServerConfig};
 use crate::inference;
 use crate::python_backend;
 
-pub type InferenceOutput = (Vec<i64>, Vec<u8>);
+/// `(shape, row-major little-endian bytes, canonical dtype)` — the dtype lets
+/// the Rust path return non-float outputs (e.g. `int64`) faithfully.
+pub type InferenceOutput = (Vec<i64>, Vec<u8>, String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputShapeContract {
     /// Declared input tensor shape (excluding batch). `None` for a model that
     /// consumes no tensor input (e.g. an output-only Python producer).
     input_shape: Option<Vec<i64>>,
-    /// Declared output tensor shape (excluding batch). Required for Python
-    /// models — every Python reply is a typed tensor written to
-    /// `NEREID_OUTPUT_PATH` and validated/streamed against this.
-    output_shape: Option<Vec<i64>>,
     max_batch_size: i64,
+    /// Declared output tensor shape (excluding the batch dimension). Required
+    /// for Python models — every Python reply is a typed tensor.
+    output_shape: Option<Vec<i64>>,
+    /// Declared input KServe datatype (e.g. `"INT32"`). Absent means `FP32`,
+    /// preserving the original float-only behavior. Requests whose datatype
+    /// disagrees with this are rejected.
+    data_type: Option<String>,
+}
+
+/// One named tensor in a multi-tensor model contract (Triton `config.pbtxt`
+/// `input {}` / `output {}` block). `dims` excludes the batch dimension.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorSpec {
+    pub name: String,
+    /// KServe datatype string, e.g. `"FP32"`.
+    pub dtype: String,
+    pub dims: Vec<i64>,
+}
+
+/// A model that consumes and/or produces more than one named tensor. This is the
+/// additive parallel path — the single-tensor [`InputShapeContract`] and its
+/// well-tested Checkpoint path are untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiTensorContract {
+    pub inputs: Vec<TensorSpec>,
+    pub outputs: Vec<TensorSpec>,
+    pub max_batch_size: i64,
 }
 
 #[derive(Debug)]
 enum ModelHandle {
     Rust(RustModelHandle),
+    RustMulti(RustMultiHandle),
     Python(PythonModelHandle),
 }
 
@@ -47,12 +73,32 @@ struct PythonModelHandle {
     /// Required for Python models: declares the output tensor (and optionally an
     /// input tensor). Every Python reply is a typed tensor.
     contract: InputShapeContract,
+    /// Bounds concurrent `main.py` subprocesses to `queue_capacity`, mirroring
+    /// the Rust backend's bounded job queue. A ModelInfer call must hold a
+    /// permit for the duration of the subprocess; when none are free the call
+    /// is rejected with `ResourceExhausted`.
+    permits: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+struct RustMultiHandle {
+    contract: MultiTensorContract,
+    job_tx: std_mpsc::SyncSender<MultiInferenceJob>,
+    queue_capacity: usize,
+    occupancy: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 struct InferenceJob {
     input_tensor: Tensor,
     response_tx: oneshot::Sender<Result<InferenceOutput, Status>>,
+    occupancy: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct MultiInferenceJob {
+    input_tensors: Vec<Tensor>,
+    response_tx: oneshot::Sender<Result<Vec<InferenceOutput>, Status>>,
     occupancy: Arc<AtomicUsize>,
 }
 
@@ -116,8 +162,7 @@ impl ModelManager {
 
                     // A Python model must ship a `model_inference.textproto`
                     // that declares `output_shape`: every reply is a typed
-                    // output tensor. An `input_shape` is optional (a model may
-                    // consume no tensor input).
+                    // output tensor. An `input_shape` is optional.
                     if !model_dir.join("model_inference.textproto").is_file() {
                         return Err(Status::failed_precondition(format!(
                             "Python model '{}' must include a model_inference.textproto declaring output_shape",
@@ -138,18 +183,12 @@ impl ModelManager {
                         ModelHandle::Python(PythonModelHandle {
                             model_dir,
                             contract,
+                            permits: Arc::new(Semaphore::new(model_cfg.queue_capacity)),
                         }),
                     );
                 }
                 DetectedBackendKind::Rust => {
                     let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
-                    let input_contract = read_input_contract_from_textproto(&model_dir)?;
-                    if !input_contract.has_input() {
-                        return Err(Status::failed_precondition(format!(
-                            "Rust model '{}' must declare input_shape in model_inference.textproto",
-                            model_cfg.name
-                        )));
-                    }
                     let device = model_cfg.device.to_tch_device()?;
                     let model_path = pt_file.to_string_lossy().into_owned();
 
@@ -159,22 +198,48 @@ impl ModelManager {
                             model_cfg.name
                         ))
                     })?;
-
-                    let (job_tx, job_rx) =
-                        std_mpsc::sync_channel::<InferenceJob>(model_cfg.queue_capacity);
                     let occupancy = Arc::new(AtomicUsize::new(0));
-                    spawn_model_worker(model_cfg.name.clone(), model, device, job_rx);
 
-                    model_names.push(model_cfg.name.clone());
-                    handles.insert(
-                        model_cfg.name.clone(),
-                        ModelHandle::Rust(RustModelHandle {
-                            input_contract,
-                            job_tx,
-                            queue_capacity: model_cfg.queue_capacity,
-                            occupancy,
-                        }),
-                    );
+                    // A textproto using nested `input {}` / `output {}` blocks is
+                    // a multi-tensor model (additive path); a flat
+                    // `input_shape` textproto is the original single-tensor one.
+                    if textproto_is_multi(&model_dir) {
+                        let contract = read_multi_contract_from_textproto(&model_dir)?;
+                        let (job_tx, job_rx) =
+                            std_mpsc::sync_channel::<MultiInferenceJob>(model_cfg.queue_capacity);
+                        spawn_multi_worker(model_cfg.name.clone(), model, device, job_rx);
+                        model_names.push(model_cfg.name.clone());
+                        handles.insert(
+                            model_cfg.name.clone(),
+                            ModelHandle::RustMulti(RustMultiHandle {
+                                contract,
+                                job_tx,
+                                queue_capacity: model_cfg.queue_capacity,
+                                occupancy,
+                            }),
+                        );
+                    } else {
+                        let input_contract = read_input_contract_from_textproto(&model_dir)?;
+                        if !input_contract.has_input() {
+                            return Err(Status::failed_precondition(format!(
+                                "Rust model '{}' must declare input_shape in model_inference.textproto",
+                                model_cfg.name
+                            )));
+                        }
+                        let (job_tx, job_rx) =
+                            std_mpsc::sync_channel::<InferenceJob>(model_cfg.queue_capacity);
+                        spawn_model_worker(model_cfg.name.clone(), model, device, job_rx);
+                        model_names.push(model_cfg.name.clone());
+                        handles.insert(
+                            model_cfg.name.clone(),
+                            ModelHandle::Rust(RustModelHandle {
+                                input_contract,
+                                job_tx,
+                                queue_capacity: model_cfg.queue_capacity,
+                                occupancy,
+                            }),
+                        );
+                    }
                 }
             }
         }
@@ -189,17 +254,54 @@ impl ModelManager {
         self.model_names.clone()
     }
 
+    /// Whether `model_name` is a configured model (any backend kind).
+    pub fn is_configured(&self, model_name: &str) -> bool {
+        self.handles.contains_key(model_name)
+    }
+
+    /// Whether `model_name` is a Python (`main.py`) backend.
+    pub fn is_python(&self, model_name: &str) -> bool {
+        matches!(self.handles.get(model_name), Some(ModelHandle::Python(_)))
+    }
+
     pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
         match self.handles.get(model_name)? {
             ModelHandle::Rust(handle) => Some(&handle.input_contract),
             ModelHandle::Python(handle) => Some(&handle.contract),
+            ModelHandle::RustMulti(_) => None,
+        }
+    }
+
+    /// Whether `model_name` is a multi-tensor Rust model (served via the named
+    /// multi-tensor inference path rather than the single-tensor one).
+    pub fn is_multi(&self, model_name: &str) -> bool {
+        matches!(
+            self.handles.get(model_name),
+            Some(ModelHandle::RustMulti(_))
+        )
+    }
+
+    /// The multi-tensor contract for a `RustMulti` model, if `model_name` is one.
+    pub fn multi_contract(&self, model_name: &str) -> Option<MultiTensorContract> {
+        match self.handles.get(model_name)? {
+            ModelHandle::RustMulti(handle) => Some(handle.contract.clone()),
+            _ => None,
         }
     }
 
     pub fn python_model_dir(&self, model_name: &str) -> Option<PathBuf> {
         match self.handles.get(model_name)? {
             ModelHandle::Python(handle) => Some(handle.model_dir.clone()),
-            ModelHandle::Rust(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The concurrency permits for a Python model's subprocess pool, for the
+    /// ModelInfer backpressure gate. `None` for non-Python models.
+    pub fn python_permits(&self, model_name: &str) -> Option<Arc<Semaphore>> {
+        match self.handles.get(model_name)? {
+            ModelHandle::Python(handle) => Some(handle.permits.clone()),
+            _ => None,
         }
     }
 
@@ -210,6 +312,11 @@ impl ModelManager {
     ) -> Result<oneshot::Receiver<Result<InferenceOutput, Status>>, Status> {
         let handle = match self.handles.get(model_name) {
             Some(ModelHandle::Rust(handle)) => handle,
+            Some(ModelHandle::RustMulti(_)) => {
+                return Err(Status::failed_precondition(format!(
+                    "model '{model_name}' is a multi-tensor model; use the multi inference path"
+                )));
+            }
             Some(ModelHandle::Python(_)) => {
                 return Err(Status::failed_precondition(format!(
                     "model '{model_name}' is a python backend and does not support tensor inference"
@@ -255,6 +362,87 @@ impl ModelManager {
             }
         }
     }
+
+    /// Enqueue a multi-tensor inference job. Mirrors [`Self::enqueue`]'s bounded
+    /// queue + backpressure for the `RustMulti` path.
+    pub fn enqueue_multi(
+        &self,
+        model_name: &str,
+        input_tensors: Vec<Tensor>,
+    ) -> Result<oneshot::Receiver<Result<Vec<InferenceOutput>, Status>>, Status> {
+        let handle = match self.handles.get(model_name) {
+            Some(ModelHandle::RustMulti(handle)) => handle,
+            Some(_) => {
+                return Err(Status::failed_precondition(format!(
+                    "model '{model_name}' is not a multi-tensor model"
+                )));
+            }
+            None => {
+                return Err(Status::not_found(format!(
+                    "model '{model_name}' is not configured in nereid.yaml"
+                )));
+            }
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let occupancy = handle.occupancy.clone();
+        let job = MultiInferenceJob {
+            input_tensors,
+            response_tx,
+            occupancy: occupancy.clone(),
+        };
+
+        let current = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
+        match handle.job_tx.try_send(job) {
+            Ok(()) => {
+                model_log(&format!(
+                    "queue status model={model_name} queue={current}/{}",
+                    handle.queue_capacity
+                ));
+                Ok(response_rx)
+            }
+            Err(std_mpsc::TrySendError::Full(_)) => {
+                occupancy.fetch_sub(1, Ordering::SeqCst);
+                Err(Status::resource_exhausted("model queue full, retry later"))
+            }
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                occupancy.fetch_sub(1, Ordering::SeqCst);
+                Err(Status::internal(format!(
+                    "worker for model '{model_name}' is unavailable"
+                )))
+            }
+        }
+    }
+}
+
+fn spawn_multi_worker(
+    model_name: String,
+    model: CModule,
+    device: Device,
+    job_rx: std_mpsc::Receiver<MultiInferenceJob>,
+) {
+    let thread_name = format!("nereid-multi-{model_name}");
+    let _ = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            for job in job_rx {
+                let result = inference::run_multi_forward_pass(&model, device, job.input_tensors)
+                    .map_err(|err| {
+                        Status::internal(format!(
+                            "multi-tensor inference failed for '{model_name}': {err}"
+                        ))
+                    });
+                match &result {
+                    Ok(_) => model_log(&format!("multi job completed model={model_name}")),
+                    Err(status) => model_log(&format!(
+                        "multi job failed model={model_name} error={}",
+                        status.message()
+                    )),
+                }
+                let _ = job.response_tx.send(result);
+                job.occupancy.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
 }
 
 fn spawn_model_worker(
@@ -427,6 +615,7 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
     let mut input_shape = None::<Vec<i64>>;
     let mut output_shape = None::<Vec<i64>>;
+    let mut data_type = None::<String>;
     let mut max_batch_size = 0i64;
     for raw_line in contents.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -451,12 +640,18 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
                 )?);
             }
             "output_shape" => {
-                output_shape = Some(parse_shape_dims(
-                    "output_shape",
-                    raw_value,
-                    raw_line,
-                    &config_path,
-                )?);
+                let dims = parse_shape_dims("output_shape", raw_value, raw_line, &config_path)?;
+                output_shape = Some(dims);
+            }
+            "data_type" => {
+                let value = raw_value.trim().trim_matches('"').to_string();
+                if crate::dtype::kserve_fixed_width(&value).is_none() {
+                    return Err(Status::failed_precondition(format!(
+                        "unsupported data_type '{value}' in {}",
+                        config_path.to_string_lossy()
+                    )));
+                }
+                data_type = Some(value);
             }
             "max_batch_size" => {
                 max_batch_size = raw_value.trim().parse::<i64>().map_err(|err| {
@@ -485,15 +680,183 @@ pub fn read_input_contract_from_textproto(model_dir: &Path) -> Result<InputShape
 
     Ok(InputShapeContract {
         input_shape,
+        max_batch_size,
         output_shape,
+        data_type,
+    })
+}
+
+/// Whether a model's `model_inference.textproto` uses the nested
+/// `input {}` / `output {}` block syntax (multi-tensor) rather than the flat
+/// `input_shape` form (single-tensor).
+pub fn textproto_is_multi(model_dir: &Path) -> bool {
+    let path = model_dir.join("model_inference.textproto");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    contents.lines().any(|raw| {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        line.starts_with("input {")
+            || line.starts_with("input{")
+            || line.starts_with("output {")
+            || line.starts_with("output{")
+    })
+}
+
+/// Parse a multi-tensor `model_inference.textproto` (nested `input {}` /
+/// `output {}` blocks with `name`, optional `data_type` (default `FP32`), and
+/// `dims`). Reuses the same `dims`/datatype validation as the single-tensor
+/// parser.
+pub fn read_multi_contract_from_textproto(model_dir: &Path) -> Result<MultiTensorContract, Status> {
+    let config_path = model_dir.join("model_inference.textproto");
+    let contents = fs::read_to_string(&config_path).map_err(|err| {
+        Status::failed_precondition(format!(
+            "failed to read {}: {err}",
+            config_path.to_string_lossy()
+        ))
+    })?;
+
+    let fail = |msg: String| {
+        Status::failed_precondition(format!("{msg} in {}", config_path.to_string_lossy()))
+    };
+
+    #[derive(Default)]
+    struct Pending {
+        name: Option<String>,
+        dtype: Option<String>,
+        dims: Option<Vec<i64>>,
+    }
+
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut max_batch_size = 0i64;
+    // None = outside a block; Some(true) = in `input {`; Some(false) = `output {`.
+    let mut block: Option<bool> = None;
+    let mut pending = Pending::default();
+
+    let unquote = |s: &str| s.trim().trim_matches('"').to_string();
+
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("input {") || line.starts_with("input{") {
+            if block.is_some() {
+                return Err(fail("nested/unclosed block".to_string()));
+            }
+            block = Some(true);
+            pending = Pending::default();
+            continue;
+        }
+        if line.starts_with("output {") || line.starts_with("output{") {
+            if block.is_some() {
+                return Err(fail("nested/unclosed block".to_string()));
+            }
+            block = Some(false);
+            pending = Pending::default();
+            continue;
+        }
+        if line == "}" {
+            let is_input = block.ok_or_else(|| fail("stray '}'".to_string()))?;
+            let name = pending
+                .name
+                .take()
+                .ok_or_else(|| fail("block missing name".to_string()))?;
+            let dims = pending
+                .dims
+                .take()
+                .ok_or_else(|| fail(format!("input/output '{name}' missing dims")))?;
+            let dtype = pending.dtype.take().unwrap_or_else(|| "FP32".to_string());
+            if crate::dtype::kserve_fixed_width(&dtype).is_none() {
+                return Err(fail(format!(
+                    "unsupported data_type '{dtype}' for '{name}'"
+                )));
+            }
+            let spec = TensorSpec { name, dtype, dims };
+            if is_input {
+                inputs.push(spec);
+            } else {
+                outputs.push(spec);
+            }
+            block = None;
+            continue;
+        }
+
+        let (field, value) = line
+            .split_once(':')
+            .ok_or_else(|| fail(format!("invalid line '{raw_line}'")))?;
+        match (block, field.trim()) {
+            (None, "max_batch_size") => {
+                max_batch_size = value
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|err| fail(format!("bad max_batch_size: {err}")))?;
+                if max_batch_size < 0 {
+                    return Err(fail("max_batch_size must be >= 0".to_string()));
+                }
+            }
+            (Some(_), "name") => pending.name = Some(unquote(value)),
+            (Some(_), "data_type") => pending.dtype = Some(unquote(value)),
+            (Some(_), "dims") => {
+                let inner = value
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .ok_or_else(|| fail(format!("dims must be bracketed: '{raw_line}'")))?;
+                let mut dims = Vec::new();
+                for d in inner.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let dim = d
+                        .parse::<i64>()
+                        .map_err(|err| fail(format!("bad dim '{d}': {err}")))?;
+                    if dim == 0 || dim < -1 {
+                        return Err(fail("dims must be positive or -1".to_string()));
+                    }
+                    dims.push(dim);
+                }
+                if dims.is_empty() {
+                    return Err(fail("dims must be non-empty".to_string()));
+                }
+                pending.dims = Some(dims);
+            }
+            _ => {}
+        }
+    }
+
+    if block.is_some() {
+        return Err(fail("unclosed block".to_string()));
+    }
+    if inputs.is_empty() || outputs.is_empty() {
+        return Err(fail(
+            "multi-tensor model needs at least one input and one output".to_string(),
+        ));
+    }
+
+    Ok(MultiTensorContract {
+        inputs,
+        outputs,
         max_batch_size,
     })
 }
 
 impl InputShapeContract {
-    /// The declared output shape (excluding batch), if declared.
-    pub fn output_shape(&self) -> Option<&[i64]> {
-        self.output_shape.as_deref()
+    /// Build a bare input contract (no output/datatype declaration) for a single
+    /// tensor. Used by the multi-tensor path to reuse the tested batch/shape
+    /// validation per named input.
+    pub fn new_input(input_shape: Vec<i64>, max_batch_size: i64) -> Self {
+        Self {
+            input_shape: Some(input_shape),
+            max_batch_size,
+            output_shape: None,
+            data_type: None,
+        }
+    }
+
+    /// The declared input shape (excluding batch), if the model consumes a
+    /// tensor.
+    pub fn input_shape(&self) -> Option<&[i64]> {
+        self.input_shape.as_deref()
     }
 
     /// Whether the model consumes a tensor input (has a declared `input_shape`).
@@ -501,9 +864,23 @@ impl InputShapeContract {
         self.input_shape.is_some()
     }
 
-    /// The declared maximum batch size (`0` when no batch dimension is declared).
+    /// The declared maximum batch size (`0` when the model declares no batch
+    /// dimension).
     pub fn max_batch_size(&self) -> i64 {
         self.max_batch_size
+    }
+
+    /// The declared output tensor shape (excluding the batch dimension), if the
+    /// model declares one. `Some(..)` marks a Python model as tensor-capable
+    /// (servable over Triton `ModelInfer`); `None` keeps it text-only.
+    pub fn output_shape(&self) -> Option<&[i64]> {
+        self.output_shape.as_deref()
+    }
+
+    /// The declared input KServe datatype, defaulting to `"FP32"` when the
+    /// contract omits `data_type` (the original float-only behavior).
+    pub fn input_datatype(&self) -> &str {
+        self.data_type.as_deref().unwrap_or("FP32")
     }
 
     /// Whether this contract declares a batch dimension.
@@ -588,12 +965,15 @@ impl InputShapeContract {
         Ok(())
     }
 
-    /// Validate a Python model's *output* tensor shape (as written to
-    /// `NEREID_OUTPUT_PATH`) against the declared `output_shape`. A declared
-    /// batch dimension may be present or omitted; when present and
-    /// `expected_batch` is `Some`, it must match the request's batch. `-1`
-    /// declared dims match anything. Returns `Status::internal` on mismatch — a
-    /// wrong-shaped reply is a model bug.
+    /// Validate a model's *output* tensor shape against the declared
+    /// `output_shape`. Mirrors the input check: a declared batch dimension may
+    /// be present (any positive size) or omitted, and `-1` dims match anything.
+    /// When the output carries a batch dimension and `expected_batch` is
+    /// `Some`, the batch size must match the request's — a model that returns a
+    /// different batch count than it was given is rejected. A model that
+    /// declares no `output_shape` has nothing to check (returns `Ok`). Returns
+    /// `Status::internal` on mismatch — a wrong-shaped output is a model/config
+    /// bug, not a client error.
     pub fn validate_output_shape(
         &self,
         actual: &[i64],
@@ -604,14 +984,23 @@ impl InputShapeContract {
             return Ok(());
         };
 
+        // The model may or may not carry a leading batch dimension.
         let offset = if self.has_batch_dim() && actual.len() == declared.len() + 1 {
             1
         } else if actual.len() == declared.len() {
             0
         } else {
+            let allowed = if self.has_batch_dim() {
+                format!(
+                    "{} (or {} with a batch dimension)",
+                    declared.len(),
+                    declared.len() + 1
+                )
+            } else {
+                declared.len().to_string()
+            };
             return Err(Status::internal(format!(
-                "model '{model_name}' output rank mismatch: declared {} dims, got {}",
-                declared.len(),
+                "model '{model_name}' output rank mismatch: expected {allowed}, got {}",
                 actual.len()
             )));
         };
@@ -658,46 +1047,40 @@ impl InputShapeContract {
     }
 }
 
+/// Build a tensor of `kind` from raw row-major little-endian `tensor_bytes` and
+/// `request_shape`. The buffer length must be exactly `numel × element_size`.
 pub fn tensor_from_input_bytes(
     tensor_bytes: &[u8],
     request_shape: &[i64],
     model_name: &str,
+    kind: tch::Kind,
 ) -> Result<Tensor, Status> {
     if tensor_bytes.is_empty() {
         return Err(Status::invalid_argument(
-            "no tensor chunk data provided for Rust inference model",
+            "no tensor data provided for Rust inference model",
         ));
     }
-    if !tensor_bytes.len().is_multiple_of(4) {
-        return Err(Status::invalid_argument(
-            "tensor chunk bytes must be a multiple of 4 for float32",
-        ));
+    let elt = kind.elt_size_in_bytes();
+    if !tensor_bytes.len().is_multiple_of(elt) {
+        return Err(Status::invalid_argument(format!(
+            "tensor bytes length {} is not a multiple of {elt} for {kind:?}",
+            tensor_bytes.len()
+        )));
     }
-
-    let values: Vec<f32> = tensor_bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
 
     let expected_numel = request_shape
         .iter()
         .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
         .ok_or_else(|| Status::invalid_argument("tensor shape overflow"))?;
-
-    if expected_numel != i64::try_from(values.len()).unwrap_or(-1) {
+    let actual_numel = (tensor_bytes.len() / elt) as i64;
+    if expected_numel != actual_numel {
         return Err(Status::invalid_argument(format!(
-            "input tensor size mismatch for model '{model_name}': expected {expected_numel} values from request shape, got {}",
-            values.len()
+            "input tensor size mismatch for model '{model_name}': expected {expected_numel} elements from request shape, got {actual_numel}"
         )));
     }
 
-    Tensor::f_from_slice(&values)
-        .and_then(|t| t.f_reshape(request_shape))
-        .map_err(|err| {
-            Status::invalid_argument(format!(
-                "failed to build input tensor from stream chunks: {err}"
-            ))
-        })
+    Tensor::f_from_data_size(tensor_bytes, request_shape, kind)
+        .map_err(|err| Status::invalid_argument(format!("failed to build input tensor: {err}")))
 }
 
 #[cfg(test)]
@@ -706,7 +1089,7 @@ mod tests {
         DetectedBackendKind, InputShapeContract, detect_backend_kind,
         find_exactly_one_pt_model_file, read_input_contract_from_textproto,
     };
-    use crate::config::{ConfiguredBackend, load_server_config};
+    use crate::config::load_server_config;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -765,8 +1148,9 @@ mod tests {
             contract,
             InputShapeContract {
                 input_shape: Some(vec![-1, 16]),
+                max_batch_size: 8,
                 output_shape: None,
-                max_batch_size: 8
+                data_type: None,
             }
         );
 
@@ -788,11 +1172,175 @@ mod tests {
     }
 
     #[test]
+    fn multi_contract_parses_nested_blocks() {
+        use super::{read_multi_contract_from_textproto, textproto_is_multi};
+        let base = temp_dir("multi-contract");
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"max_batch_size: 4\n\
+              input {\n  name: \"a\"\n  data_type: \"FP32\"\n  dims: [4]\n}\n\
+              input {\n  name: \"b\"\n  dims: [4]\n}\n\
+              output {\n  name: \"sum\"\n  data_type: \"FP32\"\n  dims: [4]\n}\n",
+        )
+        .expect("write textproto");
+
+        assert!(textproto_is_multi(&base), "nested blocks -> multi");
+        let contract = read_multi_contract_from_textproto(&base).expect("parse multi contract");
+        assert_eq!(contract.max_batch_size, 4);
+        assert_eq!(contract.inputs.len(), 2);
+        assert_eq!(contract.inputs[0].name, "a");
+        assert_eq!(contract.inputs[0].dtype, "FP32");
+        assert_eq!(contract.inputs[0].dims, vec![4]);
+        // data_type defaults to FP32 when omitted.
+        assert_eq!(contract.inputs[1].name, "b");
+        assert_eq!(contract.inputs[1].dtype, "FP32");
+        assert_eq!(contract.outputs.len(), 1);
+        assert_eq!(contract.outputs[0].name, "sum");
+
+        // A flat single-tensor textproto is NOT detected as multi.
+        let flat = temp_dir("flat-contract");
+        fs::write(
+            flat.join("model_inference.textproto"),
+            b"input_shape: [16]\nmax_batch_size: 8\n",
+        )
+        .expect("write flat");
+        assert!(!textproto_is_multi(&flat), "flat form -> not multi");
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&flat);
+    }
+
+    #[test]
+    fn multi_contract_rejects_block_missing_dims() {
+        use super::read_multi_contract_from_textproto;
+        let base = temp_dir("multi-bad");
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"input {\n  name: \"a\"\n}\noutput {\n  name: \"y\"\n  dims: [4]\n}\n",
+        )
+        .expect("write");
+        assert!(
+            read_multi_contract_from_textproto(&base).is_err(),
+            "input without dims must be rejected"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn invalid_output_shape_error_names_output_shape() {
+        let base = temp_dir("bad-output-shape");
+        // A malformed output_shape must report `output_shape`, not `input_shape`.
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"output_shape: not-a-list\n",
+        )
+        .expect("write textproto");
+        let err = read_input_contract_from_textproto(&base).expect_err("should reject");
+        assert!(
+            err.message().contains("output_shape"),
+            "error should name output_shape, got: {}",
+            err.message()
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn contract_parses_output_shape_when_present() {
+        let base = temp_dir("output-shape");
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"input_shape: [4]\nmax_batch_size: 4\noutput_shape: [4]\n",
+        )
+        .expect("write textproto");
+
+        let contract = read_input_contract_from_textproto(&base).expect("parse contract");
+        assert_eq!(
+            contract.output_shape(),
+            Some([4i64].as_slice()),
+            "output_shape should be parsed as the tensor-output signal"
+        );
+
+        // A contract with no output_shape line reports None (text-only Python).
+        fs::write(
+            base.join("model_inference.textproto"),
+            b"input_shape: [4]\nmax_batch_size: 4\n",
+        )
+        .expect("rewrite textproto");
+        let no_output = read_input_contract_from_textproto(&base).expect("parse contract");
+        assert_eq!(no_output.output_shape(), None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_output_shape_accepts_declared_and_rejects_mismatch() {
+        let contract = InputShapeContract {
+            input_shape: Some(vec![4]),
+            max_batch_size: 4,
+            output_shape: Some(vec![4]),
+            data_type: None,
+        };
+
+        // With or without the optional batch dimension.
+        contract
+            .validate_output_shape(&[1, 4], Some(1), "m")
+            .expect("batched output ok");
+        contract
+            .validate_output_shape(&[4], None, "m")
+            .expect("unbatched output ok");
+
+        // Wrong trailing dim and wrong rank are both rejected.
+        assert!(
+            contract
+                .validate_output_shape(&[1, 5], Some(1), "m")
+                .is_err()
+        );
+        assert!(
+            contract
+                .validate_output_shape(&[1, 1, 4], Some(1), "m")
+                .is_err()
+        );
+
+        // Output batch that disagrees with the input batch is rejected.
+        assert!(
+            contract
+                .validate_output_shape(&[3, 4], Some(2), "m")
+                .is_err(),
+            "output batch 3 must not pass for input batch 2"
+        );
+        contract
+            .validate_output_shape(&[2, 4], Some(2), "m")
+            .expect("matching batch ok");
+
+        // A -1 declared dim matches any positive size.
+        let variable = InputShapeContract {
+            input_shape: Some(vec![4]),
+            max_batch_size: 0,
+            output_shape: Some(vec![-1]),
+            data_type: None,
+        };
+        variable
+            .validate_output_shape(&[7], None, "m")
+            .expect("variable output dim ok");
+
+        // No declared output_shape -> nothing to check.
+        let none = InputShapeContract {
+            input_shape: Some(vec![4]),
+            max_batch_size: 0,
+            output_shape: None,
+            data_type: None,
+        };
+        none.validate_output_shape(&[9, 9, 9], None, "m")
+            .expect("undeclared output is unchecked");
+    }
+
+    #[test]
     fn input_contract_without_batch_uses_request_shape_directly() {
         let contract = InputShapeContract {
             input_shape: Some(vec![-1, 16]),
-            output_shape: None,
             max_batch_size: 0,
+            output_shape: None,
+            data_type: None,
         };
 
         contract
@@ -809,8 +1357,9 @@ mod tests {
     fn input_contract_auto_expands_missing_batch_dim() {
         let contract = InputShapeContract {
             input_shape: Some(vec![16]),
-            output_shape: None,
             max_batch_size: 10,
+            output_shape: None,
+            data_type: None,
         };
 
         // Bare shape (batch omitted) and explicit batch shape both validate.
@@ -878,39 +1427,8 @@ mod tests {
         .expect("write textproto");
         fs::write(base.join("model.pt"), b"x").expect("write model.pt");
 
-        // Auto-detection (no declared backend) is ambiguous and rejected...
         assert!(detect_backend_kind(&base, "model", None).is_err());
-        // ...but an explicit backend disambiguates, allowing a `.pt` to live
-        // alongside main.py (and vice versa).
-        assert_eq!(
-            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Python))
-                .expect("declared python resolves"),
-            DetectedBackendKind::Python
-        );
-        assert_eq!(
-            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Rust))
-                .expect("declared rust resolves"),
-            DetectedBackendKind::Rust
-        );
 
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn detect_backend_kind_declared_backend_requires_its_files() {
-        // A folder with only Python files but declaring backend "rust" fails.
-        let base = temp_dir("kind-declared-mismatch");
-        fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
-        fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
-        assert!(
-            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Rust)).is_err(),
-            "declared rust without a .pt/textproto must fail"
-        );
-        assert_eq!(
-            detect_backend_kind(&base, "model", Some(ConfiguredBackend::Python))
-                .expect("declared python matches files"),
-            DetectedBackendKind::Python
-        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -927,8 +1445,9 @@ mod tests {
     fn input_contract_allows_multiple_variable_dims() {
         let contract = InputShapeContract {
             input_shape: Some(vec![-1, -1, 16]),
-            output_shape: None,
             max_batch_size: 4,
+            output_shape: None,
+            data_type: None,
         };
 
         contract

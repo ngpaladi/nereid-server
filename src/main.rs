@@ -5,17 +5,21 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod config;
+mod dtype;
 mod inference;
 mod model_runtime;
 mod python_backend;
+mod triton;
 
 use config::load_server_config;
 use model_runtime::{InputShapeContract, ModelManager, tensor_from_input_bytes};
+use proto::grpc_inference_service_server::GrpcInferenceServiceServer;
 use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
     CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse, TensorChunk,
     ViewModelsRequest, ViewModelsResponse, checkpoint_request::Payload,
 };
+use triton::TritonService;
 
 pub mod proto {
     tonic::include_proto!("inference");
@@ -250,7 +254,14 @@ impl Nereid for NereidService {
                 } else {
                     None
                 };
-                (Some(python_backend::PythonInput { shape, bytes }), batch)
+                (
+                    Some(python_backend::PythonInput {
+                        shape,
+                        bytes,
+                        dtype: "float32".to_string(),
+                    }),
+                    batch,
+                )
             } else {
                 tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
                 (None, None)
@@ -278,9 +289,11 @@ impl Nereid for NereidService {
 
         let (tensor_bytes, request_shape) =
             collect_input_tensor(&mut stream, &input_contract, &model_name).await?;
-        let input_tensor = tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name)?;
+        // The Checkpoint tensor contract is little-endian float32.
+        let input_tensor =
+            tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name, tch::Kind::Float)?;
         let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
-        let (output_shape, output_bytes) = response_rx.await.map_err(|_| {
+        let (output_shape, output_bytes, _dtype) = response_rx.await.map_err(|_| {
             Status::internal(format!(
                 "worker response channel closed for model '{model_name}'"
             ))
@@ -305,11 +318,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|status| std::io::Error::other(status.to_string()))?,
     );
 
-    let nereid = NereidService::new(model_manager);
+    let nereid = NereidService::new(model_manager.clone());
+    let triton = TritonService::new(model_manager);
     println!("gRPC server listening on {}", addr);
 
+    // Both the native Nereid service and the Triton-compatible
+    // GRPCInferenceService are served on the same address, so a KServe v2 client
+    // (e.g. tritonclient) can talk to the latter without knowing it isn't Triton.
     Server::builder()
         .add_service(NereidServer::new(nereid))
+        .add_service(GrpcInferenceServiceServer::new(triton))
         .serve(addr)
         .await?;
 
@@ -581,7 +599,7 @@ print('sum:', sum(values))
         )
         .expect("model should load");
         let input_tensor = Tensor::from_slice(&input_values).reshape([1, 16]);
-        let (expected_shape, expected_bytes) =
+        let (expected_shape, expected_bytes, _dtype) =
             run_forward_pass(&model, Device::Cpu, &input_tensor).expect("direct forward pass");
 
         // Actual: same input through the full gRPC server.
@@ -1040,6 +1058,33 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             vec![120.0],
             "output tensor must equal the input sum"
         );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    /// The native Checkpoint TensorChunk carries no dtype and is float32 by
+    /// contract. A Python model that writes a non-float32 framed output (here
+    /// int32) is rejected rather than streaming mislabeled bytes to the client.
+    #[tokio::test]
+    async fn python_backend_rejects_non_float32_output() {
+        let main_py = "\
+import os, struct
+with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
+    f.write(b'int32 2\\n')
+    f.write(struct.pack('<2i', 3, 4))
+";
+        let (ml_backends, name) = make_python_model_raw(
+            "checkpoint-int32",
+            "e2e_checkpoint_int32",
+            "output_shape: [2]\n",
+            main_py,
+        );
+        let addr = spawn_test_server(ml_backends.clone(), vec![cpu_model(&name)]).await;
+        let mut client = connect(addr).await;
+        let status = run_checkpoint(&mut client, vec![meta(&name)])
+            .await
+            .expect_err("non-float32 Checkpoint output must be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
 
         let _ = std::fs::remove_dir_all(&ml_backends);
     }

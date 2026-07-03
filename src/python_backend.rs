@@ -1,8 +1,10 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -13,101 +15,23 @@ use crate::proto::{CheckpointResponse, TensorChunk};
 pub type CheckpointStream =
     tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
-/// Emit a Python model's output tensor back over the checkpoint stream in the
-/// same 64 KiB-chunked form the Rust path uses.
+/// Output tensor chunk size for the Checkpoint stream (mirrors the Rust path).
 const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
-/// A process-unique scratch path for a Python model's output tensor. Avoids
-/// `Date`/random by combining the pid with a monotonic counter.
-fn unique_output_path(model_name: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let safe: String = model_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    std::env::temp_dir().join(format!("nereid-out-{safe}-{}-{n}.bin", std::process::id()))
-}
-
-/// Parse the framed output tensor a Python model writes to `NEREID_OUTPUT_PATH`:
-/// a UTF-8 header line `"float32 d0,d1,...\n"` followed by raw little-endian
-/// float32 bytes. Returns `(shape, bytes)`.
-fn parse_framed_tensor(raw: &[u8], model_name: &str) -> Result<(Vec<i64>, Vec<u8>), Status> {
-    let newline = raw.iter().position(|b| *b == b'\n').ok_or_else(|| {
-        Status::internal(format!(
-            "model '{model_name}' output is missing the framed header line"
-        ))
-    })?;
-    let header = std::str::from_utf8(&raw[..newline]).map_err(|_| {
-        Status::internal(format!(
-            "model '{model_name}' output header is not valid UTF-8"
-        ))
-    })?;
-    let data = &raw[newline + 1..];
-
-    let mut parts = header.split_whitespace();
-    let dtype = parts.next().unwrap_or_default();
-    if dtype != "float32" {
-        return Err(Status::internal(format!(
-            "model '{model_name}' output dtype '{dtype}' is unsupported; only float32 is supported"
-        )));
-    }
-    let dims_str = parts.next().ok_or_else(|| {
-        Status::internal(format!(
-            "model '{model_name}' output header is missing the shape: '{header}'"
-        ))
-    })?;
-
-    let mut dims = Vec::new();
-    for dim_str in dims_str.split(',').filter(|s| !s.is_empty()) {
-        let dim = dim_str.parse::<i64>().map_err(|err| {
-            Status::internal(format!(
-                "model '{model_name}' output shape dimension '{dim_str}' is invalid: {err}"
-            ))
-        })?;
-        if dim <= 0 {
-            return Err(Status::internal(format!(
-                "model '{model_name}' output shape dimensions must be positive, got {dim}"
-            )));
-        }
-        dims.push(dim);
-    }
-    if dims.is_empty() {
-        return Err(Status::internal(format!(
-            "model '{model_name}' output header has an empty shape"
-        )));
-    }
-
-    if !data.len().is_multiple_of(4) {
-        return Err(Status::internal(format!(
-            "model '{model_name}' output byte length {} is not a multiple of 4 (float32)",
-            data.len()
-        )));
-    }
-    let expected = dims
-        .iter()
-        .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
-        .ok_or_else(|| Status::internal(format!("model '{model_name}' output shape overflow")))?;
-    let actual = (data.len() / 4) as i64;
-    if expected != actual {
-        return Err(Status::internal(format!(
-            "model '{model_name}' output size mismatch: header shape implies {expected} float32 \
-             elements, file holds {actual}"
-        )));
-    }
-
-    Ok((dims, data.to_vec()))
-}
-
-/// A validated input tensor to feed `main.py`. The raw `bytes` are the
-/// little-endian `float32` tensor values; `shape` is the (already
-/// batch-normalized) tensor shape. Delivered to the subprocess on stdin, with
-/// the shape and dtype exposed via the `NEREID_INPUT_SHAPE` /
-/// `NEREID_INPUT_DTYPE` environment variables.
+/// A validated input tensor to feed `main.py`. The raw `bytes` are the tensor
+/// values in row-major little-endian order for the element type named by
+/// `dtype` (always `float32` on the Checkpoint path; any fixed-width dtype on
+/// the ModelInfer path); `shape` is the (already batch-normalized) tensor shape.
+/// Delivered to the subprocess on stdin, with the shape and dtype exposed via
+/// the `NEREID_INPUT_SHAPE` / `NEREID_INPUT_DTYPE` environment variables.
 #[derive(Debug, Clone)]
 pub struct PythonInput {
     pub shape: Vec<i64>,
     pub bytes: Vec<u8>,
+    /// Canonical lowercase dtype name (e.g. `float32`, `int32`) advertised to
+    /// `main.py` via `NEREID_INPUT_DTYPE`. The Checkpoint path is always
+    /// `float32`; the ModelInfer path carries the request's datatype.
+    pub dtype: String,
 }
 
 pub fn venv_python_path(venv_dir: &Path) -> PathBuf {
@@ -142,6 +66,12 @@ pub fn prepare_model_envs(
     model_names: &[String],
     ml_backends_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize venv creation process-wide: several `ModelManager`s can be built
+    // concurrently (e.g. parallel tests) sharing the same model directory, and
+    // concurrent `python3 -m venv` on one dir races to a half-built venv.
+    static PREPARE_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = PREPARE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     for model_name in model_names {
         let model_dir = fs::canonicalize(ml_backends_path.join(model_name))?;
         let requirements = model_dir.join("requirements.txt");
@@ -201,6 +131,264 @@ pub fn prepare_model_envs(
     Ok(())
 }
 
+/// Spawn a configured `main.py` command and, when an input tensor is supplied,
+/// write its bytes to the child's stdin on a dedicated thread. Writing on a
+/// separate thread is what prevents a deadlock when the tensor is larger than
+/// the OS pipe buffer and `main.py` is slow to (or never) drains it. Shared by
+/// both the streaming Checkpoint path and the unary `run_python_inference`
+/// path so that safety property is implemented exactly once.
+fn spawn_with_optional_stdin(
+    mut command: Command,
+    input: Option<PythonInput>,
+) -> std::io::Result<(Child, Option<JoinHandle<()>>)> {
+    let mut child = command.spawn()?;
+    let stdin_handle = match input {
+        Some(input) => child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input.bytes);
+                let _ = stdin.flush();
+            })
+        }),
+        None => None,
+    };
+    Ok((child, stdin_handle))
+}
+
+/// A process-unique scratch path for a model's output tensor. Avoids
+/// `Date`/random by combining the pid with a monotonic counter.
+fn unique_output_path(model_name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let safe: String = model_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    std::env::temp_dir().join(format!("nereid-out-{safe}-{}-{n}.bin", std::process::id()))
+}
+
+/// Parse the self-describing output tensor a `main.py` writes to
+/// `NEREID_OUTPUT_PATH`: a UTF-8 header line `"<dtype> <d0>,<d1>,...\n"`
+/// followed by the raw little-endian tensor bytes. Returns `(shape, bytes, dtype)`.
+fn parse_framed_tensor(
+    raw: &[u8],
+    model_name: &str,
+) -> Result<(Vec<i64>, Vec<u8>, String), Status> {
+    let newline = raw.iter().position(|b| *b == b'\n').ok_or_else(|| {
+        Status::internal(format!(
+            "model '{model_name}' output is missing the framed header line"
+        ))
+    })?;
+    let header = std::str::from_utf8(&raw[..newline]).map_err(|_| {
+        Status::internal(format!(
+            "model '{model_name}' output header is not valid UTF-8"
+        ))
+    })?;
+    let data = &raw[newline + 1..];
+
+    let mut parts = header.split_whitespace();
+    let dtype = parts.next().unwrap_or_default();
+    let (_kserve, elem_size) = crate::dtype::canonical_to_kserve(dtype).ok_or_else(|| {
+        Status::internal(format!(
+            "model '{model_name}' output dtype '{dtype}' is unsupported"
+        ))
+    })?;
+    let dims_str = parts.next().ok_or_else(|| {
+        Status::internal(format!(
+            "model '{model_name}' output header is missing the shape: '{header}'"
+        ))
+    })?;
+
+    let mut dims = Vec::new();
+    for dim_str in dims_str.split(',').filter(|s| !s.is_empty()) {
+        let dim = dim_str.parse::<i64>().map_err(|err| {
+            Status::internal(format!(
+                "model '{model_name}' output shape dimension '{dim_str}' is invalid: {err}"
+            ))
+        })?;
+        if dim <= 0 {
+            return Err(Status::internal(format!(
+                "model '{model_name}' output shape dimensions must be positive, got {dim}"
+            )));
+        }
+        dims.push(dim);
+    }
+    if dims.is_empty() {
+        return Err(Status::internal(format!(
+            "model '{model_name}' output header has an empty shape"
+        )));
+    }
+
+    if !data.len().is_multiple_of(elem_size) {
+        return Err(Status::internal(format!(
+            "model '{model_name}' output byte length {} is not a multiple of {elem_size} ({dtype})",
+            data.len()
+        )));
+    }
+    let expected = dims
+        .iter()
+        .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| Status::internal(format!("model '{model_name}' output shape overflow")))?;
+    let actual = (data.len() / elem_size) as i64;
+    if expected != actual {
+        return Err(Status::internal(format!(
+            "model '{model_name}' output size mismatch: header shape implies {expected} {dtype} \
+             elements, file holds {actual}"
+        )));
+    }
+
+    Ok((dims, data.to_vec(), dtype.to_string()))
+}
+
+/// Run a Python (`main.py`) model for a single inference request and return a
+/// typed output tensor — the Triton `ModelInfer` path for tensor-capable Python
+/// models (those declaring `output_shape` in `model_inference.textproto`).
+///
+/// The validated tensor is delivered on stdin exactly as on the Checkpoint
+/// path; the model writes its output tensor to the file named by
+/// `NEREID_OUTPUT_PATH` (framed as parsed by [`parse_framed_tensor`]).
+/// stdout/stderr are drained concurrently and captured for diagnostics only —
+/// they are not returned to the client. This is a blocking call; callers run it
+/// off the async runtime (e.g. `tokio::task::spawn_blocking`).
+pub fn run_python_inference(
+    model_name: &str,
+    model_dir: PathBuf,
+    input: Option<PythonInput>,
+) -> Result<(Vec<i64>, Vec<u8>, String), Status> {
+    let main_py = model_dir.join("main.py");
+    if !main_py.is_file() {
+        return Err(Status::not_found(format!(
+            "main.py not found for model '{model_name}'"
+        )));
+    }
+    let venv_dir = model_dir.join("venv");
+    let python_path = venv_python_path(&venv_dir);
+    if !python_path.is_file() {
+        return Err(Status::not_found(format!(
+            "venv python not found for model '{model_name}'"
+        )));
+    }
+
+    let output_path = unique_output_path(model_name);
+    // The output dtype hint defaults to float32 for an output-only model.
+    let output_dtype = input
+        .as_ref()
+        .map(|i| i.dtype.clone())
+        .unwrap_or_else(|| "float32".to_string());
+
+    let mut command = Command::new(&python_path);
+    command
+        .arg("-u")
+        .arg("main.py")
+        .current_dir(&model_dir)
+        .env("NEREID_OUTPUT_PATH", &output_path)
+        .env("NEREID_OUTPUT_DTYPE", &output_dtype)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // A model with a declared input receives the validated tensor on stdin;
+    // an output-only model gets no input (stdin closed).
+    if let Some(input) = &input {
+        let shape = input
+            .shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        command
+            .env("NEREID_INPUT_SHAPE", shape)
+            .env("NEREID_INPUT_DTYPE", &input.dtype)
+            .stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+
+    let (mut child, stdin_handle) = spawn_with_optional_stdin(command, input).map_err(|err| {
+        Status::internal(format!(
+            "failed to run main.py for model '{model_name}': {err}"
+        ))
+    })?;
+
+    // Drain both pipes concurrently so a chatty model can't wedge the child by
+    // filling a pipe buffer while we wait on the other stream.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || drain(stdout));
+    let stderr_handle = std::thread::spawn(move || drain(stderr));
+
+    let status = child.wait();
+    let _ = stdout_handle.join();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    if let Some(handle) = stdin_handle {
+        let _ = handle.join();
+    }
+
+    let status = status.map_err(|err| {
+        let _ = fs::remove_file(&output_path);
+        Status::internal(format!(
+            "failed waiting on main.py for model '{model_name}': {err}"
+        ))
+    })?;
+
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_text = stderr_text.trim();
+    let stderr_suffix = |prefix: &str| {
+        if stderr_text.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}{stderr_text}")
+        }
+    };
+
+    if !status.success() {
+        let _ = fs::remove_file(&output_path);
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Err(Status::internal(format!(
+            "main.py for model '{model_name}' exited with status {code}{}",
+            stderr_suffix(": ")
+        )));
+    }
+
+    // Read then remove unconditionally (best-effort) so the temp file never
+    // leaks — on read success, read failure, or a later parse failure.
+    let raw = fs::read(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let raw = raw.map_err(|err| {
+        Status::failed_precondition(format!(
+            "model '{model_name}' declares a tensor output contract but wrote no readable tensor \
+             to NEREID_OUTPUT_PATH ({err}){}",
+            stderr_suffix("; stderr: ")
+        ))
+    })?;
+
+    parse_framed_tensor(&raw, model_name)
+}
+
+/// Read a child pipe to EOF (so the process can't wedge on a full pipe),
+/// retaining at most `DRAIN_CAP` bytes for diagnostics — a chatty or
+/// runaway model can't grow this unboundedly. Read errors are discarded.
+fn drain(stream: Option<impl Read>) -> Vec<u8> {
+    const DRAIN_CAP: usize = 64 * 1024;
+    let mut buf = Vec::new();
+    if let Some(mut stream) = stream {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if buf.len() < DRAIN_CAP {
+                        let take = n.min(DRAIN_CAP - buf.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                    }
+                    // Keep reading past the cap to EOF so the child isn't wedged.
+                }
+            }
+        }
+    }
+    buf
+}
+
 pub fn spawn_python_checkpoint_stream(
     model_name: &str,
     model_dir: PathBuf,
@@ -252,35 +440,23 @@ pub fn spawn_python_checkpoint_stream(
                 .join(",");
             command
                 .env("NEREID_INPUT_SHAPE", shape)
-                .env("NEREID_INPUT_DTYPE", "float32")
+                .env("NEREID_INPUT_DTYPE", &input.dtype)
                 .stdin(Stdio::piped());
         } else {
             command.stdin(Stdio::null());
         }
 
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        // Spawn and (when present) stream the input tensor to stdin on a
+        // dedicated thread; see `spawn_with_optional_stdin` for the deadlock
+        // rationale.
+        let (mut child, stdin_handle) = match spawn_with_optional_stdin(command, input) {
+            Ok(parts) => parts,
             Err(err) => {
                 let _ = tx.blocking_send(Err(Status::internal(format!(
                     "failed to run main.py: {err}"
                 ))));
                 return;
             }
-        };
-
-        // Stream the input tensor to stdin on a dedicated thread so it runs
-        // concurrently with the stdout/stderr readers (a single-threaded
-        // write-then-read would deadlock once the OS pipe buffer fills). Write
-        // errors (e.g. a `main.py` that ignores stdin and exits) are ignored;
-        // dropping the handle at the end signals EOF.
-        let stdin_handle = match input {
-            Some(input) => child.stdin.take().map(|mut stdin| {
-                std::thread::spawn(move || {
-                    let _ = stdin.write_all(&input.bytes);
-                    let _ = stdin.flush();
-                })
-            }),
-            None => None,
         };
 
         let stdout = match child.stdout.take() {
@@ -376,8 +552,8 @@ pub fn spawn_python_checkpoint_stream(
 
         let exit_code = status.code().unwrap_or(-1);
         if !status.success() {
-            // On failure there is no valid tensor to return; the text chunks
-            // already streamed carry the diagnostics.
+            // On failure there is no valid tensor; the streamed text carries the
+            // diagnostics.
             let _ = fs::remove_file(&output_path);
             let _ = tx.blocking_send(Ok(CheckpointResponse {
                 chunk: String::new(),
@@ -389,8 +565,8 @@ pub fn spawn_python_checkpoint_stream(
         }
 
         // Success: read, validate, and stream the model's output tensor before
-        // the terminal `done`. A model that exits 0 without a valid tensor is a
-        // contract violation (every Python reply must be a tensor).
+        // the terminal `done`. Exiting 0 without a valid tensor is a contract
+        // violation (every Python reply must be a tensor).
         let tensor = fs::read(&output_path).map_err(|err| {
             Status::failed_precondition(format!(
                 "Python model '{model_name}' exited 0 but wrote no readable output tensor to NEREID_OUTPUT_PATH: {err}"
@@ -399,7 +575,16 @@ pub fn spawn_python_checkpoint_stream(
         let _ = fs::remove_file(&output_path);
         let tensor = tensor
             .and_then(|raw| parse_framed_tensor(&raw, &model_name))
-            .and_then(|(shape, bytes)| {
+            .and_then(|(shape, bytes, dtype)| {
+                // The Checkpoint TensorChunk carries no dtype and is float32 by
+                // contract; reject a non-float32 reply rather than streaming
+                // mislabeled bytes to native clients.
+                if dtype != "float32" {
+                    return Err(Status::failed_precondition(format!(
+                        "Python model '{model_name}' wrote a '{dtype}' output tensor, but the \
+                         Checkpoint path only supports float32"
+                    )));
+                }
                 contract
                     .validate_output_shape(&shape, expected_batch, &model_name)
                     .map(|()| (shape, bytes))

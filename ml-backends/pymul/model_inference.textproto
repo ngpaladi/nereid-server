@@ -1,0 +1,7 @@
+# Tensor-output Python model: input * 2 + 1.
+# Message type: inference.ModelInferenceConfig
+input_shape: [4]
+max_batch_size: 4
+# output_shape marks this Python model as tensor-capable: it is servable over
+# the Triton ModelInfer RPC (without it, a Python model is text-only).
+output_shape: [4]
