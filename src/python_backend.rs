@@ -167,7 +167,7 @@ fn unique_output_path(model_name: &str) -> PathBuf {
 
 /// Parse the self-describing output tensor a `main.py` writes to
 /// `NEREID_OUTPUT_PATH`: a UTF-8 header line `"<dtype> <d0>,<d1>,...\n"`
-/// followed by the raw little-endian tensor bytes. Returns `(shape, bytes)`.
+/// followed by the raw little-endian tensor bytes. Returns `(shape, bytes, dtype)`.
 fn parse_framed_tensor(
     raw: &[u8],
     model_name: &str,
