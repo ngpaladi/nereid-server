@@ -1,0 +1,568 @@
+<title>nereid-server · Build Guide</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --ground:  #eef3f3;
+    --surface: #ffffff;
+    --surface-2:#f4f8f8;
+    --ink:     #0d1a1f;
+    --ink-soft:#33474d;
+    --muted:   #5c6f74;
+    --line:    #d5e1e0;
+    --line-soft:#e4eceb;
+    --accent:  #0b7f79;
+    --accent-strong:#0a6560;
+    --accent-wash:#e2f1ef;
+    --warn:    #9a6410;
+    --warn-wash:#faf1dd;
+    --warn-line:#ecd6a6;
+    --danger:  #b0402f;
+    --danger-wash:#f8e6e1;
+    --danger-line:#eec4ba;
+    --term-bg: #0c1a20;
+    --term-ink:#cfe3e2;
+    --term-dim:#6f8b8c;
+    --term-accent:#54d6c9;
+    --term-bar:#132a30;
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --maxw: 46rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:  #0a1519;
+      --surface: #0f1f25;
+      --surface-2:#0c1a20;
+      --ink:     #dde9e8;
+      --ink-soft:#b3c6c6;
+      --muted:   #859c9d;
+      --line:    #1d343b;
+      --line-soft:#16282e;
+      --accent:  #45d3c6;
+      --accent-strong:#74e2d7;
+      --accent-wash:#0f2b2b;
+      --warn:    #e2b25f;
+      --warn-wash:#241d10;
+      --warn-line:#4a3c1d;
+      --danger:  #e58a76;
+      --danger-wash:#271511;
+      --danger-line:#4d2820;
+      --term-bg: #081217;
+      --term-bar:#0e2026;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground:#eef3f3; --surface:#fff; --surface-2:#f4f8f8; --ink:#0d1a1f; --ink-soft:#33474d;
+    --muted:#5c6f74; --line:#d5e1e0; --line-soft:#e4eceb; --accent:#0b7f79; --accent-strong:#0a6560;
+    --accent-wash:#e2f1ef; --warn:#9a6410; --warn-wash:#faf1dd; --warn-line:#ecd6a6;
+    --danger:#b0402f; --danger-wash:#f8e6e1; --danger-line:#eec4ba; --term-bg:#0c1a20; --term-bar:#132a30;
+  }
+  :root[data-theme="dark"] {
+    --ground:#0a1519; --surface:#0f1f25; --surface-2:#0c1a20; --ink:#dde9e8; --ink-soft:#b3c6c6;
+    --muted:#859c9d; --line:#1d343b; --line-soft:#16282e; --accent:#45d3c6; --accent-strong:#74e2d7;
+    --accent-wash:#0f2b2b; --warn:#e2b25f; --warn-wash:#241d10; --warn-line:#4a3c1d;
+    --danger:#e58a76; --danger-wash:#271511; --danger-line:#4d2820; --term-bg:#081217; --term-bar:#0e2026;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ---- shell ---- */
+  .wrap { max-width: 74rem; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 2.5rem); }
+  .layout { display: grid; grid-template-columns: 15rem minmax(0, 1fr); gap: clamp(1.5rem, 4vw, 3.5rem); align-items: start; }
+  @media (max-width: 60rem) { .layout { grid-template-columns: 1fr; } }
+
+  /* ---- masthead ---- */
+  header.masthead {
+    border-bottom: 1px solid var(--line);
+    background:
+      radial-gradient(120% 140% at 88% -20%, var(--accent-wash), transparent 60%),
+      var(--surface);
+  }
+  .masthead .wrap { padding-top: 3.2rem; padding-bottom: 2.6rem; }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: .74rem;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: inline-flex; align-items: center; gap: .55rem;
+    margin: 0 0 1.1rem;
+  }
+  .eyebrow::before {
+    content: ""; width: 1.6rem; height: 1px; background: var(--accent); display: inline-block;
+  }
+  h1.title {
+    font-size: clamp(2.1rem, 5.5vw, 3.1rem);
+    line-height: 1.04;
+    letter-spacing: -0.02em;
+    margin: 0 0 .9rem;
+    text-wrap: balance;
+    font-weight: 660;
+  }
+  h1.title .n { color: var(--accent); }
+  .lede {
+    font-size: clamp(1.05rem, 2.4vw, 1.28rem);
+    color: var(--ink-soft);
+    max-width: 40rem;
+    margin: 0 0 1.9rem;
+    text-wrap: pretty;
+  }
+  .quickrow { display: flex; flex-wrap: wrap; gap: .6rem; }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: .8rem;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    color: var(--ink-soft);
+    padding: .32rem .7rem;
+    border-radius: 999px;
+  }
+  .chip b { color: var(--accent); font-weight: 600; }
+
+  /* ---- nav rail ---- */
+  nav.toc {
+    position: sticky; top: 1.5rem;
+    font-size: .92rem;
+    padding-top: 2.6rem;
+  }
+  @media (max-width: 60rem) {
+    nav.toc { position: static; padding-top: 1.5rem; border-bottom: 1px solid var(--line); padding-bottom: 1rem; }
+  }
+  nav.toc .navlabel {
+    font-family: var(--font-mono); font-size: .7rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 .8rem;
+  }
+  nav.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .1rem; }
+  nav.toc a {
+    display: block; color: var(--muted); text-decoration: none;
+    padding: .28rem .7rem; border-left: 2px solid transparent; border-radius: 0 4px 4px 0;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  nav.toc a:hover { color: var(--ink); background: var(--surface-2); }
+  nav.toc a .num { font-family: var(--font-mono); font-size: .78rem; color: var(--accent); margin-right: .5rem; }
+
+  /* ---- content ---- */
+  main { padding: 2.6rem 0 5rem; min-width: 0; }
+  section { max-width: var(--maxw); margin-bottom: 3.4rem; scroll-margin-top: 1.5rem; }
+  section > h2 {
+    font-size: 1.62rem; letter-spacing: -0.01em; margin: 0 0 .3rem; font-weight: 640;
+    display: flex; align-items: baseline; gap: .7rem; text-wrap: balance;
+  }
+  section > h2 .idx { font-family: var(--font-mono); font-size: .9rem; color: var(--accent); font-weight: 500; }
+  section > .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: 1.02rem; }
+  h3 { font-size: 1.12rem; margin: 2.1rem 0 .6rem; font-weight: 620; letter-spacing: -0.005em; }
+  p { margin: 0 0 1rem; }
+  a { color: var(--accent-strong); text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset: 2px; }
+  strong { font-weight: 640; color: var(--ink); }
+  code {
+    font-family: var(--font-mono); font-size: .86em;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    padding: .08em .38em; border-radius: 4px; color: var(--ink);
+  }
+  ul, ol.steps { margin: 0 0 1.1rem; padding-left: 1.2rem; }
+  li { margin: .3rem 0; }
+  li::marker { color: var(--accent); }
+  hr.rule { border: 0; height: 1px; background: var(--line); margin: 2.4rem 0; max-width: var(--maxw); }
+
+  /* ---- terminal blocks ---- */
+  .term {
+    background: var(--term-bg); border-radius: 10px; overflow: hidden;
+    margin: 0 0 1.3rem; border: 1px solid color-mix(in srgb, var(--term-bg) 60%, #000);
+    box-shadow: 0 1px 0 color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .term .bar {
+    background: var(--term-bar); padding: .5rem .8rem; display: flex; align-items: center; gap: .45rem;
+    border-bottom: 1px solid rgba(255,255,255,.05);
+  }
+  .term .bar i { width: 10px; height: 10px; border-radius: 50%; background: #2c454b; display: inline-block; }
+  .term .bar i:nth-child(1) { background: #e0715f; }
+  .term .bar i:nth-child(2) { background: #d9ad57; }
+  .term .bar i:nth-child(3) { background: #5bbf7f; }
+  .term .bar .cap { margin-left: .6rem; font-family: var(--font-mono); font-size: .72rem; color: var(--term-dim); letter-spacing: .04em; }
+  .term pre { margin: 0; padding: .95rem 1.1rem; overflow-x: auto; font-family: var(--font-mono); font-size: .84rem; line-height: 1.7; color: var(--term-ink); }
+  .term pre .p { color: var(--term-accent); user-select: none; }
+  .term pre .c { color: var(--term-dim); }
+  .term pre .o { color: #9fb6b6; }
+  .term pre .f { color: #e2b25f; }
+  .term pre b { color: #fff; font-weight: 600; }
+
+  /* ---- decision matrix ---- */
+  .tablewrap { overflow-x: auto; margin: 0 0 1.2rem; border: 1px solid var(--line); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; background: var(--surface); }
+  th, td { text-align: left; padding: .72rem .9rem; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  thead th { background: var(--surface-2); font-size: .74rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td code { background: transparent; border: 0; padding: 0; color: var(--accent-strong); white-space: nowrap; }
+  td .goal { font-weight: 600; }
+
+  /* ---- callouts ---- */
+  .call { border-radius: 8px; padding: .9rem 1.1rem .9rem 1.15rem; margin: 0 0 1.3rem; border: 1px solid; font-size: .95rem; }
+  .call p:last-child { margin-bottom: 0; }
+  .call .tag { font-family: var(--font-mono); font-size: .68rem; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; display: block; margin-bottom: .3rem; }
+  .call.note   { background: var(--accent-wash); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+  .call.note .tag { color: var(--accent-strong); }
+  .call.warn   { background: var(--warn-wash); border-color: var(--warn-line); }
+  .call.warn .tag { color: var(--warn); }
+  .call.stop   { background: var(--danger-wash); border-color: var(--danger-line); }
+  .call.stop .tag { color: var(--danger); }
+
+  /* ---- mode cards ---- */
+  .modegrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .8rem; margin: 0 0 1.4rem; }
+  .mode { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.05rem; }
+  .mode h4 { margin: 0 0 .1rem; font-family: var(--font-mono); font-size: .95rem; color: var(--accent-strong); }
+  .mode .tagline { font-size: .82rem; color: var(--muted); margin: 0 0 .55rem; }
+  .mode p { font-size: .9rem; margin: 0; color: var(--ink-soft); }
+
+  /* ---- footer ---- */
+  footer { border-top: 1px solid var(--line); background: var(--surface); }
+  footer .wrap { padding: 2rem 0; display: flex; flex-wrap: wrap; gap: .6rem 1.4rem; align-items: center; font-size: .88rem; color: var(--muted); }
+  footer code { font-size: .8rem; }
+  .theme-toggle {
+    margin-left: auto; font-family: var(--font-mono); font-size: .78rem; cursor: pointer;
+    background: var(--surface-2); border: 1px solid var(--line); color: var(--ink-soft);
+    padding: .35rem .8rem; border-radius: 999px;
+  }
+  a:focus-visible, .theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+</style>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow">nereid-server · build guide</p>
+    <h1 class="title">From clone to a running server, in one script.</h1>
+    <p class="lede">nereid links <strong>libtorch</strong> — a ~200&nbsp;MB C++ dependency with a strict version pin and no embedded rpath. <code>build.sh</code> turns that from a research project into a single command, whether you're on a CPU laptop or a CUDA node behind a module system.</p>
+    <div class="quickrow">
+      <span class="chip"><b>tch</b> 0.18 → libtorch 2.5.1</span>
+      <span class="chip"><b>cxx11</b> ABI</span>
+      <span class="chip">dynamic · bundled · <b>static</b></span>
+      <span class="chip">sha256-<b>pinned</b> downloads</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="layout">
+    <nav class="toc">
+      <p class="navlabel">On this page</p>
+      <ol>
+        <li><a href="#tldr"><span class="num">01</span>The short version</a></li>
+        <li><a href="#pick"><span class="num">02</span>Pick a build</a></li>
+        <li><a href="#prereqs"><span class="num">03</span>Prerequisites</a></li>
+        <li><a href="#modes"><span class="num">04</span>Linking modes</a></li>
+        <li><a href="#libtorch"><span class="num">05</span>Where libtorch comes from</a></li>
+        <li><a href="#hpc"><span class="num">06</span>HPC &amp; environments</a></li>
+        <li><a href="#static"><span class="num">07</span>Static from source</a></li>
+        <li><a href="#run"><span class="num">08</span>Running &amp; troubleshooting</a></li>
+        <li><a href="#reference"><span class="num">09</span>Flag reference</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <section id="tldr">
+        <h2><span class="idx">01</span> The short version</h2>
+        <p class="sub">If you just want a working server and don't care how, this is the whole story.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="c"># CPU build. Downloads libtorch, builds, tells you how to run it.</span>
+<span class="p">$</span> ./build.sh
+
+<span class="c"># Something you can copy to another box and run as-is — no LD_LIBRARY_PATH.</span>
+<span class="p">$</span> ./build.sh <span class="f">--release --link bundled --fetch-libtorch</span></pre>
+        </div>
+        <p>The first command builds against the libtorch <code>tch</code> fetches for you and writes a launcher that sets the loader path. The second produces a <strong>self-contained directory</strong> under <code>dist/</code> — binary plus its libtorch, wired to find each other wherever they land. That's the one you hand to a container or a colleague.</p>
+        <div class="call note">
+          <span class="tag">Why a script at all</span>
+          <p>libtorch ships as shared libraries with no rpath baked in, so a plain <code>cargo build</code> produces a binary that can't find its own dependency at runtime. Every mode below exists to solve that cleanly instead of exporting <code>LD_LIBRARY_PATH</code> by hand each time.</p>
+        </div>
+      </section>
+
+      <section id="pick">
+        <h2><span class="idx">02</span> Pick a build</h2>
+        <p class="sub">Four situations cover almost everyone. Find yours, run the command.</p>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr><th>You want to…</th><th>Use</th><th>Command</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="goal">Hack locally</span><br>build &amp; iterate on one machine</td>
+                <td>dynamic<br><small>(default)</small></td>
+                <td><code>./build.sh</code></td>
+              </tr>
+              <tr>
+                <td><span class="goal">Ship it</span><br>container, systemd, another host</td>
+                <td>bundled</td>
+                <td><code>./build.sh --release --link bundled --fetch-libtorch</code></td>
+              </tr>
+              <tr>
+                <td><span class="goal">Run on a cluster</span><br>CUDA + a module system + a shared libtorch</td>
+                <td>dynamic<br>on HPC</td>
+                <td><code>./build.sh --module cuda/12.6.0 --device cuda --libtorch /path/to/libtorch</code></td>
+              </tr>
+              <tr>
+                <td><span class="goal">One file, no deps</span><br>a single binary with libtorch linked in</td>
+                <td>static</td>
+                <td><code>./build.sh --release --link static --build-libtorch</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Everything after this is detail on the choices those commands make — read the section for the row you landed on.</p>
+      </section>
+
+      <section id="prereqs">
+        <h2><span class="idx">03</span> Prerequisites</h2>
+        <p class="sub">The floor is a Rust toolchain. The rest depends on how far you go.</p>
+        <ul>
+          <li><strong>Rust (stable) + Cargo</strong> — the only hard requirement for a dynamic build. <a href="https://rust-lang.org/tools/install/">rustup</a>.</li>
+          <li><strong>curl + unzip</strong> — for <code>--fetch-libtorch</code> (present on essentially every Linux box).</li>
+          <li><strong>patchelf</strong> — for <code>--link bundled</code> to set the rpath. Without it you still get a working bundle, just with a small <code>run.sh</code> wrapper instead of a bare binary. <code>apt-get install patchelf</code>.</li>
+          <li><strong>A CUDA toolkit</strong> — only for <code>--device cuda</code>. On a cluster this is a <code>module load</code> away; see §06.</li>
+          <li><strong>git, CMake, Ninja, and a C++17 compiler</strong> — only for <code>--build-libtorch</code> (§07), plus a Python with PyYAML for PyTorch's code generators.</li>
+        </ul>
+        <div class="call note">
+          <span class="tag">Nothing to install for the common case</span>
+          <p>A first-time <code>./build.sh</code> on a stock machine needs only Rust. libtorch is downloaded on demand, and the build tells you exactly how to launch the result.</p>
+        </div>
+      </section>
+
+      <section id="modes">
+        <h2><span class="idx">04</span> Linking modes</h2>
+        <p class="sub">How the binary connects to libtorch — and therefore how portable the result is.</p>
+        <div class="modegrid">
+          <div class="mode">
+            <h4>dynamic</h4>
+            <p class="tagline">default · fastest turnaround</p>
+            <p>Links libtorch's <code>.so</code> files as usual. Portable to nowhere on its own, but perfect while you iterate.</p>
+          </div>
+          <div class="mode">
+            <h4>bundled</h4>
+            <p class="tagline">relocatable · ship it</p>
+            <p>Copies libtorch beside the binary, rpath set to <code>$ORIGIN/lib</code>. Runs anywhere as a unit.</p>
+          </div>
+          <div class="mode">
+            <h4>static</h4>
+            <p class="tagline">one file · self-contained</p>
+            <p>libtorch linked <em>into</em> the binary. No <code>.so</code> to carry — but you must build libtorch yourself first.</p>
+          </div>
+        </div>
+
+        <h3>dynamic — the default</h3>
+        <p>An ordinary <code>cargo build</code>, plus one thing cargo won't do for you: after the build, the script finds the exact libtorch <code>lib/</code> directory it linked and writes a launcher next to the binary.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="p">$</span> ./build.sh --release
+<span class="o">==> Built: target/release/grpc-test</span>
+<span class="o">==> Run wrapper written: target/release/run-grpc-test.sh</span>
+
+<span class="p">$</span> target/release/run-grpc-test.sh   <span class="c"># loader path already set</span></pre>
+        </div>
+
+        <h3>bundled — the one you ship</h3>
+        <p>Builds, then assembles a directory that carries its own libtorch and knows how to find it. Because the rpath is <code>$ORIGIN</code>-relative, you can move, copy, or <code>tar</code> the whole folder and it still runs — no environment variables, no system libtorch.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="p">$</span> ./build.sh --release <span class="f">--link bundled --fetch-libtorch</span>
+<span class="o">==> Copied 12 shared object(s) and the binary into dist/grpc-test</span>
+<span class="o">==> Patched rpath to $ORIGIN/lib — the bundle is relocatable.</span>
+
+<span class="p">$</span> ls dist/grpc-test
+<span class="o">grpc-test  lib/</span>
+<span class="p">$</span> ./dist/grpc-test/grpc-test        <span class="c"># no LD_LIBRARY_PATH, from anywhere</span></pre>
+        </div>
+        <div class="call note">
+          <span class="tag">Verified relocatable</span>
+          <p>The rpath is relative to the binary, not an absolute path — copy <code>dist/grpc-test</code> to another host, a scratch dir, or a container image and it resolves libtorch from its own <code>lib/</code> every time.</p>
+        </div>
+
+        <h3>static — one binary, nothing beside it</h3>
+        <p>Sets <code>LIBTORCH_STATIC=1</code> so libtorch is linked directly into the executable. The catch is upstream: PyTorch stopped publishing prebuilt static archives after 2.1.2, so there's no <code>libtorch.a</code> to download at the 2.5.1 version <code>tch</code> needs. Pair this with <code>--build-libtorch</code> (§07), which produces one from source. The script checks the archives are present before linking and confirms the finished binary has no libtorch dependency left.</p>
+      </section>
+
+      <section id="libtorch">
+        <h2><span class="idx">05</span> Where libtorch comes from</h2>
+        <p class="sub">Four sources, checked in order. The first one that applies wins.</p>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Source</th><th>Best for</th></tr></thead>
+            <tbody>
+              <tr><td><code>--build-libtorch</code></td><td>Built from source, static</td><td>Static links (§07)</td></tr>
+              <tr><td><code>--fetch-libtorch</code></td><td>Official download, <strong>sha256-verified</strong></td><td>Reproducible &amp; offline-friendly builds</td></tr>
+              <tr><td><code>--libtorch &lt;dir&gt;</code></td><td>An install you already have</td><td>HPC shared installs</td></tr>
+              <tr><td><em>(none)</em></td><td><code>tch</code> downloads it silently</td><td>First quick build</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Verified downloads with <code>--fetch-libtorch</code></h3>
+        <p>By default <code>tch</code> downloads libtorch during the build with no integrity check and drops it somewhere under <code>target/</code>. <code>--fetch-libtorch</code> takes that over: it pulls the official archive, checks it against a <strong>pinned sha256</strong>, and caches it under <code>.cache/libtorch/</code> so repeat builds are instant and provenance is known.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="p">$</span> ./build.sh --fetch-libtorch
+<span class="o">==> downloading libtorch: .../libtorch-cxx11-abi-shared-with-deps-2.5.1+cpu.zip</span>
+<span class="o">==> sha256 verified: 618ca54e…562fa</span>
+<span class="o">==> extracting into .cache/libtorch/cpu-2.5.1</span></pre>
+        </div>
+        <p>The CPU 2.5.1 hash ships pinned. For another device or version, pass the expected digest with <code>--libtorch-sha256 &lt;hex&gt;</code> — or <code>--no-verify</code> to skip the check, if you know what you're doing.</p>
+
+        <h3>An existing install with <code>--libtorch</code></h3>
+        <p>On a shared system libtorch is often already unpacked somewhere central. Point at it and the script uses it verbatim — this is also how you supply a specific CUDA build.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="p">$</span> ./build.sh --libtorch /opt/libtorch --device cuda</pre>
+        </div>
+        <div class="call warn">
+          <span class="tag">Version &amp; ABI must match</span>
+          <p>An external libtorch has to be the version <code>tch</code> expects (<strong>2.5.1</strong> for tch&nbsp;0.18) and the <strong>cxx11 ABI</strong>. A mismatch shows up as link or load-time symbol errors, not a friendly message.</p>
+        </div>
+      </section>
+
+      <section id="hpc">
+        <h2><span class="idx">06</span> HPC &amp; managed environments</h2>
+        <p class="sub">The messy parts of a cluster build — modules, CUDA, and someone else's Python — handled inline.</p>
+        <p>This script started life as a one-cluster recipe: <code>module load cuda</code>, point <code>LIBTORCH</code> at a shared install, build. That pattern is now first-class and portable — the same flags work on any Lmod or environment-modules system.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">login-node ~ $</span></div>
+<pre><span class="p">$</span> ./build.sh <span class="f">--module</span> cuda/12.6.0 <span class="f">--device</span> cuda <span class="f">\</span>
+             <span class="f">--libtorch</span> /depot/group/torch/libtorch <span class="f">--release</span></pre>
+        </div>
+        <p><code>--module</code> is repeatable — pass it once per module you need loaded before the compiler and CUDA are on <code>PATH</code>.</p>
+
+        <h3>Building inside conda, pyenv, or a venv</h3>
+        <p>Clusters rarely give you the Python you want by default, and the from-source libtorch build (§07) needs one with specific packages. Activate the right environment as part of the build instead of remembering to do it first:</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="p">$</span> ./build.sh <span class="f">--conda</span> nereid --release
+<span class="p">$</span> ./build.sh <span class="f">--pyenv</span> 3.12.4 --build-libtorch
+<span class="p">$</span> ./build.sh <span class="f">--venv</span> ./.venv --link bundled</pre>
+        </div>
+        <p>Each activates its environment in the build shell before anything compiles, so the toolchain, the Python code generators, and the model backends all see the same interpreter. If the manager or environment name is wrong, the build stops with a clear message rather than silently using the system Python.</p>
+        <div class="call note">
+          <span class="tag">Matches the client tooling</span>
+          <p>The Python client ships a <code>conda_env.yml</code> with <code>tritonclient</code> included, so the same conda environment can drive both a nereid-native and a Triton client against your freshly built server.</p>
+        </div>
+      </section>
+
+      <section id="static">
+        <h2><span class="idx">07</span> Static libtorch from source</h2>
+        <p class="sub">The long road — worth it when you need a single binary with no runtime dependency on libtorch at all.</p>
+        <p>Since no prebuilt static libtorch exists at 2.5.1, <code>scripts/build-libtorch.sh</code> builds one. <code>./build.sh --build-libtorch</code> calls it for you, then static-links against the result and drops back out to finish the server build. You can also run it standalone to produce a reusable <code>libtorch.a</code> tree.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">bash</span></div>
+<pre><span class="c"># End to end: build libtorch, then a static server binary.</span>
+<span class="p">$</span> ./build.sh --release --link static --build-libtorch
+
+<span class="c"># Or build libtorch once, reuse it however you like.</span>
+<span class="p">$</span> scripts/build-libtorch.sh --version 2.5.1 --out /opt/libtorch-static
+<span class="p">$</span> ./build.sh --release --link static --libtorch /opt/libtorch-static</pre>
+        </div>
+        <p>Under the hood it follows PyTorch's own CMake recipe: a shallow, submodule-complete checkout at the tag, configured with <code>BUILD_SHARED_LIBS=OFF</code> into a clean install prefix, then <code>cmake --build --target install</code>. The output is exactly the <code>include/</code> + <code>lib/</code> layout <code>LIBTORCH</code> expects, and the script refuses to hand back a tree that didn't actually produce <code>libtorch.a</code>.</p>
+        <div class="call stop">
+          <span class="tag">Set expectations</span>
+          <p>This is a full PyTorch C++ build: a multi-gigabyte checkout and a compile that runs from tens of minutes to well over an hour depending on the machine. It needs CMake, Ninja, a C++17 compiler, and a Python with PyYAML. Prerequisites are checked up front, so it fails fast if something's missing rather than an hour in.</p>
+        </div>
+        <p>Useful knobs: <code>--jobs N</code> to cap parallelism (a full-width libtorch build is memory-hungry), <code>--device cuda</code> for a CUDA-enabled static build, and <code>--keep-src</code> to keep the checkout around for a faster rebuild.</p>
+      </section>
+
+      <section id="run">
+        <h2><span class="idx">08</span> Running &amp; troubleshooting</h2>
+        <p class="sub">One error accounts for nearly every "it built but won't start" report.</p>
+        <div class="term">
+          <div class="bar"><i></i><i></i><i></i><span class="cap">the classic</span></div>
+<pre><span class="o">error while loading shared libraries: libtorch_cpu.so:</span>
+<span class="o">cannot open shared object file: No such file or directory</span></pre>
+        </div>
+        <p>This means the binary is dynamically linked and the loader can't find libtorch. It's expected when you run a <code>dynamic</code> binary directly instead of through its wrapper. Three ways out, cleanest first:</p>
+        <ol class="steps">
+          <li>Run the generated launcher: <code>target/&lt;profile&gt;/run-grpc-test.sh</code>. It sets the loader path for you.</li>
+          <li>Build <code>--link bundled</code> and run <code>dist/grpc-test/grpc-test</code> — the problem can't occur, the path is baked in.</li>
+          <li>Set it yourself: <code>export LD_LIBRARY_PATH=&lt;libtorch&gt;/lib:$LD_LIBRARY_PATH</code>.</li>
+        </ol>
+        <p>Once it starts, the server binds to <code>server.bind_addr</code> from <code>nereid.yaml</code> and loads models from <code>server.ml_backends_path</code>. Copy <code>nereid.yaml.example</code> to <code>nereid.yaml</code> before the first run — the server won't start without it.</p>
+        <p>Add <code>--run</code> to any build to launch the server the moment it finishes, through the correct wrapper for the mode you chose.</p>
+      </section>
+
+      <section id="reference">
+        <h2><span class="idx">09</span> Flag reference</h2>
+        <p class="sub"><code>./build.sh --help</code> prints this too. <code>scripts/build-libtorch.sh --help</code> covers the source build.</p>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Does</th></tr></thead>
+            <tbody>
+              <tr><td><code>--link &lt;mode&gt;</code></td><td><code>dynamic</code> (default), <code>bundled</code>, or <code>static</code></td></tr>
+              <tr><td><code>--release</code> / <code>--debug</code></td><td>Build profile (default: debug)</td></tr>
+              <tr><td><code>--device &lt;dev&gt;</code></td><td><code>cpu</code>, <code>cuda</code>, or <code>cuda:&lt;ver&gt;</code>; sets <code>TORCH_CUDA_VERSION</code></td></tr>
+              <tr><td><code>--fetch-libtorch</code></td><td>Download the official libtorch and verify its sha256</td></tr>
+              <tr><td><code>--build-libtorch</code></td><td>Build a static libtorch from source, then static-link it</td></tr>
+              <tr><td><code>--libtorch &lt;dir&gt;</code></td><td>Use an existing libtorch install (or set <code>$LIBTORCH</code>)</td></tr>
+              <tr><td><code>--libtorch-version &lt;v&gt;</code></td><td>Version to fetch or build (default: 2.5.1)</td></tr>
+              <tr><td><code>--libtorch-sha256 &lt;hex&gt;</code></td><td>Expected digest for an un-pinned fetch</td></tr>
+              <tr><td><code>--no-verify</code></td><td>Skip the download checksum (not recommended)</td></tr>
+              <tr><td><code>--module &lt;spec&gt;</code></td><td><code>module load &lt;spec&gt;</code>; repeatable</td></tr>
+              <tr><td><code>--conda &lt;env&gt;</code></td><td>Activate a conda environment before building</td></tr>
+              <tr><td><code>--pyenv &lt;ver&gt;</code></td><td>Select a pyenv version before building</td></tr>
+              <tr><td><code>--venv &lt;dir&gt;</code></td><td>Activate a virtualenv before building</td></tr>
+              <tr><td><code>--out &lt;dir&gt;</code></td><td>Output directory for a bundled build</td></tr>
+              <tr><td><code>-j, --jobs &lt;n&gt;</code></td><td>Parallel build jobs</td></tr>
+              <tr><td><code>--run</code></td><td>Launch the server after building</td></tr>
+              <tr><td><code>-- &lt;args&gt;</code></td><td>Everything after <code>--</code> is passed straight to cargo</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap">
+    <span>nereid-server — a nifty little Rust inference server</span>
+    <span>·</span>
+    <span>Build tooling: <code>build.sh</code> · <code>scripts/build-libtorch.sh</code></span>
+    <button class="theme-toggle" id="themeToggle" aria-label="Toggle color theme">◐ theme</button>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    var btn = document.getElementById('themeToggle');
+    btn.addEventListener('click', function () {
+      var cur = root.getAttribute('data-theme');
+      if (!cur) {
+        cur = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      root.setAttribute('data-theme', cur === 'dark' ? 'light' : 'dark');
+    });
+
+    // Highlight the current section in the rail as you scroll.
+    var links = Array.prototype.slice.call(document.querySelectorAll('nav.toc a'));
+    var map = {};
+    links.forEach(function (a) { map[a.getAttribute('href').slice(1)] = a; });
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          links.forEach(function (a) { a.style.color = ''; a.style.borderColor = ''; });
+          var a = map[e.target.id];
+          if (a) {
+            a.style.color = 'var(--ink)';
+            a.style.borderColor = 'var(--accent)';
+          }
+        }
+      });
+    }, { rootMargin: '-10% 0px -80% 0px' });
+    document.querySelectorAll('main section').forEach(function (s) { obs.observe(s); });
+  })();
+</script>

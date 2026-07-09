@@ -322,12 +322,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let triton = TritonService::new(model_manager);
     println!("gRPC server listening on {}", addr);
 
+    // allow messages up to 128MB in TritonServer
+    let max_msg_size = 128 * 1024 * 1024;
+
+    let nereid_server = NereidServer::new(nereid);
+    let triton_server = GrpcInferenceServiceServer::new(triton)
+        .max_decoding_message_size(max_msg_size)
+        .max_encoding_message_size(max_msg_size);
+
     // Both the native Nereid service and the Triton-compatible
     // GRPCInferenceService are served on the same address, so a KServe v2 client
     // (e.g. tritonclient) can talk to the latter without knowing it isn't Triton.
     Server::builder()
-        .add_service(NereidServer::new(nereid))
-        .add_service(GrpcInferenceServiceServer::new(triton))
+        .add_service(nereid_server)
+        .add_service(triton_server)
         .serve(addr)
         .await?;
 
