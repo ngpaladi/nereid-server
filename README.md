@@ -192,6 +192,54 @@ Server binds to `server.bind_addr` from `nereid.yaml` (default example: `[::1]:5
 Model folders are loaded from `server.ml_backends_path` (default example: `ml-backends`).
 This folder must exist in the project root and contain all ML model folders.
 
+### `./build.sh` — libtorch-aware build driver
+`cargo build` links libtorch *dynamically* and leaves the binary needing
+`LD_LIBRARY_PATH` at runtime (see [Running the built binary directly](#running-the-built-binary-directly-not-via-cargo-run)).
+`./build.sh` wraps `cargo build`, resolves the libtorch dependency, and can produce
+a self-contained (or statically linked) binary. It also folds in the pieces an HPC
+build needs — `module load`, an external libtorch install, or a conda/pyenv/venv
+environment. Run `./build.sh --help` for the full option list; the
+**[build guide](docs/index.html)** has the detailed walkthrough. The three linking
+modes:
+
+- **`dynamic`** (default) — ordinary build. Locates the libtorch `lib/` directory
+  and writes a `target/<profile>/run-grpc-test.sh` wrapper that sets
+  `LD_LIBRARY_PATH` for you.
+  ```bash
+  ./build.sh --release            # then: target/release/run-grpc-test.sh
+  ```
+- **`bundled`** — relocatable, "ship it anywhere" build. Copies libtorch's shared
+  objects next to the binary under `dist/grpc-test/` and patches its rpath to
+  `$ORIGIN/lib`, so it runs with **no `LD_LIBRARY_PATH`** and moves as a unit — a
+  good fit for containers, systemd, or a tarball. Needs `patchelf`
+  (`apt-get install patchelf`); without it a `run.sh` wrapper is written instead.
+  ```bash
+  ./build.sh --release --link bundled --fetch-libtorch
+  # -> dist/grpc-test/{grpc-test, lib/*.so}; just run dist/grpc-test/grpc-test
+  ```
+- **`static`** — true static link of libtorch (`LIBTORCH_STATIC=1`). PyTorch no
+  longer ships a prebuilt static libtorch, so `./build.sh --build-libtorch` builds
+  one from source (`scripts/build-libtorch.sh`) and links against it; or point
+  `--libtorch` at a static build you already have. The script validates the
+  archives up front and confirms the result has no libtorch runtime dependency.
+  ```bash
+  ./build.sh --release --link static --build-libtorch   # long; builds libtorch.a
+  ```
+
+**libtorch source** (precedence: `--build-libtorch` > `--fetch-libtorch` >
+`--libtorch`/`$LIBTORCH` > `tch`'s own download). `--fetch-libtorch` downloads the
+official libtorch and **verifies its sha256** before use, instead of the opaque
+download `tch` does by default.
+
+**Other flags:** `--device cpu|cuda|cuda:<ver>` (sets `TORCH_CUDA_VERSION`),
+`--module <spec>` (repeatable, `module load` for HPC), `--conda <env>` /
+`--pyenv <ver>` / `--venv <dir>` to build inside a managed environment, `--out <dir>`
+for the bundle location, `--run` to launch after building, and `-- <cargo args>` to
+pass flags straight through to cargo.
+
+The previous cluster-specific `build.sh` is now the default `--module ... --libtorch ...`
+path — e.g. `./build.sh --module cuda/12.6.0 --device cuda --libtorch <shared-install>`.
+
 ### Running the built binary directly (not via `cargo run`)
 `cargo run`/`cargo test` automatically set `LD_LIBRARY_PATH` so the binary can find the
 libtorch shared libraries (`libtorch_cpu.so`, etc.) downloaded by `torch-sys`. If you run a
