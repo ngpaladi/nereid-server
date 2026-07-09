@@ -42,7 +42,10 @@ Build a static libtorch from source and install it to --out.
 
 Options:
   --version <v>   PyTorch/libtorch version tag to build (default: 2.5.1).
-  --device <dev>  cpu (default), cuda, or cuda:<ver>. cuda builds with USE_CUDA=ON.
+  --device <dev>  cpu (default), cuda, or cuda:<cuXYZ> (e.g. cuda:cu124 — the compact
+                  form, not cuda:12.4). Any cuda* value builds with USE_CUDA=ON; the
+                  cuXYZ tag only labels the output dir. The actual CUDA toolkit used
+                  is whatever nvcc/CMake find on PATH (load it via your module system).
   --out <dir>     Install prefix (default: .cache/libtorch-static/<device>-<version>).
   --src <dir>     Where to check out PyTorch (default: <out>/../src/pytorch-<version>).
   -j, --jobs <n>  Parallel build jobs (default: nproc).
@@ -75,9 +78,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$DEVICE" in
-  cpu)         USE_CUDA=OFF ;;
-  cuda|cuda:*) USE_CUDA=ON ;;
-  *)           die "invalid --device: '$DEVICE' (want cpu|cuda|cuda:<ver>)" ;;
+  cpu)    USE_CUDA=OFF ;;
+  cuda)   USE_CUDA=ON ;;
+  cuda:*) cuver="${DEVICE#cuda:}"
+          # The cuXYZ here is only a label for the output/build dir (kept
+          # consistent with ./build.sh). The actual CUDA the source build uses
+          # is whatever nvcc/CMake find on PATH, not this tag.
+          [[ "$cuver" =~ ^cu[0-9]+$ ]] || die \
+            "invalid --device '$DEVICE': use 'cuda' or the compact 'cuda:cuXYZ' form,
+    e.g. --device cuda:cu124 (not cuda:12.4)."
+          USE_CUDA=ON ;;
+  *)      die "invalid --device: '$DEVICE' (want cpu | cuda | cuda:cuXYZ, e.g. cuda:cu124)" ;;
 esac
 
 # device tag for default paths (cuda:cu124 -> cu124)

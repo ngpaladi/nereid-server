@@ -38,6 +38,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_NAME="grpc-test"           # cargo package name -> target/<profile>/grpc-test
 
 LINK_MODE="dynamic"            # dynamic | bundled | static
+LINK_EXPLICIT=0                # was --link passed on the command line?
 PROFILE="debug"               # debug | release
 DEVICE="cpu"                  # cpu | cuda | cuda:<ver> (e.g. cuda:cu124)
 LIBTORCH_PATH="${LIBTORCH:-}"  # external libtorch dir (overrides download)
@@ -94,8 +95,10 @@ libtorch source (highest precedence first):
   --no-verify         Skip the sha256 check for --fetch-libtorch (not recommended).
 
 Device:
-  --device <dev>      cpu (default), cuda, or cuda:<ver> (e.g. cuda:cu124).
-                        Sets TORCH_CUDA_VERSION and selects the CUDA download.
+  --device <dev>      cpu (default), cuda, or cuda:<cuXYZ>. The version is the
+                        compact TORCH_CUDA_VERSION form, e.g. --device cuda:cu124
+                        (not cuda:12.4). Bare 'cuda' defaults to cu124. Selects the
+                        CUDA libtorch download / TORCH_CUDA_VERSION.
 
 Environment (applied before building; useful on HPC / managed Python):
   --module <spec>     `module load <spec>` (repeatable), e.g. --module cuda/12.6.0.
@@ -123,8 +126,8 @@ EOF
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --link)             LINK_MODE="${2:?--link needs a value}"; shift 2 ;;
-    --link=*)           LINK_MODE="${1#*=}"; shift ;;
+    --link)             LINK_MODE="${2:?--link needs a value}"; LINK_EXPLICIT=1; shift 2 ;;
+    --link=*)           LINK_MODE="${1#*=}"; LINK_EXPLICIT=1; shift ;;
     --release)          PROFILE="release"; shift ;;
     --debug)            PROFILE="debug"; shift ;;
     --device)           DEVICE="${2:?--device needs a value}"; shift 2 ;;
@@ -157,9 +160,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --build-libtorch produces a static libtorch, so it only makes sense with a
-# static link; adopt that unless the user explicitly picked another mode.
-if [[ $BUILD_LIBTORCH -eq 1 && "$LINK_MODE" == "dynamic" ]]; then
+# --build-libtorch produces a static libtorch, which can only be static-linked.
+# Default --link to static for it; but if the user explicitly asked for a
+# different mode, that's a contradiction — fail loudly rather than silently
+# overriding their choice.
+if [[ $BUILD_LIBTORCH -eq 1 ]]; then
+  if [[ $LINK_EXPLICIT -eq 1 && "$LINK_MODE" != "static" ]]; then
+    die "--build-libtorch produces a static libtorch, which cannot be linked '$LINK_MODE'.
+    Use '--link static' (or drop --link to default to it), or drop --build-libtorch
+    and use --fetch-libtorch for a $LINK_MODE build."
+  fi
   LINK_MODE="static"
 fi
 
@@ -176,8 +186,14 @@ DEVICE_SUBDIR="cpu"            # download.pytorch.org/libtorch/<subdir>
 case "$DEVICE" in
   cpu)    ;;
   cuda)   DEVICE_SUBDIR="cu124"; BUILD_ENV+=("TORCH_CUDA_VERSION=cu124") ;;
-  cuda:*) DEVICE_SUBDIR="${DEVICE#cuda:}"; BUILD_ENV+=("TORCH_CUDA_VERSION=${DEVICE#cuda:}") ;;
-  *)      die "invalid --device: '$DEVICE' (want cpu|cuda|cuda:<ver>)" ;;
+  cuda:*) cuver="${DEVICE#cuda:}"
+          # tch's TORCH_CUDA_VERSION and PyTorch's download URLs both use the
+          # compact "cuXYZ" form (e.g. cu124), not a dotted "12.4".
+          [[ "$cuver" =~ ^cu[0-9]+$ ]] || die \
+            "invalid --device '$DEVICE': the CUDA version must be the compact 'cuXYZ' form,
+    e.g. --device cuda:cu124 (not cuda:12.4). This matches TORCH_CUDA_VERSION."
+          DEVICE_SUBDIR="$cuver"; BUILD_ENV+=("TORCH_CUDA_VERSION=$cuver") ;;
+  *)      die "invalid --device: '$DEVICE' (want cpu | cuda | cuda:cuXYZ, e.g. cuda:cu124)" ;;
 esac
 
 # ---------------------------------------------------------------------------
