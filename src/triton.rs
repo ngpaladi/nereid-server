@@ -1223,7 +1223,10 @@ mod triton_e2e_tests {
     #[tokio::test]
     async fn tensorflow_model_infer_returns_input_plus_one() {
         assert!(
-            fixtures_dir().join("tfadd").join("saved_model.pb").is_file(),
+            fixtures_dir()
+                .join("tfadd")
+                .join("saved_model.pb")
+                .is_file(),
             "tfadd fixture missing (run scripts/make_example_models.py)"
         );
         let input_values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -1270,6 +1273,80 @@ mod triton_e2e_tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(got, expected, "tfadd must compute input + 1");
+    }
+
+    /// GPU smoke test: serve the ONNX `onnxadd` fixture on `device: cuda`, which
+    /// drives ort's CUDA execution provider. Ignored by default (needs an NVIDIA
+    /// GPU with a working CUDA + cuDNN stack); run with `--ignored`. A pass proves
+    /// the cuda-config path is wired and produces correct results; ort falls back
+    /// to CPU when the GPU stack is unavailable, so it is not by itself proof the
+    /// math ran on the GPU (watch ort's stderr for the active execution provider).
+    #[cfg(feature = "onnx")]
+    #[tokio::test]
+    #[ignore = "requires an NVIDIA GPU with CUDA/cuDNN"]
+    async fn onnx_cuda_smoke() {
+        use crate::config::{ModelConfig, ModelDevice, ServerConfig, ServerSection};
+        assert!(
+            fixtures_dir().join("onnxadd").join("model.onnx").is_file(),
+            "onnxadd fixture missing"
+        );
+        let config = ServerConfig {
+            server: ServerSection {
+                bind_addr: "127.0.0.1:0".to_string(),
+                ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
+            },
+            models: vec![ModelConfig {
+                name: "onnxadd".to_string(),
+                device: ModelDevice::Cuda(0),
+                queue_capacity: 4,
+                backend: None,
+                signature: None,
+            }],
+        };
+        let model_manager =
+            Arc::new(ModelManager::from_config(&config).expect("cuda onnx model should build"));
+        let triton = TritonService::new(model_manager);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(GrpcInferenceServiceServer::new(triton))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let mut client = connect(addr).await;
+        let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let response = client
+            .model_infer(ModelInferRequest {
+                model_name: "onnxadd".to_string(),
+                model_version: String::new(),
+                id: "cuda-1".to_string(),
+                parameters: Default::default(),
+                inputs: vec![InferInputTensor {
+                    name: "input".to_string(),
+                    datatype: FP32.to_string(),
+                    shape: vec![1, 4],
+                    parameters: Default::default(),
+                    contents: None,
+                }],
+                outputs: Vec::new(),
+                raw_input_contents: vec![f32_le_bytes(&input)],
+            })
+            .await
+            .expect("cuda onnx model_infer should succeed")
+            .into_inner();
+        let raw = &response.raw_output_contents[0];
+        let got: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![2.0, 3.0, 4.0, 5.0],
+            "onnxadd on cuda must compute input + 1"
+        );
     }
 
     /// The client may request the model's output by its real name (`output`) —
