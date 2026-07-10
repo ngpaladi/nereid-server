@@ -5,13 +5,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 
+#[cfg(feature = "torch")]
 use tch::{CModule, Device, Tensor};
-use tokio::sync::{Semaphore, oneshot};
+#[cfg(feature = "python")]
+use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 use tonic::Status;
 
 use crate::config::{ConfiguredBackend, ModelConfig, ServerConfig};
+#[cfg(feature = "torch")]
 use crate::inference;
 use crate::native_backend::{self, NativeKind, NativeLoadSpec, NativeModel, NativeTensor};
+#[cfg(feature = "python")]
 use crate::python_backend;
 
 /// `(shape, row-major little-endian bytes, canonical dtype)` — the dtype lets
@@ -55,8 +60,11 @@ pub struct MultiTensorContract {
 
 #[derive(Debug)]
 enum ModelHandle {
+    #[cfg(feature = "torch")]
     Rust(RustModelHandle),
+    #[cfg(feature = "torch")]
     RustMulti(RustMultiHandle),
+    #[cfg(feature = "python")]
     Python(PythonModelHandle),
     /// ONNX or TensorFlow, served in-process by a boxed native engine on a
     /// dedicated worker thread. One variant covers both engines (single- and
@@ -64,6 +72,7 @@ enum ModelHandle {
     Native(NativeModelHandle),
 }
 
+#[cfg(feature = "torch")]
 #[derive(Debug)]
 struct RustModelHandle {
     input_contract: InputShapeContract,
@@ -72,6 +81,7 @@ struct RustModelHandle {
     occupancy: Arc<AtomicUsize>,
 }
 
+#[cfg(feature = "python")]
 #[derive(Debug)]
 struct PythonModelHandle {
     model_dir: PathBuf,
@@ -85,6 +95,7 @@ struct PythonModelHandle {
     permits: Arc<Semaphore>,
 }
 
+#[cfg(feature = "torch")]
 #[derive(Debug)]
 struct RustMultiHandle {
     contract: MultiTensorContract,
@@ -107,6 +118,7 @@ struct NativeModelHandle {
     occupancy: Arc<AtomicUsize>,
 }
 
+#[cfg(feature = "torch")]
 #[derive(Debug)]
 struct InferenceJob {
     input_tensor: Tensor,
@@ -122,6 +134,7 @@ struct NativeInferenceJob {
     occupancy: Arc<AtomicUsize>,
 }
 
+#[cfg(feature = "torch")]
 #[derive(Debug)]
 struct MultiInferenceJob {
     input_tensors: Vec<Tensor>,
@@ -175,6 +188,15 @@ impl ModelManager {
             }
 
             match detect_backend_kind(&model_dir, &model_cfg.name, model_cfg.backend)? {
+                #[cfg(not(feature = "python"))]
+                DetectedBackendKind::Python => {
+                    return Err(Status::failed_precondition(format!(
+                        "model '{}' is a Python (main.py) model, but this server was built \
+                         without the python backend. Rebuild with `--features python`.",
+                        model_cfg.name
+                    )));
+                }
+                #[cfg(feature = "python")]
                 DetectedBackendKind::Python => {
                     python_backend::prepare_model_envs(
                         std::slice::from_ref(&model_cfg.name),
@@ -214,6 +236,15 @@ impl ModelManager {
                         }),
                     );
                 }
+                #[cfg(not(feature = "torch"))]
+                DetectedBackendKind::Rust => {
+                    return Err(Status::failed_precondition(format!(
+                        "model '{}' is a TorchScript (.pt) model, but this server was built \
+                         without the torch backend. Rebuild with `--features torch`.",
+                        model_cfg.name
+                    )));
+                }
+                #[cfg(feature = "torch")]
                 DetectedBackendKind::Rust => {
                     let pt_file = find_exactly_one_pt_model_file(&model_dir)?;
                     let device = model_cfg.device.to_tch_device()?;
@@ -298,15 +329,27 @@ impl ModelManager {
     }
 
     /// Whether `model_name` is a Python (`main.py`) backend.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub fn is_python(&self, model_name: &str) -> bool {
-        matches!(self.handles.get(model_name), Some(ModelHandle::Python(_)))
+        #[cfg(feature = "python")]
+        {
+            matches!(self.handles.get(model_name), Some(ModelHandle::Python(_)))
+        }
+        #[cfg(not(feature = "python"))]
+        {
+            let _ = model_name;
+            false
+        }
     }
 
     pub fn input_contract(&self, model_name: &str) -> Option<&InputShapeContract> {
         match self.handles.get(model_name)? {
+            #[cfg(feature = "torch")]
             ModelHandle::Rust(handle) => Some(&handle.input_contract),
+            #[cfg(feature = "python")]
             ModelHandle::Python(handle) => Some(&handle.contract),
             ModelHandle::Native(handle) => handle.single_contract.as_ref(),
+            #[cfg(feature = "torch")]
             ModelHandle::RustMulti(_) => None,
         }
     }
@@ -319,6 +362,7 @@ impl ModelManager {
     /// The Triton `platform` string to advertise for a model, by backend kind.
     pub fn platform(&self, model_name: &str) -> &'static str {
         match self.handles.get(model_name) {
+            #[cfg(feature = "python")]
             Some(ModelHandle::Python(_)) => "python",
             Some(ModelHandle::Native(handle)) => match handle.kind {
                 NativeKind::Onnx => "onnxruntime_onnx",
@@ -333,6 +377,7 @@ impl ModelManager {
     /// multi-tensor inference path rather than the single-tensor one.
     pub fn is_multi(&self, model_name: &str) -> bool {
         match self.handles.get(model_name) {
+            #[cfg(feature = "torch")]
             Some(ModelHandle::RustMulti(_)) => true,
             Some(ModelHandle::Native(handle)) => handle.multi.is_some(),
             _ => false,
@@ -343,12 +388,15 @@ impl ModelManager {
     /// `model_name` is one.
     pub fn multi_contract(&self, model_name: &str) -> Option<MultiTensorContract> {
         match self.handles.get(model_name)? {
+            #[cfg(feature = "torch")]
             ModelHandle::RustMulti(handle) => Some(handle.contract.clone()),
             ModelHandle::Native(handle) => handle.multi.clone(),
+            #[allow(unreachable_patterns)] // reachable only with torch/python variants present
             _ => None,
         }
     }
 
+    #[cfg(feature = "python")]
     pub fn python_model_dir(&self, model_name: &str) -> Option<PathBuf> {
         match self.handles.get(model_name)? {
             ModelHandle::Python(handle) => Some(handle.model_dir.clone()),
@@ -358,6 +406,7 @@ impl ModelManager {
 
     /// The concurrency permits for a Python model's subprocess pool, for the
     /// ModelInfer backpressure gate. `None` for non-Python models.
+    #[cfg(feature = "python")]
     pub fn python_permits(&self, model_name: &str) -> Option<Arc<Semaphore>> {
         match self.handles.get(model_name)? {
             ModelHandle::Python(handle) => Some(handle.permits.clone()),
@@ -365,6 +414,7 @@ impl ModelManager {
         }
     }
 
+    #[cfg(feature = "torch")]
     pub fn enqueue(
         &self,
         model_name: &str,
@@ -377,6 +427,7 @@ impl ModelManager {
                     "model '{model_name}' is a multi-tensor model; use the multi inference path"
                 )));
             }
+            #[cfg(feature = "python")]
             Some(ModelHandle::Python(_)) => {
                 return Err(Status::failed_precondition(format!(
                     "model '{model_name}' is a python backend and does not support tensor inference"
@@ -430,6 +481,7 @@ impl ModelManager {
 
     /// Enqueue a multi-tensor inference job. Mirrors [`Self::enqueue`]'s bounded
     /// queue + backpressure for the `RustMulti` path.
+    #[cfg(feature = "torch")]
     pub fn enqueue_multi(
         &self,
         model_name: &str,
@@ -489,6 +541,7 @@ impl ModelManager {
     ) -> Result<oneshot::Receiver<Result<Vec<InferenceOutput>, Status>>, Status> {
         let handle = match self.handles.get(model_name) {
             Some(ModelHandle::Native(handle)) => handle,
+            #[allow(unreachable_patterns)] // reachable only with torch/python variants present
             Some(_) => {
                 return Err(Status::failed_precondition(format!(
                     "model '{model_name}' is not a native (ONNX/TensorFlow) model"
@@ -613,6 +666,7 @@ fn spawn_native_worker(
         });
 }
 
+#[cfg(feature = "torch")]
 fn spawn_multi_worker(
     model_name: String,
     model: CModule,
@@ -643,6 +697,7 @@ fn spawn_multi_worker(
         });
 }
 
+#[cfg(feature = "torch")]
 fn spawn_model_worker(
     model_name: String,
     model: CModule,
@@ -786,6 +841,7 @@ pub fn find_exactly_one_onnx_file(model_dir: &Path) -> Result<PathBuf, Status> {
     }
 }
 
+#[cfg(feature = "torch")]
 pub fn find_exactly_one_pt_model_file(model_dir: &Path) -> Result<PathBuf, Status> {
     let entries = fs::read_dir(model_dir)
         .map_err(|err| Status::internal(format!("failed to read model directory: {err}")))?;
@@ -1233,6 +1289,7 @@ impl InputShapeContract {
     /// declares no `output_shape` has nothing to check (returns `Ok`). Returns
     /// `Status::internal` on mismatch — a wrong-shaped output is a model/config
     /// bug, not a client error.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub fn validate_output_shape(
         &self,
         actual: &[i64],
@@ -1308,6 +1365,7 @@ impl InputShapeContract {
 
 /// Build a tensor of `kind` from raw row-major little-endian `tensor_bytes` and
 /// `request_shape`. The buffer length must be exactly `numel × element_size`.
+#[cfg(feature = "torch")]
 pub fn tensor_from_input_bytes(
     tensor_bytes: &[u8],
     request_shape: &[i64],

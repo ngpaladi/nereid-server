@@ -147,6 +147,28 @@ in-process, no Python subprocess — behind opt-in build features. They're off b
 base build stays lean; enable them with `./build.sh --onnx` / `--tensorflow` (or
 `cargo build --features onnx,tensorflow`).
 
+**Every backend is a Cargo feature, so you build only the ones you want.** The default build
+keeps the two original backends (`torch` + `python`); pass `--no-default-features` with just the
+features you need. An **ONNX-only** or **TensorFlow-only** server links **no libtorch at all** —
+the whole [libtorch build story](#the-buildsh-libtorch-aware-build-driver) simply doesn't apply
+to it.
+
+| Feature | Backend | Heavy dependency |
+| --- | --- | --- |
+| `torch` (default) | TorchScript `.pt` | libtorch (via `tch`) |
+| `python` (default) | Python `main.py` | none |
+| `onnx` | ONNX | ONNX Runtime (via `ort`) |
+| `tensorflow` | TensorFlow SavedModel | libtensorflow |
+
+```bash
+./build.sh --backends onnx                 # ONNX only — no libtorch, no python
+./build.sh --backends torch,onnx           # .pt + ONNX
+./build.sh --release --link bundled --backends onnx,tensorflow   # native-only, self-contained
+cargo build --no-default-features --features onnx                # the same, via cargo
+```
+A model whose files need a backend the server wasn't built with fails at startup with a clear
+"rebuild with `--features …`" message.
+
 - **ONNX** — a folder with one `.onnx` file + `model_inference.textproto`. Runs on
   [ONNX Runtime](https://onnxruntime.ai/) via the `ort` crate, with the **CUDA execution
   provider** selected when the model's `device` is `cuda`.

@@ -4,15 +4,17 @@
 // and positive queue capacity).
 
 use std::collections::HashSet;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "torch"))]
 use std::ffi::CString;
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "torch"))]
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 
 use serde::Deserialize;
+#[cfg(feature = "torch")]
 use tch::{Cuda, Device};
+#[cfg(feature = "torch")]
 use tonic::Status;
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +122,7 @@ impl ModelDevice {
         }
     }
 
+    #[cfg(feature = "torch")]
     pub fn to_tch_device(self) -> Result<Device, Status> {
         match self {
             Self::Cpu => Ok(Device::Cpu),
@@ -145,6 +148,7 @@ impl ModelDevice {
     }
 }
 
+#[cfg(feature = "torch")]
 fn preload_libtorch_cuda() {
     #[cfg(target_os = "linux")]
     {
@@ -156,7 +160,7 @@ fn preload_libtorch_cuda() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "torch"))]
 fn dlopen_library(library: &str) -> Result<(), String> {
     const RTLD_NOW: c_int = 2;
     const RTLD_GLOBAL: c_int = 0x100;
@@ -170,7 +174,7 @@ fn dlopen_library(library: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "torch"))]
 fn dlopen_error() -> String {
     let error = unsafe { dlerror() };
     if error.is_null() {
@@ -182,7 +186,7 @@ fn dlopen_error() -> String {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "torch"))]
 #[link(name = "dl")]
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;

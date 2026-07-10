@@ -6,14 +6,18 @@ use tonic::{Request, Response, Status, transport::Server};
 
 mod config;
 mod dtype;
+#[cfg(feature = "torch")]
 mod inference;
 mod model_runtime;
 mod native_backend;
+#[cfg(feature = "python")]
 mod python_backend;
 mod triton;
 
 use config::load_server_config;
-use model_runtime::{InputShapeContract, ModelManager, tensor_from_input_bytes};
+#[cfg(feature = "torch")]
+use model_runtime::tensor_from_input_bytes;
+use model_runtime::{InputShapeContract, ModelManager};
 use proto::grpc_inference_service_server::GrpcInferenceServiceServer;
 use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
@@ -232,6 +236,7 @@ impl Nereid for NereidService {
             return Err(Status::invalid_argument("model_name is required"));
         }
 
+        #[cfg(feature = "python")]
         if let Some(model_dir) = self.model_manager.python_model_dir(&model_name) {
             // Every Python model has a required contract declaring output_shape.
             // When it also declares input_shape, the validated tensor is piped
@@ -322,21 +327,36 @@ impl Nereid for NereidService {
             )));
         }
 
-        // The Checkpoint tensor contract is little-endian float32.
-        let input_tensor =
-            tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name, tch::Kind::Float)?;
-        let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
-        let (output_shape, output_bytes, _dtype) = response_rx.await.map_err(|_| {
-            Status::internal(format!(
-                "worker response channel closed for model '{model_name}'"
-            ))
-        })??;
+        // Rust `.pt` path. The Checkpoint tensor contract is little-endian float32.
+        #[cfg(feature = "torch")]
+        {
+            let input_tensor = tensor_from_input_bytes(
+                &tensor_bytes,
+                &request_shape,
+                &model_name,
+                tch::Kind::Float,
+            )?;
+            let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
+            let (output_shape, output_bytes, _dtype) = response_rx.await.map_err(|_| {
+                Status::internal(format!(
+                    "worker response channel closed for model '{model_name}'"
+                ))
+            })??;
 
-        Ok(Response::new(output_to_stream(
-            &model_name,
-            output_shape,
-            output_bytes,
-        )))
+            Ok(Response::new(output_to_stream(
+                &model_name,
+                output_shape,
+                output_bytes,
+            )))
+        }
+        #[cfg(not(feature = "torch"))]
+        {
+            let _ = (tensor_bytes, request_shape, &input_contract);
+            Err(Status::failed_precondition(format!(
+                "model '{model_name}' is a TorchScript (.pt) model, but this server was built \
+                 without the torch backend. Rebuild with `--features torch`."
+            )))
+        }
     }
 }
 

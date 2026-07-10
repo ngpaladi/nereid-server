@@ -25,7 +25,9 @@ use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::dtype;
-use crate::model_runtime::{InputShapeContract, ModelManager, tensor_from_input_bytes};
+#[cfg(feature = "torch")]
+use crate::model_runtime::tensor_from_input_bytes;
+use crate::model_runtime::{InputShapeContract, ModelManager};
 use crate::native_backend::NativeTensor;
 use crate::proto::grpc_inference_service_server::GrpcInferenceService;
 use crate::proto::model_infer_request::InferInputTensor;
@@ -37,6 +39,7 @@ use crate::proto::{
     ServerLiveResponse, ServerMetadataRequest, ServerMetadataResponse, ServerReadyRequest,
     ServerReadyResponse,
 };
+#[cfg(feature = "python")]
 use crate::python_backend::{PythonInput, run_python_inference};
 
 /// KServe spells 32-bit float exactly this way; it's also the default datatype
@@ -46,6 +49,110 @@ const FP32: &str = "FP32";
 /// nereid serves a single, implicit model version. A request may name it
 /// explicitly (`"1"`) or leave it empty; any other version is unavailable.
 const MODEL_VERSION: &str = "1";
+
+/// The extracted single input: `(raw little-endian bytes, batch-normalized
+/// shape, canonical dtype, expected batch size)`.
+type SingleInput = (Vec<u8>, Vec<i64>, &'static str, Option<i64>);
+
+/// Validate and extract the single input tensor for `model_name` from `request`,
+/// returning it, or `None` for an output-only model. Backend-agnostic: it
+/// validates datatype/shape/byte-length via the KServe contract and never
+/// touches libtorch, so every single-tensor backend shares one implementation.
+fn extract_single_input(
+    contract: &InputShapeContract,
+    request: &mut ModelInferRequest,
+    model_name: &str,
+) -> Result<Option<SingleInput>, Status> {
+    if !contract.has_input() {
+        // Output-only model: no input tensor expected. Reject stray client data.
+        if !request.inputs.is_empty() || !request.raw_input_contents.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "model '{model_name}' declares no input tensor but the request carries \
+                 {} input(s) and {} raw buffer(s)",
+                request.inputs.len(),
+                request.raw_input_contents.len()
+            )));
+        }
+        return Ok(None);
+    }
+
+    if request.inputs.len() != 1 {
+        return Err(Status::invalid_argument(format!(
+            "model '{model_name}' expects one input tensor, got {}",
+            request.inputs.len()
+        )));
+    }
+    let input = &request.inputs[0];
+
+    let expected_dt = contract.input_datatype();
+    if input.datatype != expected_dt {
+        return Err(Status::invalid_argument(format!(
+            "datatype mismatch for model '{model_name}': expected {expected_dt}, got '{}'",
+            input.datatype
+        )));
+    }
+    let (elem_size, canonical_dtype) = dtype::kserve_fixed_width(expected_dt).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "unsupported datatype '{expected_dt}' for model '{model_name}'"
+        ))
+    })?;
+
+    // Raw bytes take precedence over typed `contents`; typed contents is FP32-only.
+    let input_shape = input.shape.clone();
+    let input_bytes = if !request.raw_input_contents.is_empty() {
+        if request.raw_input_contents.len() != 1 {
+            return Err(Status::invalid_argument(
+                "raw_input_contents must hold exactly one buffer for a single input",
+            ));
+        }
+        request.raw_input_contents.remove(0)
+    } else if expected_dt == FP32 {
+        match &input.contents {
+            Some(contents) => contents
+                .fp32_contents
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            None => {
+                return Err(Status::invalid_argument(
+                    "input tensor has neither raw_input_contents nor contents",
+                ));
+            }
+        }
+    } else {
+        return Err(Status::invalid_argument(format!(
+            "datatype '{expected_dt}' requires raw_input_contents (typed contents is FP32-only)"
+        )));
+    };
+
+    contract.validate_request_shape(&input_shape, model_name)?;
+    let request_shape = contract.normalize_request_shape(input_shape);
+
+    let numel = request_shape
+        .iter()
+        .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| Status::invalid_argument("input tensor shape overflow"))?;
+    let expected_bytes = (numel as usize).saturating_mul(elem_size);
+    if input_bytes.len() != expected_bytes {
+        return Err(Status::invalid_argument(format!(
+            "input byte length {} does not match shape {request_shape:?} \u{d7} \
+             {elem_size} bytes ({expected_bytes}) for model '{model_name}'",
+            input_bytes.len()
+        )));
+    }
+
+    let expected_batch = if contract.max_batch_size() > 0 {
+        request_shape.first().copied()
+    } else {
+        None
+    };
+    Ok(Some((
+        input_bytes,
+        request_shape,
+        canonical_dtype,
+        expected_batch,
+    )))
+}
 
 /// Whether a requested model version is servable. nereid has no version
 /// concept, so only the implicit version `"1"` (or an empty selector) exists.
@@ -254,10 +361,7 @@ impl TritonService {
     /// selection, datatype validation, shape/batch normalization, backend
     /// dispatch (Rust `.pt` queue or Python subprocess with backpressure), and
     /// output validation.
-    async fn infer_once(
-        &self,
-        mut request: ModelInferRequest,
-    ) -> Result<ModelInferResponse, Status> {
+    async fn infer_once(&self, request: ModelInferRequest) -> Result<ModelInferResponse, Status> {
         let model_name = request.model_name.trim().to_string();
         if model_name.is_empty() {
             return Err(Status::invalid_argument("model_name is required"));
@@ -278,238 +382,38 @@ impl TritonService {
         if self.model_manager.is_multi(&model_name) {
             return self.infer_multi(request, model_name).await;
         }
+        // Single-tensor dispatch, one method per backend so each compiles only
+        // when its feature is enabled.
+        if self.model_manager.is_native(&model_name) {
+            return self.infer_native_once(request, model_name).await;
+        }
+        #[cfg(feature = "python")]
+        if self.model_manager.is_python(&model_name) {
+            return self.infer_python_once(request, model_name).await;
+        }
+        #[cfg(feature = "torch")]
+        {
+            self.infer_torch_once(request, model_name).await
+        }
+        #[cfg(not(feature = "torch"))]
+        {
+            let _ = &request;
+            Err(Status::internal(format!(
+                "model '{model_name}' is a non-native single-tensor model, but neither the \
+                 torch nor python backend is compiled in"
+            )))
+        }
+    }
 
-        let is_python = self.model_manager.is_python(&model_name);
-        let is_native = self.model_manager.is_native(&model_name);
-        let contract = self.model_manager.input_contract(&model_name).cloned();
-        // Every configured Python model declares `output_shape` (enforced at
-        // startup), so all Python models are tensor-capable over ModelInfer.
-
-        let contract = contract.ok_or_else(|| {
-            Status::internal(format!(
-                "model '{model_name}' is missing its input contract"
-            ))
-        })?;
-
-        // A model with a declared input consumes exactly one input tensor; an
-        // output-only model (Python, no `input_shape`) consumes none — matching
-        // what `model_metadata` advertises. `py_input`/`rust_tensor` carry the
-        // built input for the respective backend.
-        let (py_input, rust_tensor, native_input, expected_batch) = if contract.has_input() {
-            if request.inputs.len() != 1 {
-                return Err(Status::invalid_argument(format!(
-                    "model '{model_name}' expects one input tensor, got {}",
-                    request.inputs.len()
-                )));
-            }
-            let input = &request.inputs[0];
-
-            // The request datatype must match the model's declared datatype
-            // (default FP32). The Rust `.pt` path runs the libtorch kinds; the
-            // Python path is byte-passthrough over any fixed-width dtype.
-            let expected_dt = contract.input_datatype();
-            if input.datatype != expected_dt {
-                return Err(Status::invalid_argument(format!(
-                    "datatype mismatch for model '{model_name}': expected {expected_dt}, got '{}'",
-                    input.datatype
-                )));
-            }
-            let (elem_size, canonical_dtype) =
-                dtype::kserve_fixed_width(expected_dt).ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "unsupported datatype '{expected_dt}' for model '{model_name}'"
-                    ))
-                })?;
-
-            // Raw bytes (row-major little-endian) take precedence over the typed
-            // `contents`. KServe pairs raw_input_contents positionally with
-            // inputs, so a single input means a single raw buffer. Typed
-            // `contents` is supported only for FP32; other dtypes must use raw.
-            let input_shape = input.shape.clone();
-            let input_bytes = if !request.raw_input_contents.is_empty() {
-                if request.raw_input_contents.len() != 1 {
-                    return Err(Status::invalid_argument(
-                        "raw_input_contents must hold exactly one buffer for a single input",
-                    ));
-                }
-                // Take the single buffer without partially moving `request`
-                // (its `id`/`outputs` are still read below).
-                request.raw_input_contents.remove(0)
-            } else if expected_dt == FP32 {
-                match &input.contents {
-                    Some(contents) => contents
-                        .fp32_contents
-                        .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect(),
-                    None => {
-                        return Err(Status::invalid_argument(
-                            "input tensor has neither raw_input_contents nor contents",
-                        ));
-                    }
-                }
-            } else {
-                return Err(Status::invalid_argument(format!(
-                    "datatype '{expected_dt}' requires raw_input_contents (typed contents is FP32-only)"
-                )));
-            };
-
-            // Validate and batch-normalize the requested shape exactly as the
-            // native Checkpoint path does.
-            contract.validate_request_shape(&input_shape, &model_name)?;
-            let request_shape = contract.normalize_request_shape(input_shape);
-
-            // The raw buffer must be exactly one element per shape slot.
-            let numel = request_shape
-                .iter()
-                .try_fold(1i64, |acc, dim| acc.checked_mul(*dim))
-                .ok_or_else(|| Status::invalid_argument("input tensor shape overflow"))?;
-            let expected_bytes = (numel as usize).saturating_mul(elem_size);
-            if input_bytes.len() != expected_bytes {
-                return Err(Status::invalid_argument(format!(
-                    "input byte length {} does not match shape {request_shape:?} \u{d7} \
-                     {elem_size} bytes ({expected_bytes}) for model '{model_name}'",
-                    input_bytes.len()
-                )));
-            }
-
-            let expected_batch = if contract.max_batch_size() > 0 {
-                request_shape.first().copied()
-            } else {
-                None
-            };
-
-            if is_python {
-                let py_input = PythonInput {
-                    shape: request_shape,
-                    bytes: input_bytes,
-                    dtype: canonical_dtype.to_string(),
-                };
-                (Some(py_input), None, None, expected_batch)
-            } else if is_native {
-                // Native (ONNX/TensorFlow): pass raw bytes + canonical dtype
-                // straight through — no libtorch kind, so uint16/32/64 work too.
-                let native = NativeTensor {
-                    name: "input".to_string(),
-                    shape: request_shape,
-                    dtype: canonical_dtype.to_string(),
-                    data: input_bytes,
-                };
-                (None, None, Some(native), expected_batch)
-            } else {
-                // The Rust `.pt` path builds a tensor of the declared dtype's
-                // libtorch kind; dtypes with no libtorch kind (uint16/32/64) are
-                // rejected here.
-                let kind = dtype::kind_from_canonical(canonical_dtype).ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "Rust .pt model '{model_name}' does not support datatype {expected_dt} \
-                         (no libtorch kind)"
-                    ))
-                })?;
-                let tensor =
-                    tensor_from_input_bytes(&input_bytes, &request_shape, &model_name, kind)?;
-                (None, Some(tensor), None, expected_batch)
-            }
-        } else {
-            // Output-only model (Python): no input tensor expected. Reject both
-            // declared inputs and raw buffers (KServe pairs raw_input_contents
-            // positionally with inputs, so any is stray client data).
-            if !request.inputs.is_empty() || !request.raw_input_contents.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "model '{model_name}' declares no input tensor but the request carries \
-                     {} input(s) and {} raw buffer(s)",
-                    request.inputs.len(),
-                    request.raw_input_contents.len()
-                )));
-            }
-            (None, None, None, None)
-        };
-
-        let (output_shape, output_bytes, output_dt) = if is_python {
-            // Bound concurrent subprocesses; hold the permit across the whole
-            // blocking call so the pool count reflects work in flight.
-            let permits = self
-                .model_manager
-                .python_permits(&model_name)
-                .ok_or_else(|| {
-                    Status::internal(format!("Python model '{model_name}' has no permit pool"))
-                })?;
-            let _permit = permits.try_acquire_owned().map_err(|_| {
-                Status::resource_exhausted(format!("model '{model_name}' queue full, retry later"))
-            })?;
-
-            let model_dir = self
-                .model_manager
-                .python_model_dir(&model_name)
-                .ok_or_else(|| {
-                    Status::internal(format!(
-                        "Python model '{model_name}' has no model directory"
-                    ))
-                })?;
-            let name = model_name.clone();
-            let (shape, bytes, out_canonical) = tokio::task::spawn_blocking(move || {
-                run_python_inference(&name, model_dir, py_input)
-            })
-            .await
-            .map_err(|err| {
-                Status::internal(format!("python inference task failed to join: {err}"))
-            })??;
-            // Reject an output whose shape contradicts the declared output_shape
-            // or whose batch size disagrees with the request.
-            contract.validate_output_shape(&shape, expected_batch, &model_name)?;
-            let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
-                Status::internal(format!(
-                    "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
-                ))
-            })?;
-            (shape, bytes, out_kserve.to_string())
-        } else if is_native {
-            let native_input = native_input.ok_or_else(|| {
-                Status::internal(format!("native model '{model_name}' has no input tensor"))
-            })?;
-            let response_rx = self
-                .model_manager
-                .enqueue_native(&model_name, vec![native_input])?;
-            let mut outputs = response_rx.await.map_err(|_| {
-                Status::internal(format!(
-                    "worker response channel closed for model '{model_name}'"
-                ))
-            })??;
-            if outputs.len() != 1 {
-                return Err(Status::internal(format!(
-                    "single-tensor native model '{model_name}' returned {} outputs, expected 1",
-                    outputs.len()
-                )));
-            }
-            let (shape, bytes, out_canonical) = outputs.remove(0);
-            let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
-                Status::internal(format!(
-                    "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
-                ))
-            })?;
-            (shape, bytes, out_kserve.to_string())
-        } else {
-            let input_tensor = rust_tensor.ok_or_else(|| {
-                Status::internal(format!("Rust model '{model_name}' has no input tensor"))
-            })?;
-            let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
-            let (shape, bytes, out_canonical) = response_rx.await.map_err(|_| {
-                Status::internal(format!(
-                    "worker response channel closed for model '{model_name}'"
-                ))
-            })??;
-            let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
-                Status::internal(format!(
-                    "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
-                ))
-            })?;
-            (shape, bytes, out_kserve.to_string())
-        };
-
-        // The single-tensor model's only output is named "output" (as advertised
-        // by ModelMetadata). If the client requested specific outputs, each must
-        // reference that name — reject unknown names rather than silently
-        // renaming the returned tensor.
+    /// Build the single-tensor Triton response for a model whose only output is
+    /// named `output`. Rejects a client-requested output name that isn't `output`.
+    fn single_output_response(
+        request: &ModelInferRequest,
+        model_name: String,
+        output_shape: Vec<i64>,
+        output_bytes: Vec<u8>,
+        output_dt: String,
+    ) -> Result<ModelInferResponse, Status> {
         const OUTPUT_NAME: &str = "output";
         if let Some(unknown) = request.outputs.iter().find(|o| o.name != OUTPUT_NAME) {
             return Err(Status::invalid_argument(format!(
@@ -517,11 +421,10 @@ impl TritonService {
                 unknown.name
             )));
         }
-
         Ok(ModelInferResponse {
             model_name,
             model_version: MODEL_VERSION.to_string(),
-            id: request.id,
+            id: request.id.clone(),
             parameters: Default::default(),
             outputs: vec![InferOutputTensor {
                 name: OUTPUT_NAME.to_string(),
@@ -532,6 +435,177 @@ impl TritonService {
             }],
             raw_output_contents: vec![output_bytes],
         })
+    }
+
+    /// Native (ONNX/TensorFlow) single-tensor inference over ModelInfer.
+    async fn infer_native_once(
+        &self,
+        mut request: ModelInferRequest,
+        model_name: String,
+    ) -> Result<ModelInferResponse, Status> {
+        let contract = self
+            .model_manager
+            .input_contract(&model_name)
+            .cloned()
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "model '{model_name}' is missing its input contract"
+                ))
+            })?;
+        let (bytes, shape, canonical, _batch) =
+            extract_single_input(&contract, &mut request, &model_name)?.ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "native model '{model_name}' requires an input tensor"
+                ))
+            })?;
+        let native = NativeTensor {
+            name: "input".to_string(),
+            shape,
+            dtype: canonical.to_string(),
+            data: bytes,
+        };
+        let response_rx = self
+            .model_manager
+            .enqueue_native(&model_name, vec![native])?;
+        let mut outputs = response_rx.await.map_err(|_| {
+            Status::internal(format!(
+                "worker response channel closed for model '{model_name}'"
+            ))
+        })??;
+        if outputs.len() != 1 {
+            return Err(Status::internal(format!(
+                "single-tensor native model '{model_name}' returned {} outputs, expected 1",
+                outputs.len()
+            )));
+        }
+        let (out_shape, out_bytes, out_canonical) = outputs.remove(0);
+        let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
+            Status::internal(format!(
+                "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
+            ))
+        })?;
+        Self::single_output_response(
+            &request,
+            model_name,
+            out_shape,
+            out_bytes,
+            out_kserve.to_string(),
+        )
+    }
+
+    /// Rust TorchScript (`.pt`) single-tensor inference over ModelInfer.
+    #[cfg(feature = "torch")]
+    async fn infer_torch_once(
+        &self,
+        mut request: ModelInferRequest,
+        model_name: String,
+    ) -> Result<ModelInferResponse, Status> {
+        let contract = self
+            .model_manager
+            .input_contract(&model_name)
+            .cloned()
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "model '{model_name}' is missing its input contract"
+                ))
+            })?;
+        let expected_dt = contract.input_datatype().to_string();
+        let (bytes, shape, canonical, _batch) =
+            extract_single_input(&contract, &mut request, &model_name)?.ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "Rust .pt model '{model_name}' requires an input tensor"
+                ))
+            })?;
+        // dtypes with no libtorch kind (uint16/32/64) are rejected here.
+        let kind = dtype::kind_from_canonical(canonical).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "Rust .pt model '{model_name}' does not support datatype {expected_dt} \
+                 (no libtorch kind)"
+            ))
+        })?;
+        let tensor = tensor_from_input_bytes(&bytes, &shape, &model_name, kind)?;
+        let response_rx = self.model_manager.enqueue(&model_name, tensor)?;
+        let (out_shape, out_bytes, out_canonical) = response_rx.await.map_err(|_| {
+            Status::internal(format!(
+                "worker response channel closed for model '{model_name}'"
+            ))
+        })??;
+        let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
+            Status::internal(format!(
+                "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
+            ))
+        })?;
+        Self::single_output_response(
+            &request,
+            model_name,
+            out_shape,
+            out_bytes,
+            out_kserve.to_string(),
+        )
+    }
+
+    /// Python (`main.py`) single-tensor inference over ModelInfer.
+    #[cfg(feature = "python")]
+    async fn infer_python_once(
+        &self,
+        mut request: ModelInferRequest,
+        model_name: String,
+    ) -> Result<ModelInferResponse, Status> {
+        let contract = self
+            .model_manager
+            .input_contract(&model_name)
+            .cloned()
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "model '{model_name}' is missing its input contract"
+                ))
+            })?;
+        let (py_input, expected_batch) =
+            match extract_single_input(&contract, &mut request, &model_name)? {
+                Some((bytes, shape, canonical, batch)) => (
+                    Some(PythonInput {
+                        shape,
+                        bytes,
+                        dtype: canonical.to_string(),
+                    }),
+                    batch,
+                ),
+                None => (None, None),
+            };
+
+        // Bound concurrent subprocesses; hold the permit across the whole
+        // blocking call so the pool count reflects work in flight.
+        let permits = self
+            .model_manager
+            .python_permits(&model_name)
+            .ok_or_else(|| {
+                Status::internal(format!("Python model '{model_name}' has no permit pool"))
+            })?;
+        let _permit = permits.try_acquire_owned().map_err(|_| {
+            Status::resource_exhausted(format!("model '{model_name}' queue full, retry later"))
+        })?;
+        let model_dir = self
+            .model_manager
+            .python_model_dir(&model_name)
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "Python model '{model_name}' has no model directory"
+                ))
+            })?;
+        let name = model_name.clone();
+        let (shape, bytes, out_canonical) =
+            tokio::task::spawn_blocking(move || run_python_inference(&name, model_dir, py_input))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("python inference task failed to join: {err}"))
+                })??;
+        contract.validate_output_shape(&shape, expected_batch, &model_name)?;
+        let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
+            Status::internal(format!(
+                "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
+            ))
+        })?;
+        Self::single_output_response(&request, model_name, shape, bytes, out_kserve.to_string())
     }
 
     /// The multi-tensor inference path: bind the request's named input tensors
@@ -594,6 +668,7 @@ impl TritonService {
 
         // Build one tensor per declared input, in contract order. Rust models get
         // libtorch tensors; native (ONNX/TF) models get raw `NativeTensor`s.
+        #[cfg(feature = "torch")]
         let mut input_tensors = Vec::with_capacity(contract.inputs.len());
         let mut native_inputs: Vec<NativeTensor> = Vec::with_capacity(contract.inputs.len());
         let mut batch: Option<i64> = None;
@@ -681,15 +756,26 @@ impl TritonService {
                     data: bytes,
                 });
             } else {
-                // The Rust `.pt` path needs a libtorch kind; uint16/32/64 (which
-                // libtorch lacks) are rejected here but work on the native path.
-                let kind = dtype::kind_from_canonical(canonical).ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "input '{}' datatype {} has no libtorch kind",
-                        spec.name, spec.dtype
-                    ))
-                })?;
-                input_tensors.push(tensor_from_input_bytes(&bytes, &shape, &model_name, kind)?);
+                #[cfg(feature = "torch")]
+                {
+                    // The Rust `.pt` path needs a libtorch kind; uint16/32/64
+                    // (which libtorch lacks) are rejected here but work natively.
+                    let kind = dtype::kind_from_canonical(canonical).ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "input '{}' datatype {} has no libtorch kind",
+                            spec.name, spec.dtype
+                        ))
+                    })?;
+                    input_tensors.push(tensor_from_input_bytes(&bytes, &shape, &model_name, kind)?);
+                }
+                #[cfg(not(feature = "torch"))]
+                {
+                    let _ = (&shape, &bytes, canonical);
+                    return Err(Status::internal(format!(
+                        "model '{model_name}' is a multi-tensor .pt model, but the torch backend \
+                         is not compiled in"
+                    )));
+                }
             }
         }
 
@@ -697,8 +783,18 @@ impl TritonService {
             self.model_manager
                 .enqueue_native(&model_name, native_inputs)?
         } else {
-            self.model_manager
-                .enqueue_multi(&model_name, input_tensors)?
+            #[cfg(feature = "torch")]
+            {
+                self.model_manager
+                    .enqueue_multi(&model_name, input_tensors)?
+            }
+            #[cfg(not(feature = "torch"))]
+            {
+                return Err(Status::internal(format!(
+                    "model '{model_name}' is a multi-tensor .pt model, but the torch backend \
+                     is not compiled in"
+                )));
+            }
         };
         let outputs = response_rx.await.map_err(|_| {
             Status::internal(format!(

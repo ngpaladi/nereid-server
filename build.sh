@@ -46,7 +46,8 @@ OUT_DIR=""                    # bundled output dir (default: dist/<binary>)
 JOBS=""                       # cargo -j value (empty = cargo default)
 DO_RUN=0                       # run the server after building
 declare -a EXTRA_CARGO_ARGS=() # passthrough args after `--`
-declare -a FEATURES=()         # cargo features (native backends: onnx / tensorflow)
+declare -a FEATURES=()         # extra cargo features added on top of the selection
+BACKENDS=""                    # exact backend set (implies --no-default-features)
 
 # libtorch source resolution
 LIBTORCH_VERSION="2.5.1"       # the version tch 0.18.x links against
@@ -95,12 +96,17 @@ libtorch source (highest precedence first):
   --libtorch-sha256 <hex>  Expected sha256 for --fetch-libtorch (un-pinned combos).
   --no-verify         Skip the sha256 check for --fetch-libtorch (not recommended).
 
-Native backends (opt-in; each links a heavy extra runtime):
-  --onnx              Enable the ONNX backend (ort / ONNX Runtime, CUDA-capable).
-  --tensorflow        Enable the TensorFlow backend (libtensorflow SavedModel, CPU).
-  --tensorflow-gpu    TensorFlow backend linked against the libtensorflow GPU build.
-  --features <list>   Pass an arbitrary comma-separated cargo feature list.
-                        (bundled builds also bundle libonnxruntime/libtensorflow.)
+Backend selection (build only the backends you want):
+  --backends <csv>    Exact backend set, e.g. --backends onnx (turns OFF the
+                        default torch+python). Valid: torch, python, onnx,
+                        tensorflow, tensorflow-gpu. An ONNX/TF-only build links
+                        no libtorch at all.
+  --onnx              Add the ONNX backend (ort / ONNX Runtime, CUDA-capable).
+  --tensorflow        Add the TensorFlow backend (libtensorflow SavedModel).
+  --tensorflow-gpu    Add TensorFlow linked against the libtensorflow GPU build.
+  --features <list>   Add an arbitrary comma-separated cargo feature list.
+  # With no --backends, the default torch+python backends stay on and --onnx /
+  # --tensorflow add to them. bundled builds bundle whichever runtimes are linked.
 
 Device:
   --device <dev>      cpu (default), cuda, or cuda:<cuXYZ>. The version is the
@@ -136,6 +142,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --link)             LINK_MODE="${2:?--link needs a value}"; LINK_EXPLICIT=1; shift 2 ;;
     --link=*)           LINK_MODE="${1#*=}"; LINK_EXPLICIT=1; shift ;;
+    --backends)         BACKENDS="${2:?--backends needs a value}"; shift 2 ;;
+    --backends=*)       BACKENDS="${1#*=}"; shift ;;
     --onnx)             FEATURES+=("onnx"); shift ;;
     --tensorflow)       FEATURES+=("tensorflow"); shift ;;
     --tensorflow-gpu)   FEATURES+=("tensorflow-gpu"); shift ;;
@@ -347,17 +355,45 @@ fi
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
+# Resolve the final cargo feature selection. `--backends <csv>` picks an exact
+# set (turning off the torch+python defaults); `--onnx`/`--tensorflow` add on top
+# of whatever's selected. With neither, the default backends (torch+python) apply.
 declare -a CARGO_ARGS=(build)
 [[ "$PROFILE" == "release" ]] && CARGO_ARGS+=(--release)
 [[ -n "$JOBS" ]] && CARGO_ARGS+=(-j "$JOBS")
-if [[ ${#FEATURES[@]} -gt 0 ]]; then
-  # Join with commas for a single --features argument.
-  feature_csv="$(IFS=,; echo "${FEATURES[*]}")"
+
+declare -a SELECTED=()
+if [[ -n "$BACKENDS" ]]; then
+  IFS=',' read -r -a explicit <<< "$BACKENDS"
+  SELECTED+=("${explicit[@]}")
+fi
+SELECTED+=("${FEATURES[@]}")
+
+# Is the torch (.pt / libtorch) backend part of this build? It's on by default
+# unless an explicit --backends set omits it.
+if [[ -n "$BACKENDS" ]]; then
+  case ",$BACKENDS,${FEATURES[*]}," in *torch*) TORCH_ENABLED=1 ;; *) TORCH_ENABLED=0 ;; esac
+else
+  TORCH_ENABLED=1
+fi
+
+if [[ -n "$BACKENDS" ]]; then
+  CARGO_ARGS+=(--no-default-features)
+fi
+if [[ ${#SELECTED[@]} -gt 0 ]]; then
+  feature_csv="$(IFS=,; echo "${SELECTED[*]}")"
   CARGO_ARGS+=(--features "$feature_csv")
 fi
 CARGO_ARGS+=("${EXTRA_CARGO_ARGS[@]}")
 
+# A non-torch build must not try to fetch/point-at libtorch.
+if [[ $TORCH_ENABLED -eq 0 ]]; then
+  FETCH_LIBTORCH=0
+  LIBTORCH_PATH=""
+fi
+
 log "Building nereid-server (profile=$PROFILE, device=$DEVICE, link=$LINK_MODE)"
+[[ -n "$BACKENDS" ]] && log "Backends: $BACKENDS${FEATURES[*]:+ (+ ${FEATURES[*]})}"
 [[ ${#FEATURES[@]} -gt 0 ]] && log "Features: ${FEATURES[*]}"
 [[ ${#BUILD_ENV[@]} -gt 0 ]] && log "Build env: ${BUILD_ENV[*]}"
 
@@ -405,24 +441,27 @@ case "$LINK_MODE" in
     ;;
 
   bundled)
-    lib_dir="$(find_libtorch_lib_dir || true)"
-    [[ -n "$lib_dir" && -d "$lib_dir" ]] \
-      || die "could not locate the libtorch lib/ directory to bundle from."
     [[ -z "$OUT_DIR" ]] && OUT_DIR="$REPO_ROOT/dist/$BIN_NAME"
     mkdir -p "$OUT_DIR/lib"
-
-    log "Bundling libtorch shared objects from: $lib_dir"
-    shopt -s nullglob
     copied=0
-    for so in "$lib_dir"/*.so "$lib_dir"/*.so.*; do
-      cp -L "$so" "$OUT_DIR/lib/" && copied=$((copied + 1))
-    done
-    shopt -u nullglob
-    [[ $copied -gt 0 ]] || die "found no .so files to bundle under $lib_dir"
+
+    # libtorch's shared objects (only when the torch backend is in the build).
+    if [[ $TORCH_ENABLED -eq 1 ]]; then
+      lib_dir="$(find_libtorch_lib_dir || true)"
+      [[ -n "$lib_dir" && -d "$lib_dir" ]] \
+        || die "could not locate the libtorch lib/ directory to bundle from."
+      log "Bundling libtorch shared objects from: $lib_dir"
+      shopt -s nullglob
+      for so in "$lib_dir"/*.so "$lib_dir"/*.so.*; do
+        cp -L "$so" "$OUT_DIR/lib/" && copied=$((copied + 1))
+      done
+      shopt -u nullglob
+      [[ $copied -gt 0 ]] || die "found no .so files to bundle under $lib_dir"
+    fi
 
     # Native backend runtimes (ONNX Runtime, libtensorflow) live outside the
     # libtorch dir. Resolve them from the binary's actual load map and bundle
-    # them too, so a --features onnx/tensorflow build is equally self-contained.
+    # them too, so a native-only build is equally self-contained.
     if command -v ldd >/dev/null 2>&1; then
       while read -r native_so; do
         [[ -n "$native_so" && -f "$native_so" ]] || continue
@@ -461,8 +500,14 @@ EOF
     ;;
 
   dynamic)
-    lib_dir="$(find_libtorch_lib_dir || true)"
-    if [[ -n "$lib_dir" && -d "$lib_dir" ]]; then
+    # Only torch builds need the libtorch loader-path wrapper. Native-only builds
+    # (ONNX/TensorFlow) resolve their runtimes without it.
+    lib_dir=""
+    [[ $TORCH_ENABLED -eq 1 ]] && lib_dir="$(find_libtorch_lib_dir || true)"
+    if [[ $TORCH_ENABLED -eq 0 ]]; then
+      log "No torch backend in this build — the binary needs no libtorch loader path."
+      log "Run it directly: $BIN_PATH"
+    elif [[ -n "$lib_dir" && -d "$lib_dir" ]]; then
       wrapper="$REPO_ROOT/target/$PROFILE/run-$BIN_NAME.sh"
       cat > "$wrapper" <<EOF
 #!/usr/bin/env bash

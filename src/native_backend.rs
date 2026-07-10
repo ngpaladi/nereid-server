@@ -55,7 +55,8 @@ pub struct NativeLoadSpec<'a> {
     /// Ordered output tensor names from the model contract.
     pub output_names: Vec<String>,
     /// TensorFlow SavedModel signature key (default `"serving_default"`); unused
-    /// by ONNX.
+    /// by ONNX, so only read when the `tensorflow` backend is compiled in.
+    #[cfg_attr(not(feature = "tensorflow"), allow(dead_code))]
     pub signature: String,
 }
 
