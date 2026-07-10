@@ -1214,6 +1214,64 @@ mod triton_e2e_tests {
         assert_eq!(got, expected, "onnxadd must compute input + 1");
     }
 
+    /// The TensorFlow backend (feature `tensorflow`) serves the committed `tfadd`
+    /// SavedModel fixture (`output = input + 1`) end to end over ModelInfer,
+    /// exercising native detection, the libtensorflow SavedModel session, and the
+    /// tensor round-trip. CPU-only. Generate the fixture with
+    /// `scripts/make_example_models.py` (needs `tensorflow`).
+    #[cfg(feature = "tensorflow")]
+    #[tokio::test]
+    async fn tensorflow_model_infer_returns_input_plus_one() {
+        assert!(
+            fixtures_dir().join("tfadd").join("saved_model.pb").is_file(),
+            "tfadd fixture missing (run scripts/make_example_models.py)"
+        );
+        let input_values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let expected: Vec<f32> = input_values.iter().map(|v| v + 1.0).collect();
+
+        let addr = spawn_triton_server("tfadd").await;
+        let mut client = connect(addr).await;
+
+        let meta = client
+            .model_metadata(ModelMetadataRequest {
+                name: "tfadd".to_string(),
+                version: String::new(),
+            })
+            .await
+            .expect("model_metadata")
+            .into_inner();
+        assert_eq!(meta.platform, "tensorflow_savedmodel");
+
+        let response = client
+            .model_infer(ModelInferRequest {
+                model_name: "tfadd".to_string(),
+                model_version: String::new(),
+                id: "tf-1".to_string(),
+                parameters: Default::default(),
+                inputs: vec![InferInputTensor {
+                    name: "input".to_string(),
+                    datatype: FP32.to_string(),
+                    shape: vec![1, 4],
+                    parameters: Default::default(),
+                    contents: None,
+                }],
+                outputs: Vec::new(),
+                raw_input_contents: vec![f32_le_bytes(&input_values)],
+            })
+            .await
+            .expect("tensorflow model_infer should succeed")
+            .into_inner();
+
+        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.outputs[0].shape, vec![1, 4]);
+        let raw = &response.raw_output_contents[0];
+        let got: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, expected, "tfadd must compute input + 1");
+    }
+
     /// The client may request the model's output by its real name (`output`) —
     /// which returns a tensor named `output` — but requesting an unknown output
     /// name is rejected rather than silently renamed.

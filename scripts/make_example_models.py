@@ -60,8 +60,9 @@ def make_tf(model_dir: str) -> None:
             return {"output": x + 1.0}
 
     os.makedirs(model_dir, exist_ok=True)
+    model = AddOne()
     tf.saved_model.save(
-        AddOne(), model_dir, signatures={"serving_default": AddOne().__call__}
+        model, model_dir, signatures={"serving_default": model.__call__}
     )
     with open(os.path.join(model_dir, "model_inference.textproto"), "w") as f:
         f.write(TEXTPROTO)

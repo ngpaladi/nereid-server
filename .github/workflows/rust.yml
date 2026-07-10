@@ -82,6 +82,17 @@ jobs:
         export LD_LIBRARY_PATH="$(dirname "$(find target -name libtorch_cpu.so -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)")":$LD_LIBRARY_PATH
         cargo test --features onnx --verbose onnx_model_infer
 
+    # Run the TensorFlow backend end to end (loads the committed tfadd SavedModel
+    # and asserts output == input + 1). Needs both libtorch (tch) and
+    # libtensorflow on the loader path — both were extracted into target/ by their
+    # build scripts.
+    - name: Run TensorFlow end-to-end test
+      run: |
+        torch="$(dirname "$(find target -name libtorch_cpu.so -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)")"
+        tf="$(dirname "$(find target -name 'libtensorflow.so*' 2>/dev/null | head -1)")"
+        export LD_LIBRARY_PATH="$torch:$tf:$LD_LIBRARY_PATH"
+        cargo test --features tensorflow --verbose tensorflow_model_infer
+
   # Proves the build is modular: an ONNX-only (and native-only) server compiles
   # with the torch+python defaults turned off and links no libtorch at all.
   modular-build:
