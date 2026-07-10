@@ -8,6 +8,7 @@ mod config;
 mod dtype;
 mod inference;
 mod model_runtime;
+mod native_backend;
 mod python_backend;
 mod triton;
 
@@ -289,6 +290,38 @@ impl Nereid for NereidService {
 
         let (tensor_bytes, request_shape) =
             collect_input_tensor(&mut stream, &input_contract, &model_name).await?;
+
+        // Native (ONNX/TensorFlow) single-tensor models take the native path,
+        // bypassing libtorch. The Checkpoint tensor contract is float32.
+        if self.model_manager.is_native(&model_name) {
+            let native = native_backend::NativeTensor {
+                name: "input".to_string(),
+                shape: request_shape,
+                dtype: "float32".to_string(),
+                data: tensor_bytes,
+            };
+            let response_rx = self
+                .model_manager
+                .enqueue_native(&model_name, vec![native])?;
+            let mut outputs = response_rx.await.map_err(|_| {
+                Status::internal(format!(
+                    "worker response channel closed for model '{model_name}'"
+                ))
+            })??;
+            if outputs.len() != 1 {
+                return Err(Status::internal(format!(
+                    "single-tensor native model '{model_name}' returned {} outputs, expected 1",
+                    outputs.len()
+                )));
+            }
+            let (output_shape, output_bytes, _dtype) = outputs.remove(0);
+            return Ok(Response::new(output_to_stream(
+                &model_name,
+                output_shape,
+                output_bytes,
+            )));
+        }
+
         // The Checkpoint tensor contract is little-endian float32.
         let input_tensor =
             tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name, tch::Kind::Float)?;
@@ -424,6 +457,7 @@ mod checkpoint_e2e_tests {
             device: ModelDevice::Cpu,
             queue_capacity: 4,
             backend: None,
+            signature: None,
         }
     }
 

@@ -26,6 +26,7 @@ use tonic::{Request, Response, Status};
 
 use crate::dtype;
 use crate::model_runtime::{InputShapeContract, ModelManager, tensor_from_input_bytes};
+use crate::native_backend::NativeTensor;
 use crate::proto::grpc_inference_service_server::GrpcInferenceService;
 use crate::proto::model_infer_request::InferInputTensor;
 use crate::proto::model_infer_response::InferOutputTensor;
@@ -129,16 +130,16 @@ impl GrpcInferenceService for TritonService {
                     shape,
                 }
             };
+            let platform = self.model_manager.platform(&name).to_string();
             return Ok(Response::new(ModelMetadataResponse {
                 name,
                 versions: vec![MODEL_VERSION.to_string()],
-                platform: "pytorch_libtorch".to_string(),
+                platform,
                 inputs: multi.inputs.iter().map(to_meta).collect(),
                 outputs: multi.outputs.iter().map(to_meta).collect(),
             }));
         }
 
-        let is_python = self.model_manager.is_python(&name);
         let contract = self.model_manager.input_contract(&name);
         // Input/output datatypes come from the model's declared contract
         // (default FP32).
@@ -186,14 +187,11 @@ impl GrpcInferenceService for TritonService {
             shape: output_shape,
         }];
 
+        let platform = self.model_manager.platform(&name).to_string();
         Ok(Response::new(ModelMetadataResponse {
             name,
             versions: vec![MODEL_VERSION.to_string()],
-            platform: if is_python {
-                "python".to_string()
-            } else {
-                "pytorch_libtorch".to_string()
-            },
+            platform,
             inputs,
             outputs,
         }))
@@ -282,6 +280,7 @@ impl TritonService {
         }
 
         let is_python = self.model_manager.is_python(&model_name);
+        let is_native = self.model_manager.is_native(&model_name);
         let contract = self.model_manager.input_contract(&model_name).cloned();
         // Every configured Python model declares `output_shape` (enforced at
         // startup), so all Python models are tensor-capable over ModelInfer.
@@ -296,7 +295,7 @@ impl TritonService {
         // output-only model (Python, no `input_shape`) consumes none — matching
         // what `model_metadata` advertises. `py_input`/`rust_tensor` carry the
         // built input for the respective backend.
-        let (py_input, rust_tensor, expected_batch) = if contract.has_input() {
+        let (py_input, rust_tensor, native_input, expected_batch) = if contract.has_input() {
             if request.inputs.len() != 1 {
                 return Err(Status::invalid_argument(format!(
                     "model '{model_name}' expects one input tensor, got {}",
@@ -386,7 +385,17 @@ impl TritonService {
                     bytes: input_bytes,
                     dtype: canonical_dtype.to_string(),
                 };
-                (Some(py_input), None, expected_batch)
+                (Some(py_input), None, None, expected_batch)
+            } else if is_native {
+                // Native (ONNX/TensorFlow): pass raw bytes + canonical dtype
+                // straight through — no libtorch kind, so uint16/32/64 work too.
+                let native = NativeTensor {
+                    name: "input".to_string(),
+                    shape: request_shape,
+                    dtype: canonical_dtype.to_string(),
+                    data: input_bytes,
+                };
+                (None, None, Some(native), expected_batch)
             } else {
                 // The Rust `.pt` path builds a tensor of the declared dtype's
                 // libtorch kind; dtypes with no libtorch kind (uint16/32/64) are
@@ -399,7 +408,7 @@ impl TritonService {
                 })?;
                 let tensor =
                     tensor_from_input_bytes(&input_bytes, &request_shape, &model_name, kind)?;
-                (None, Some(tensor), expected_batch)
+                (None, Some(tensor), None, expected_batch)
             }
         } else {
             // Output-only model (Python): no input tensor expected. Reject both
@@ -413,7 +422,7 @@ impl TritonService {
                     request.raw_input_contents.len()
                 )));
             }
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let (output_shape, output_bytes, output_dt) = if is_python {
@@ -448,6 +457,31 @@ impl TritonService {
             // Reject an output whose shape contradicts the declared output_shape
             // or whose batch size disagrees with the request.
             contract.validate_output_shape(&shape, expected_batch, &model_name)?;
+            let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
+                Status::internal(format!(
+                    "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
+                ))
+            })?;
+            (shape, bytes, out_kserve.to_string())
+        } else if is_native {
+            let native_input = native_input.ok_or_else(|| {
+                Status::internal(format!("native model '{model_name}' has no input tensor"))
+            })?;
+            let response_rx = self
+                .model_manager
+                .enqueue_native(&model_name, vec![native_input])?;
+            let mut outputs = response_rx.await.map_err(|_| {
+                Status::internal(format!(
+                    "worker response channel closed for model '{model_name}'"
+                ))
+            })??;
+            if outputs.len() != 1 {
+                return Err(Status::internal(format!(
+                    "single-tensor native model '{model_name}' returned {} outputs, expected 1",
+                    outputs.len()
+                )));
+            }
+            let (shape, bytes, out_canonical) = outputs.remove(0);
             let (out_kserve, _) = dtype::canonical_to_kserve(&out_canonical).ok_or_else(|| {
                 Status::internal(format!(
                     "model '{model_name}' returned unsupported output dtype '{out_canonical}'"
@@ -556,8 +590,12 @@ impl TritonService {
             )));
         }
 
-        // Build one tensor per declared input, in contract order.
+        let is_native = self.model_manager.is_native(&model_name);
+
+        // Build one tensor per declared input, in contract order. Rust models get
+        // libtorch tensors; native (ONNX/TF) models get raw `NativeTensor`s.
         let mut input_tensors = Vec::with_capacity(contract.inputs.len());
+        let mut native_inputs: Vec<NativeTensor> = Vec::with_capacity(contract.inputs.len());
         let mut batch: Option<i64> = None;
         for spec in &contract.inputs {
             let (inp, idx) = *by_name.get(spec.name.as_str()).ok_or_else(|| {
@@ -579,12 +617,6 @@ impl TritonService {
                         spec.dtype, spec.name
                     ))
                 })?;
-            let kind = dtype::kind_from_canonical(canonical).ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "input '{}' datatype {} has no libtorch kind",
-                    spec.name, spec.dtype
-                ))
-            })?;
 
             // Validate + normalize the shape via an ephemeral single-tensor
             // contract, reusing the tested batch logic.
@@ -641,12 +673,33 @@ impl TritonService {
                 }
             }
 
-            input_tensors.push(tensor_from_input_bytes(&bytes, &shape, &model_name, kind)?);
+            if is_native {
+                native_inputs.push(NativeTensor {
+                    name: spec.name.clone(),
+                    shape,
+                    dtype: canonical.to_string(),
+                    data: bytes,
+                });
+            } else {
+                // The Rust `.pt` path needs a libtorch kind; uint16/32/64 (which
+                // libtorch lacks) are rejected here but work on the native path.
+                let kind = dtype::kind_from_canonical(canonical).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "input '{}' datatype {} has no libtorch kind",
+                        spec.name, spec.dtype
+                    ))
+                })?;
+                input_tensors.push(tensor_from_input_bytes(&bytes, &shape, &model_name, kind)?);
+            }
         }
 
-        let response_rx = self
-            .model_manager
-            .enqueue_multi(&model_name, input_tensors)?;
+        let response_rx = if is_native {
+            self.model_manager
+                .enqueue_native(&model_name, native_inputs)?
+        } else {
+            self.model_manager
+                .enqueue_multi(&model_name, input_tensors)?
+        };
         let outputs = response_rx.await.map_err(|_| {
             Status::internal(format!(
                 "worker response channel closed for model '{model_name}'"
@@ -774,6 +827,7 @@ mod triton_e2e_tests {
                 device: ModelDevice::Cpu,
                 queue_capacity,
                 backend: None,
+                signature: None,
             }],
         };
         let model_manager =
@@ -1004,6 +1058,64 @@ mod triton_e2e_tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(got, expected, "pymul must compute input * 2 + 1");
+    }
+
+    /// The ONNX backend (feature `onnx`) serves the committed `onnxadd` fixture
+    /// (`output = input + 1`) end to end over ModelInfer, exercising native
+    /// backend detection, the ort session, and the tensor round-trip. Runs on
+    /// CPU, so it needs no GPU. Generate the fixture with
+    /// `scripts/make_example_models.py`.
+    #[cfg(feature = "onnx")]
+    #[tokio::test]
+    async fn onnx_model_infer_returns_input_plus_one() {
+        assert!(
+            fixtures_dir().join("onnxadd").join("model.onnx").is_file(),
+            "onnxadd fixture missing (run scripts/make_example_models.py)"
+        );
+        let input_values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let expected: Vec<f32> = input_values.iter().map(|v| v + 1.0).collect();
+
+        let addr = spawn_triton_server("onnxadd").await;
+        let mut client = connect(addr).await;
+
+        let meta = client
+            .model_metadata(ModelMetadataRequest {
+                name: "onnxadd".to_string(),
+                version: String::new(),
+            })
+            .await
+            .expect("model_metadata")
+            .into_inner();
+        assert_eq!(meta.platform, "onnxruntime_onnx");
+
+        let response = client
+            .model_infer(ModelInferRequest {
+                model_name: "onnxadd".to_string(),
+                model_version: String::new(),
+                id: "onnx-1".to_string(),
+                parameters: Default::default(),
+                inputs: vec![InferInputTensor {
+                    name: "input".to_string(),
+                    datatype: FP32.to_string(),
+                    shape: vec![1, 4],
+                    parameters: Default::default(),
+                    contents: None,
+                }],
+                outputs: Vec::new(),
+                raw_input_contents: vec![f32_le_bytes(&input_values)],
+            })
+            .await
+            .expect("onnx model_infer should succeed")
+            .into_inner();
+
+        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.outputs[0].shape, vec![1, 4]);
+        let raw = &response.raw_output_contents[0];
+        let got: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, expected, "onnxadd must compute input + 1");
     }
 
     /// The client may request the model's output by its real name (`output`) —

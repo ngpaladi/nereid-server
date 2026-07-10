@@ -36,19 +36,31 @@ pub struct ModelConfig {
     pub device: ModelDevice,
     pub queue_capacity: usize,
     /// Optional explicit backend selector. When set, it decides the model's
-    /// backend (and disambiguates a folder that contains files for both — e.g.
-    /// a `.pt` alongside `main.py`). When absent, the backend is auto-detected
-    /// from the folder contents.
+    /// backend (and disambiguates a folder that contains files for more than one
+    /// — e.g. a `.pt` alongside `main.py`). When absent, the backend is
+    /// auto-detected from the folder contents.
     #[serde(default)]
     pub backend: Option<ConfiguredBackend>,
+    /// TensorFlow SavedModel signature key. Only meaningful for the `tensorflow`
+    /// backend; defaults to `"serving_default"` when absent.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
-/// An explicitly-declared backend kind in `nereid.yaml` (`backend: "python"` or
-/// `backend: "rust"`).
+impl ModelConfig {
+    /// The TensorFlow signature to serve, defaulting to `"serving_default"`.
+    pub fn tf_signature(&self) -> &str {
+        self.signature.as_deref().unwrap_or("serving_default")
+    }
+}
+
+/// An explicitly-declared backend kind in `nereid.yaml` (e.g. `backend: "onnx"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfiguredBackend {
     Python,
     Rust,
+    Onnx,
+    Tensorflow,
 }
 
 impl<'de> Deserialize<'de> for ConfiguredBackend {
@@ -59,8 +71,10 @@ impl<'de> Deserialize<'de> for ConfiguredBackend {
         match String::deserialize(deserializer)?.as_str() {
             "python" => Ok(ConfiguredBackend::Python),
             "rust" => Ok(ConfiguredBackend::Rust),
+            "onnx" => Ok(ConfiguredBackend::Onnx),
+            "tensorflow" => Ok(ConfiguredBackend::Tensorflow),
             other => Err(serde::de::Error::custom(format!(
-                "invalid backend '{other}': expected \"python\" or \"rust\""
+                "invalid backend '{other}': expected \"python\", \"rust\", \"onnx\", or \"tensorflow\""
             ))),
         }
     }
@@ -95,6 +109,17 @@ impl<'de> Deserialize<'de> for ModelDevice {
 }
 
 impl ModelDevice {
+    /// The CUDA device index for GPU-capable native backends (ONNX/TensorFlow),
+    /// or `None` for CPU. Unlike [`to_tch_device`](Self::to_tch_device) this does
+    /// not touch libtorch — each native runtime does its own CUDA availability
+    /// check when it loads the model.
+    pub fn cuda_index(self) -> Option<usize> {
+        match self {
+            Self::Cpu => None,
+            Self::Cuda(index) => Some(index),
+        }
+    }
+
     pub fn to_tch_device(self) -> Result<Device, Status> {
         match self {
             Self::Cpu => Ok(Device::Cpu),

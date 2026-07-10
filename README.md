@@ -3,8 +3,10 @@ A nifty little rust inference server
 
 Goal is to build a simple replacement for a ML inference server.
 Right now, this project contains a Rust gRPC server built with `tonic`.
-The server supports PyTorch models exported in TorchScript (.pt) format, as well as
-arbitrary Python scripts (`main.py`) run inside a per-model virtualenv.
+The server supports PyTorch models exported in TorchScript (.pt) format, arbitrary
+Python scripts (`main.py`) run inside a per-model virtualenv, and — behind opt-in
+build features — **ONNX** and **TensorFlow** models served natively in-process (see
+[Native ONNX and TensorFlow backends](#native-onnx-and-tensorflow-backends)).
 
 ## Proto
 - `proto/inference.proto` — the native Nereid service.
@@ -138,6 +140,35 @@ with open(os.environ["NEREID_OUTPUT_PATH"], "wb") as f:
 ```
 See `ml-backends/model1` and `ml-backends/model2` for complete examples. A Python model that
 exits 0 without writing a valid output tensor is a contract violation and the request fails.
+
+## Native ONNX and TensorFlow backends
+Beyond `.pt` and Python, nereid can serve **ONNX** and **TensorFlow** models *natively* —
+in-process, no Python subprocess — behind opt-in build features. They're off by default so the
+base build stays lean; enable them with `./build.sh --onnx` / `--tensorflow` (or
+`cargo build --features onnx,tensorflow`).
+
+- **ONNX** — a folder with one `.onnx` file + `model_inference.textproto`. Runs on
+  [ONNX Runtime](https://onnxruntime.ai/) via the `ort` crate, with the **CUDA execution
+  provider** selected when the model's `device` is `cuda`.
+- **TensorFlow** — a folder with a **SavedModel** (`saved_model.pb` + `variables/`) +
+  `model_inference.textproto`. Runs on libtensorflow via the `tensorflow` crate; the SavedModel
+  signature defaults to `serving_default` (override per model with `signature:` in `nereid.yaml`).
+  GPU needs the libtensorflow GPU build (`./build.sh --tensorflow-gpu`).
+
+Both are served over the same surfaces as the `.pt` backend: the Triton `ModelInfer` path
+(single- **and** multi-tensor, the full KServe dtype set) and, for single-tensor models,
+nereid's native `Checkpoint`. Backend detection is automatic from the folder contents; set
+`backend: "onnx"` / `"tensorflow"` in `nereid.yaml` to be explicit or to disambiguate. A model
+whose files need a backend the server wasn't built with fails at startup with a clear
+"rebuild with `--features …`" message.
+
+Generate the example models (`onnxadd`, `tfadd` — each computes `input + 1`) with:
+```bash
+python scripts/make_example_models.py   # needs `onnx` (and `tensorflow` for tfadd)
+```
+
+**Dtype note:** the native path additionally supports `UINT16/32/64` (which the Rust `.pt` path
+cannot, as libtorch lacks those kinds); TensorFlow does not support `BF16`.
 
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).

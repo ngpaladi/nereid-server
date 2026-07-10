@@ -46,6 +46,7 @@ OUT_DIR=""                    # bundled output dir (default: dist/<binary>)
 JOBS=""                       # cargo -j value (empty = cargo default)
 DO_RUN=0                       # run the server after building
 declare -a EXTRA_CARGO_ARGS=() # passthrough args after `--`
+declare -a FEATURES=()         # cargo features (native backends: onnx / tensorflow)
 
 # libtorch source resolution
 LIBTORCH_VERSION="2.5.1"       # the version tch 0.18.x links against
@@ -94,6 +95,13 @@ libtorch source (highest precedence first):
   --libtorch-sha256 <hex>  Expected sha256 for --fetch-libtorch (un-pinned combos).
   --no-verify         Skip the sha256 check for --fetch-libtorch (not recommended).
 
+Native backends (opt-in; each links a heavy extra runtime):
+  --onnx              Enable the ONNX backend (ort / ONNX Runtime, CUDA-capable).
+  --tensorflow        Enable the TensorFlow backend (libtensorflow SavedModel, CPU).
+  --tensorflow-gpu    TensorFlow backend linked against the libtensorflow GPU build.
+  --features <list>   Pass an arbitrary comma-separated cargo feature list.
+                        (bundled builds also bundle libonnxruntime/libtensorflow.)
+
 Device:
   --device <dev>      cpu (default), cuda, or cuda:<cuXYZ>. The version is the
                         compact TORCH_CUDA_VERSION form, e.g. --device cuda:cu124
@@ -128,6 +136,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --link)             LINK_MODE="${2:?--link needs a value}"; LINK_EXPLICIT=1; shift 2 ;;
     --link=*)           LINK_MODE="${1#*=}"; LINK_EXPLICIT=1; shift ;;
+    --onnx)             FEATURES+=("onnx"); shift ;;
+    --tensorflow)       FEATURES+=("tensorflow"); shift ;;
+    --tensorflow-gpu)   FEATURES+=("tensorflow-gpu"); shift ;;
+    --features)         FEATURES+=("${2:?--features needs a value}"); shift 2 ;;
+    --features=*)       FEATURES+=("${1#*=}"); shift ;;
     --release)          PROFILE="release"; shift ;;
     --debug)            PROFILE="debug"; shift ;;
     --device)           DEVICE="${2:?--device needs a value}"; shift 2 ;;
@@ -337,9 +350,15 @@ fi
 declare -a CARGO_ARGS=(build)
 [[ "$PROFILE" == "release" ]] && CARGO_ARGS+=(--release)
 [[ -n "$JOBS" ]] && CARGO_ARGS+=(-j "$JOBS")
+if [[ ${#FEATURES[@]} -gt 0 ]]; then
+  # Join with commas for a single --features argument.
+  feature_csv="$(IFS=,; echo "${FEATURES[*]}")"
+  CARGO_ARGS+=(--features "$feature_csv")
+fi
 CARGO_ARGS+=("${EXTRA_CARGO_ARGS[@]}")
 
 log "Building nereid-server (profile=$PROFILE, device=$DEVICE, link=$LINK_MODE)"
+[[ ${#FEATURES[@]} -gt 0 ]] && log "Features: ${FEATURES[*]}"
 [[ ${#BUILD_ENV[@]} -gt 0 ]] && log "Build env: ${BUILD_ENV[*]}"
 
 ( cd "$REPO_ROOT" && env "${BUILD_ENV[@]}" cargo "${CARGO_ARGS[@]}" )
@@ -400,6 +419,20 @@ case "$LINK_MODE" in
     done
     shopt -u nullglob
     [[ $copied -gt 0 ]] || die "found no .so files to bundle under $lib_dir"
+
+    # Native backend runtimes (ONNX Runtime, libtensorflow) live outside the
+    # libtorch dir. Resolve them from the binary's actual load map and bundle
+    # them too, so a --features onnx/tensorflow build is equally self-contained.
+    if command -v ldd >/dev/null 2>&1; then
+      while read -r native_so; do
+        [[ -n "$native_so" && -f "$native_so" ]] || continue
+        cp -L "$native_so" "$OUT_DIR/lib/" && copied=$((copied + 1))
+        log "Bundled native runtime: $(basename "$native_so")"
+      done < <(ldd "$BIN_PATH" 2>/dev/null \
+        | grep -iE 'libonnxruntime|libtensorflow|libtensorflow_framework' \
+        | awk '{print $3}')
+    fi
+
     cp "$BIN_PATH" "$OUT_DIR/$BIN_NAME"
     log "Copied $copied shared object(s) and the binary into $OUT_DIR"
 

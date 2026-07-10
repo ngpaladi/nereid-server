@@ -9,8 +9,9 @@ use tch::{CModule, Device, Tensor};
 use tokio::sync::{Semaphore, oneshot};
 use tonic::Status;
 
-use crate::config::{ConfiguredBackend, ServerConfig};
+use crate::config::{ConfiguredBackend, ModelConfig, ServerConfig};
 use crate::inference;
+use crate::native_backend::{self, NativeKind, NativeLoadSpec, NativeModel, NativeTensor};
 use crate::python_backend;
 
 /// `(shape, row-major little-endian bytes, canonical dtype)` — the dtype lets
@@ -57,6 +58,10 @@ enum ModelHandle {
     Rust(RustModelHandle),
     RustMulti(RustMultiHandle),
     Python(PythonModelHandle),
+    /// ONNX or TensorFlow, served in-process by a boxed native engine on a
+    /// dedicated worker thread. One variant covers both engines (single- and
+    /// multi-tensor) — the concrete engine lives inside the worker.
+    Native(NativeModelHandle),
 }
 
 #[derive(Debug)]
@@ -88,10 +93,32 @@ struct RustMultiHandle {
     occupancy: Arc<AtomicUsize>,
 }
 
+/// A native (ONNX/TensorFlow) model. `single_contract`/`multi` are mutually
+/// exclusive and mirror the Rust single/multi split so the Triton dispatch and
+/// its validation can be reused unchanged. The engine itself lives in the worker
+/// thread reachable through `job_tx`.
+#[derive(Debug)]
+struct NativeModelHandle {
+    kind: NativeKind,
+    single_contract: Option<InputShapeContract>,
+    multi: Option<MultiTensorContract>,
+    job_tx: std_mpsc::SyncSender<NativeInferenceJob>,
+    queue_capacity: usize,
+    occupancy: Arc<AtomicUsize>,
+}
+
 #[derive(Debug)]
 struct InferenceJob {
     input_tensor: Tensor,
     response_tx: oneshot::Sender<Result<InferenceOutput, Status>>,
+    occupancy: Arc<AtomicUsize>,
+}
+
+/// A native inference job. Inputs arrive in the model's declared order; the
+/// worker returns one `InferenceOutput` per model output, in declared order.
+struct NativeInferenceJob {
+    inputs: Vec<NativeTensor>,
+    response_tx: oneshot::Sender<Result<Vec<InferenceOutput>, Status>>,
     occupancy: Arc<AtomicUsize>,
 }
 
@@ -241,6 +268,17 @@ impl ModelManager {
                         );
                     }
                 }
+                DetectedBackendKind::Onnx => {
+                    let handle = build_native_handle(NativeKind::Onnx, &model_dir, model_cfg)?;
+                    model_names.push(model_cfg.name.clone());
+                    handles.insert(model_cfg.name.clone(), handle);
+                }
+                DetectedBackendKind::Tensorflow => {
+                    let handle =
+                        build_native_handle(NativeKind::Tensorflow, &model_dir, model_cfg)?;
+                    model_names.push(model_cfg.name.clone());
+                    handles.insert(model_cfg.name.clone(), handle);
+                }
             }
         }
 
@@ -268,23 +306,45 @@ impl ModelManager {
         match self.handles.get(model_name)? {
             ModelHandle::Rust(handle) => Some(&handle.input_contract),
             ModelHandle::Python(handle) => Some(&handle.contract),
+            ModelHandle::Native(handle) => handle.single_contract.as_ref(),
             ModelHandle::RustMulti(_) => None,
         }
     }
 
-    /// Whether `model_name` is a multi-tensor Rust model (served via the named
-    /// multi-tensor inference path rather than the single-tensor one).
-    pub fn is_multi(&self, model_name: &str) -> bool {
-        matches!(
-            self.handles.get(model_name),
-            Some(ModelHandle::RustMulti(_))
-        )
+    /// Whether `model_name` is a native (ONNX/TensorFlow) model.
+    pub fn is_native(&self, model_name: &str) -> bool {
+        matches!(self.handles.get(model_name), Some(ModelHandle::Native(_)))
     }
 
-    /// The multi-tensor contract for a `RustMulti` model, if `model_name` is one.
+    /// The Triton `platform` string to advertise for a model, by backend kind.
+    pub fn platform(&self, model_name: &str) -> &'static str {
+        match self.handles.get(model_name) {
+            Some(ModelHandle::Python(_)) => "python",
+            Some(ModelHandle::Native(handle)) => match handle.kind {
+                NativeKind::Onnx => "onnxruntime_onnx",
+                NativeKind::Tensorflow => "tensorflow_savedmodel",
+            },
+            _ => "pytorch_libtorch",
+        }
+    }
+
+    /// Whether `model_name` is a multi-tensor model — a multi-tensor Rust model
+    /// or a native model with a multi-tensor contract — served via the named
+    /// multi-tensor inference path rather than the single-tensor one.
+    pub fn is_multi(&self, model_name: &str) -> bool {
+        match self.handles.get(model_name) {
+            Some(ModelHandle::RustMulti(_)) => true,
+            Some(ModelHandle::Native(handle)) => handle.multi.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The multi-tensor contract for a multi-tensor model (Rust or native), if
+    /// `model_name` is one.
     pub fn multi_contract(&self, model_name: &str) -> Option<MultiTensorContract> {
         match self.handles.get(model_name)? {
             ModelHandle::RustMulti(handle) => Some(handle.contract.clone()),
+            ModelHandle::Native(handle) => handle.multi.clone(),
             _ => None,
         }
     }
@@ -320,6 +380,11 @@ impl ModelManager {
             Some(ModelHandle::Python(_)) => {
                 return Err(Status::failed_precondition(format!(
                     "model '{model_name}' is a python backend and does not support tensor inference"
+                )));
+            }
+            Some(ModelHandle::Native(_)) => {
+                return Err(Status::failed_precondition(format!(
+                    "model '{model_name}' is a native (ONNX/TensorFlow) model; use the native inference path"
                 )));
             }
             None => {
@@ -413,6 +478,139 @@ impl ModelManager {
             }
         }
     }
+
+    /// Enqueue a native (ONNX/TensorFlow) inference job. Inputs must already be
+    /// in the model's declared order. Mirrors [`Self::enqueue`]'s bounded queue +
+    /// backpressure. Returns one [`InferenceOutput`] per model output.
+    pub fn enqueue_native(
+        &self,
+        model_name: &str,
+        inputs: Vec<NativeTensor>,
+    ) -> Result<oneshot::Receiver<Result<Vec<InferenceOutput>, Status>>, Status> {
+        let handle = match self.handles.get(model_name) {
+            Some(ModelHandle::Native(handle)) => handle,
+            Some(_) => {
+                return Err(Status::failed_precondition(format!(
+                    "model '{model_name}' is not a native (ONNX/TensorFlow) model"
+                )));
+            }
+            None => {
+                return Err(Status::not_found(format!(
+                    "model '{model_name}' is not configured in nereid.yaml"
+                )));
+            }
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let occupancy = handle.occupancy.clone();
+        let job = NativeInferenceJob {
+            inputs,
+            response_tx,
+            occupancy: occupancy.clone(),
+        };
+
+        let current = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
+        match handle.job_tx.try_send(job) {
+            Ok(()) => {
+                model_log(&format!(
+                    "queue status model={model_name} queue={current}/{}",
+                    handle.queue_capacity
+                ));
+                Ok(response_rx)
+            }
+            Err(std_mpsc::TrySendError::Full(_)) => {
+                occupancy.fetch_sub(1, Ordering::SeqCst);
+                Err(Status::resource_exhausted("model queue full, retry later"))
+            }
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                occupancy.fetch_sub(1, Ordering::SeqCst);
+                Err(Status::internal(format!(
+                    "worker for model '{model_name}' is unavailable"
+                )))
+            }
+        }
+    }
+}
+
+/// Load a native model and wire up its worker + handle. Shared by the ONNX and
+/// TensorFlow load arms; the only difference is the model path (a `.onnx` file
+/// vs. the SavedModel directory).
+fn build_native_handle(
+    kind: NativeKind,
+    model_dir: &Path,
+    model_cfg: &ModelConfig,
+) -> Result<ModelHandle, Status> {
+    let is_multi = textproto_is_multi(model_dir);
+    let model_path: PathBuf = match kind {
+        NativeKind::Onnx => find_exactly_one_onnx_file(model_dir)?,
+        NativeKind::Tensorflow => model_dir.to_path_buf(),
+    };
+
+    let (single_contract, multi, input_names, output_names) = if is_multi {
+        let contract = read_multi_contract_from_textproto(model_dir)?;
+        let ins = contract.inputs.iter().map(|s| s.name.clone()).collect();
+        let outs = contract.outputs.iter().map(|s| s.name.clone()).collect();
+        (None, Some(contract), ins, outs)
+    } else {
+        let contract = read_input_contract_from_textproto(model_dir)?;
+        if !contract.has_input() {
+            return Err(Status::failed_precondition(format!(
+                "native model '{}' must declare input_shape in model_inference.textproto",
+                model_cfg.name
+            )));
+        }
+        (Some(contract), None, Vec::new(), Vec::new())
+    };
+
+    let spec = NativeLoadSpec {
+        path: &model_path,
+        cuda_index: model_cfg.device.cuda_index(),
+        input_names,
+        output_names,
+        signature: model_cfg.tf_signature().to_string(),
+    };
+    let model = native_backend::load_native_model(kind, spec)?;
+
+    let occupancy = Arc::new(AtomicUsize::new(0));
+    let (job_tx, job_rx) = std_mpsc::sync_channel::<NativeInferenceJob>(model_cfg.queue_capacity);
+    spawn_native_worker(model_cfg.name.clone(), model, job_rx);
+
+    Ok(ModelHandle::Native(NativeModelHandle {
+        kind,
+        single_contract,
+        multi,
+        job_tx,
+        queue_capacity: model_cfg.queue_capacity,
+        occupancy,
+    }))
+}
+
+fn spawn_native_worker(
+    model_name: String,
+    mut model: Box<dyn NativeModel>,
+    job_rx: std_mpsc::Receiver<NativeInferenceJob>,
+) {
+    let thread_name = format!("nereid-native-{model_name}");
+    let _ = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            for job in job_rx {
+                let result = model.run(job.inputs).map(|outs| {
+                    outs.into_iter()
+                        .map(|t| (t.shape, t.data, t.dtype))
+                        .collect::<Vec<InferenceOutput>>()
+                });
+                match &result {
+                    Ok(_) => model_log(&format!("native job completed model={model_name}")),
+                    Err(status) => model_log(&format!(
+                        "native job failed model={model_name} error={}",
+                        status.message()
+                    )),
+                }
+                let _ = job.response_tx.send(result);
+                job.occupancy.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
 }
 
 fn spawn_multi_worker(
@@ -477,16 +675,27 @@ fn spawn_model_worker(
 pub enum DetectedBackendKind {
     Python,
     Rust,
+    Onnx,
+    Tensorflow,
 }
 
-fn model_dir_has_any_pt_file(model_dir: &Path) -> bool {
+fn model_dir_has_ext(model_dir: &Path, ext: &str) -> bool {
     fs::read_dir(model_dir)
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
-                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "pt"))
+                .any(|entry| entry.path().extension().is_some_and(|e| e == ext))
         })
         .unwrap_or(false)
+}
+
+fn model_dir_has_any_pt_file(model_dir: &Path) -> bool {
+    model_dir_has_ext(model_dir, "pt")
+}
+
+/// A TensorFlow SavedModel directory: `saved_model.pb` plus a `variables/` dir.
+fn dir_is_saved_model(model_dir: &Path) -> bool {
+    model_dir.join("saved_model.pb").is_file() && model_dir.join("variables").is_dir()
 }
 
 pub fn detect_backend_kind(
@@ -494,14 +703,16 @@ pub fn detect_backend_kind(
     model_name: &str,
     declared: Option<ConfiguredBackend>,
 ) -> Result<DetectedBackendKind, Status> {
+    let has_textproto = model_dir.join("model_inference.textproto").is_file();
     let has_python =
         model_dir.join("main.py").is_file() && model_dir.join("requirements.txt").is_file();
-    let has_rust = model_dir.join("model_inference.textproto").is_file()
-        && model_dir_has_any_pt_file(model_dir);
+    let has_rust = has_textproto && model_dir_has_any_pt_file(model_dir);
+    let has_onnx = has_textproto && model_dir_has_ext(model_dir, "onnx");
+    let has_tf = has_textproto && dir_is_saved_model(model_dir);
 
     // An explicit `backend` in nereid.yaml decides the kind and disambiguates a
-    // folder holding files for both (e.g. a `.pt` alongside `main.py`); we only
-    // verify the chosen backend's own required files are present.
+    // folder holding files for more than one; we only verify the chosen
+    // backend's own required files are present.
     if let Some(declared) = declared {
         return match declared {
             ConfiguredBackend::Python if has_python => Ok(DetectedBackendKind::Python),
@@ -512,18 +723,66 @@ pub fn detect_backend_kind(
             ConfiguredBackend::Rust => Err(Status::failed_precondition(format!(
                 "model '{model_name}' declares backend \"rust\" but is missing a .pt model + model_inference.textproto"
             ))),
+            ConfiguredBackend::Onnx if has_onnx => Ok(DetectedBackendKind::Onnx),
+            ConfiguredBackend::Onnx => Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"onnx\" but is missing a .onnx model + model_inference.textproto"
+            ))),
+            ConfiguredBackend::Tensorflow if has_tf => Ok(DetectedBackendKind::Tensorflow),
+            ConfiguredBackend::Tensorflow => Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"tensorflow\" but is missing a SavedModel (saved_model.pb + variables/) + model_inference.textproto"
+            ))),
         };
     }
 
-    match (has_python, has_rust) {
-        (true, true) => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder contains both a Python backend (main.py + requirements.txt) and a Rust backend (a .pt model + model_inference.textproto); set `backend` in nereid.yaml to disambiguate"
+    // Auto-detect: exactly one backend's files must be present.
+    let mut present = Vec::new();
+    if has_python {
+        present.push(DetectedBackendKind::Python);
+    }
+    if has_rust {
+        present.push(DetectedBackendKind::Rust);
+    }
+    if has_onnx {
+        present.push(DetectedBackendKind::Onnx);
+    }
+    if has_tf {
+        present.push(DetectedBackendKind::Tensorflow);
+    }
+
+    match present.len() {
+        1 => Ok(present[0]),
+        0 => Err(Status::failed_precondition(format!(
+            "model '{model_name}' folder must contain exactly one backend's files: (main.py + requirements.txt), (a .pt model + model_inference.textproto), (a .onnx model + model_inference.textproto), or (a SavedModel + model_inference.textproto)"
         ))),
-        (false, false) => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder must contain either (main.py + requirements.txt) or (a .pt model + model_inference.textproto)"
+        _ => Err(Status::failed_precondition(format!(
+            "model '{model_name}' folder contains files for multiple backends ({present:?}); set `backend` in nereid.yaml to disambiguate"
         ))),
-        (true, false) => Ok(DetectedBackendKind::Python),
-        (false, true) => Ok(DetectedBackendKind::Rust),
+    }
+}
+
+pub fn find_exactly_one_onnx_file(model_dir: &Path) -> Result<PathBuf, Status> {
+    let entries = fs::read_dir(model_dir)
+        .map_err(|err| Status::internal(format!("failed to read model directory: {err}")))?;
+
+    let mut onnx_files = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| Status::internal(format!("failed to read model entry: {err}")))?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "onnx") {
+            onnx_files.push(path);
+        }
+    }
+
+    onnx_files.sort();
+    match onnx_files.len() {
+        1 => Ok(onnx_files.remove(0)),
+        0 => Err(Status::failed_precondition(
+            "model must contain exactly one .onnx file; found none",
+        )),
+        count => Err(Status::failed_precondition(format!(
+            "model must contain exactly one .onnx file; found {count}"
+        ))),
     }
 }
 

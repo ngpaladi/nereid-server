@@ -12,6 +12,24 @@ tch = { version = "0.18.1", features = ["download-libtorch"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 
+# Native inference runtimes, each opt-in behind a feature so the default build
+# stays tch-only (see `[features]`). `ort` links ONNX Runtime (downloads it by
+# default); `tensorflow` links libtensorflow for SavedModel inference.
+ort = { version = "2.0.0-rc.12", optional = true, features = ["cuda", "half"] }
+tensorflow = { version = "0.21.0", optional = true }
+# 2-byte float element types (FP16/BF16) for the native backends.
+half = { version = "2", optional = true }
+
+[features]
+# Opt-in native backends. Neither is on by default; enable with
+# `cargo build --features onnx` / `--features tensorflow` (or `./build.sh --onnx`).
+onnx = ["dep:ort", "dep:half"]
+tensorflow = ["dep:tensorflow", "dep:half"]
+# GPU-enabled TensorFlow (links the libtensorflow GPU build). ONNX GPU needs no
+# separate feature — ort's CUDA execution provider is compiled in and selected at
+# runtime when a model's device is `cuda`.
+tensorflow-gpu = ["tensorflow", "tensorflow/tensorflow_gpu"]
+
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3"
