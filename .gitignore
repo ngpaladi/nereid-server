@@ -40,3 +40,5 @@ __pycache__/
 
 # Local runtime config files
 /nereid.yaml
+# MkDocs build output
+/site

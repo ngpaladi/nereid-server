@@ -1,0 +1,4 @@
+# Dependencies for building the documentation site (see mkdocs.yml).
+#   mkdocs build --strict     # from the repo root
+mkdocs-terminal
+pymdown-extensions
