@@ -1,6 +1,3 @@
-//! ONNX backend, via ONNX Runtime (`ort`). In-process; the CUDA execution
-//! provider is selected when the model's device is `cuda`.
-
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -11,9 +8,9 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::value::{DynValue, TensorElementType, Value};
 use tonic::Status;
 
-use super::Tensor;
-use super::native_common::{bytes_to_vec, dispatch_dtype, slice_to_bytes};
-use super::{Backend, Contract};
+use crate::backend::Tensor;
+use crate::backend::native_common::{bytes_to_vec, dispatch_dtype, slice_to_bytes};
+use crate::backend::{Backend, Contract};
 use crate::config::ModelConfig;
 
 pub struct OnnxBackend {

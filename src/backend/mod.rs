@@ -6,16 +6,14 @@
 
 pub mod contract;
 
+// Shared tensor helpers for the in-process native backends. `pub(crate)` so the
+// backend modules (which live under `crate::backends`) can reach them.
 #[cfg(any(feature = "onnx", feature = "tensorflow"))]
-mod native_common;
-#[cfg(feature = "onnx")]
-mod onnx;
-#[cfg(feature = "python")]
-mod python;
-#[cfg(feature = "tensorflow")]
-mod tensorflow;
-#[cfg(feature = "torch")]
-mod torch;
+pub(crate) mod native_common;
+
+// The backends themselves live one folder each under `src/backends/` and are
+// discovered by build.rs — see `crate::backends`. They self-register into the
+// registry below, so nothing here enumerates them.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,7 +22,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tonic::Status;
 
-use crate::config::{ConfiguredBackend, ServerConfig};
+use crate::config::{ModelConfig, ServerConfig};
 use crate::proto::{CheckpointResponse, TensorChunk};
 
 pub use contract::{Contract, TensorSpec};
@@ -117,8 +115,9 @@ impl ModelManager {
                 )));
             }
 
-            let kind = detect_backend(&model_dir, &model_cfg.name, model_cfg.backend)?;
-            let (backend, contract) = load_backend(kind, &model_dir, model_cfg)?;
+            let registration =
+                detect_backend(&model_dir, &model_cfg.name, model_cfg.backend.as_deref())?;
+            let (backend, contract) = (registration.load)(&model_dir, model_cfg)?;
 
             model_names.push(model_cfg.name.clone());
             entries.insert(
@@ -302,16 +301,44 @@ async fn stream_outputs(
         .await;
 }
 
-/// Which backend a model uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BackendKind {
-    Torch,
-    Python,
-    Onnx,
-    Tensorflow,
+/// A backend's loader: file path + model config in, a boxed backend plus its
+/// parsed contract out (or a missing-feature error when the engine is off).
+pub type LoadFn = fn(&Path, &ModelConfig) -> Result<(Box<dyn Backend>, Contract), Status>;
+
+/// A backend's self-registration, collected at link time via [`inventory`]. Each
+/// backend module `submit!`s exactly one of these, so the core never enumerates
+/// backends — it iterates the registrations. Every field is always compiled (no
+/// backend dependency), so the registry is complete even for backends whose
+/// engine feature is off; `load` then returns a "rebuild with --features" error.
+pub struct BackendRegistration {
+    /// The `backend:` value in `nereid.yaml` (and the Cargo feature that
+    /// provides this backend).
+    pub name: &'static str,
+    /// Additional accepted `backend:` spellings (e.g. deprecated aliases).
+    pub aliases: &'static [&'static str],
+    /// A one-line description of the folder shape, for the ambiguity/no-match
+    /// errors.
+    pub describes: &'static str,
+    /// Whether the backend can be auto-detected from folder contents. A backend
+    /// whose code is compiled into the server (no on-disk signature) sets this
+    /// `false` and is selectable only via an explicit `backend:` declaration.
+    pub auto_detect: bool,
+    /// File-signature detection — pure inspection, no backend dependency.
+    pub detect: fn(&Path) -> bool,
+    /// Load the model, or return a missing-feature error when this backend's
+    /// feature is not compiled in.
+    pub load: LoadFn,
 }
 
-fn dir_has_ext(model_dir: &Path, ext: &str) -> bool {
+inventory::collect!(BackendRegistration);
+
+fn registrations() -> impl Iterator<Item = &'static BackendRegistration> {
+    inventory::iter::<BackendRegistration>()
+}
+
+/// Shared file-signature helpers, used by the backends' `detect` predicates
+/// (which live under `crate::backends`), hence `pub(crate)`.
+pub(crate) fn dir_has_ext(model_dir: &Path, ext: &str) -> bool {
     std::fs::read_dir(model_dir)
         .map(|entries| {
             entries
@@ -321,118 +348,68 @@ fn dir_has_ext(model_dir: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn dir_is_saved_model(model_dir: &Path) -> bool {
+pub(crate) fn dir_is_saved_model(model_dir: &Path) -> bool {
     model_dir.join("saved_model.pb").is_file() && model_dir.join("variables").is_dir()
 }
 
-/// Detect the backend from folder contents, honouring an explicit `backend:`.
-/// Detection is pure file inspection (always compiled); whether the backend is
-/// actually built in is checked at `load`.
+/// Pick the backend for a model: the explicitly-declared one, else the single
+/// auto-detected match. Consults only the registry, so it never names a specific
+/// backend — new backends slot in by registering.
 fn detect_backend(
     model_dir: &Path,
     model_name: &str,
-    declared: Option<ConfiguredBackend>,
-) -> Result<BackendKind, Status> {
-    let has_textproto = model_dir.join("model_inference.textproto").is_file();
-    let has_python =
-        model_dir.join("main.py").is_file() && model_dir.join("requirements.txt").is_file();
-    let has_torch = has_textproto && dir_has_ext(model_dir, "pt");
-    let has_onnx = has_textproto && dir_has_ext(model_dir, "onnx");
-    let has_tf = has_textproto && dir_is_saved_model(model_dir);
-
+    declared: Option<&str>,
+) -> Result<&'static BackendRegistration, Status> {
     if let Some(declared) = declared {
-        return match declared {
-            ConfiguredBackend::Python if has_python => Ok(BackendKind::Python),
-            ConfiguredBackend::Python => Err(Status::failed_precondition(format!(
-                "model '{model_name}' declares backend \"python\" but is missing main.py + requirements.txt"
-            ))),
-            ConfiguredBackend::Torch if has_torch => Ok(BackendKind::Torch),
-            ConfiguredBackend::Torch => Err(Status::failed_precondition(format!(
-                "model '{model_name}' declares backend \"torch\" but is missing a .pt model + model_inference.textproto"
-            ))),
-            ConfiguredBackend::Onnx if has_onnx => Ok(BackendKind::Onnx),
-            ConfiguredBackend::Onnx => Err(Status::failed_precondition(format!(
-                "model '{model_name}' declares backend \"onnx\" but is missing a .onnx model + model_inference.textproto"
-            ))),
-            ConfiguredBackend::Tensorflow if has_tf => Ok(BackendKind::Tensorflow),
-            ConfiguredBackend::Tensorflow => Err(Status::failed_precondition(format!(
-                "model '{model_name}' declares backend \"tensorflow\" but is missing a SavedModel (saved_model.pb + variables/) + model_inference.textproto"
-            ))),
-        };
+        let registration = registrations()
+            .find(|r| r.name == declared || r.aliases.contains(&declared))
+            .ok_or_else(|| {
+                let known: Vec<&str> = registrations().map(|r| r.name).collect();
+                Status::failed_precondition(format!(
+                    "model '{model_name}' declares unknown backend \"{declared}\"; \
+                 known backends: {}",
+                    known.join(", ")
+                ))
+            })?;
+        if registration.auto_detect && !(registration.detect)(model_dir) {
+            return Err(Status::failed_precondition(format!(
+                "model '{model_name}' declares backend \"{declared}\" but its folder is not {}",
+                registration.describes
+            )));
+        }
+        return Ok(registration);
     }
 
-    let mut present = Vec::new();
-    if has_python {
-        present.push(BackendKind::Python);
-    }
-    if has_torch {
-        present.push(BackendKind::Torch);
-    }
-    if has_onnx {
-        present.push(BackendKind::Onnx);
-    }
-    if has_tf {
-        present.push(BackendKind::Tensorflow);
-    }
-    match present.len() {
-        1 => Ok(present[0]),
-        0 => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder must contain exactly one backend's files: (main.py + requirements.txt), (a .pt model + model_inference.textproto), (a .onnx model + model_inference.textproto), or (a SavedModel + model_inference.textproto)"
-        ))),
-        _ => Err(Status::failed_precondition(format!(
-            "model '{model_name}' folder contains files for multiple backends ({present:?}); set `backend` in nereid.yaml to disambiguate"
-        ))),
-    }
-}
-
-/// Load the detected backend, or fail with a clear "rebuild with --features"
-/// message when the backend isn't compiled in.
-#[cfg_attr(
-    not(any(
-        feature = "torch",
-        feature = "python",
-        feature = "onnx",
-        feature = "tensorflow"
-    )),
-    allow(unused_variables)
-)]
-fn load_backend(
-    kind: BackendKind,
-    model_dir: &Path,
-    model_cfg: &crate::config::ModelConfig,
-) -> Result<(Box<dyn Backend>, Contract), Status> {
-    match kind {
-        #[cfg(feature = "torch")]
-        BackendKind::Torch => torch::TorchBackend::load(model_dir, model_cfg),
-        #[cfg(not(feature = "torch"))]
-        BackendKind::Torch => Err(missing_feature(
-            &model_cfg.name,
-            "TorchScript (.pt)",
-            "torch",
-        )),
-        #[cfg(feature = "python")]
-        BackendKind::Python => python::PythonBackend::load(model_dir, model_cfg),
-        #[cfg(not(feature = "python"))]
-        BackendKind::Python => Err(missing_feature(
-            &model_cfg.name,
-            "Python (main.py)",
-            "python",
-        )),
-        #[cfg(feature = "onnx")]
-        BackendKind::Onnx => onnx::OnnxBackend::load(model_dir, model_cfg),
-        #[cfg(not(feature = "onnx"))]
-        BackendKind::Onnx => Err(missing_feature(&model_cfg.name, "ONNX", "onnx")),
-        #[cfg(feature = "tensorflow")]
-        BackendKind::Tensorflow => tensorflow::TensorflowBackend::load(model_dir, model_cfg),
-        #[cfg(not(feature = "tensorflow"))]
-        BackendKind::Tensorflow => {
-            Err(missing_feature(&model_cfg.name, "TensorFlow", "tensorflow"))
+    let matches: Vec<&BackendRegistration> = registrations()
+        .filter(|r| r.auto_detect && (r.detect)(model_dir))
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(only),
+        [] => {
+            let shapes: Vec<&str> = registrations()
+                .filter(|r| r.auto_detect)
+                .map(|r| r.describes)
+                .collect();
+            Err(Status::failed_precondition(format!(
+                "model '{model_name}' folder must match exactly one backend, one of: {}",
+                shapes.join("; ")
+            )))
+        }
+        many => {
+            let names: Vec<&str> = many.iter().map(|r| r.name).collect();
+            Err(Status::failed_precondition(format!(
+                "model '{model_name}' folder matches multiple backends ({}); set `backend` in nereid.yaml to disambiguate",
+                names.join(", ")
+            )))
         }
     }
 }
 
+/// The "rebuild with --features" error a backend's `load` returns when its
+/// engine feature is off. Kept in the core so every backend phrases it the same.
+/// (Unused when every backend feature is enabled — no `load` hits its off-arm.)
 #[allow(dead_code)]
-fn missing_feature(model_name: &str, what: &str, feature: &str) -> Status {
+pub(crate) fn missing_feature(model_name: &str, what: &str, feature: &str) -> Status {
     Status::failed_precondition(format!(
         "model '{model_name}' is a {what} model, but this server was built without that backend. \
          Rebuild with `--features {feature}` (or `./build.sh --{feature}`)."
@@ -441,7 +418,7 @@ fn missing_feature(model_name: &str, what: &str, feature: &str) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendKind, detect_backend};
+    use super::detect_backend;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -462,8 +439,10 @@ mod tests {
         fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
 
         assert_eq!(
-            detect_backend(&base, "model", None).expect("should detect python"),
-            BackendKind::Python
+            detect_backend(&base, "model", None)
+                .expect("should detect python")
+                .name,
+            "python"
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -480,9 +459,22 @@ mod tests {
         fs::write(base.join("model.pt"), b"x").expect("write model.pt");
 
         assert_eq!(
-            detect_backend(&base, "model", None).expect("should detect torch"),
-            BackendKind::Torch
+            detect_backend(&base, "model", None)
+                .expect("should detect torch")
+                .name,
+            "torch"
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detect_backend_declared_unknown_is_rejected() {
+        let base = temp_dir("unknown");
+        fs::write(base.join("main.py"), b"print('hi')").expect("write main.py");
+        fs::write(base.join("requirements.txt"), b"numpy").expect("write requirements.txt");
+
+        assert!(detect_backend(&base, "model", Some("nope")).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }

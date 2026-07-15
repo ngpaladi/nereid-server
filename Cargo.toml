@@ -10,6 +10,9 @@ tonic-prost = "*"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+# Link-time backend registry: each backend `submit!`s itself so the core never
+# enumerates them (no central enum or match). See `backend::registry`.
+inventory = "0.3"
 
 # Every inference backend is optional and selected by a Cargo feature, so you
 # build only the ones you want (see `[features]`). `tch` links libtorch for the

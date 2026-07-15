@@ -36,12 +36,14 @@ pub struct ModelConfig {
     )]
     pub device: ModelDevice,
     pub queue_capacity: usize,
-    /// Optional explicit backend selector. When set, it decides the model's
-    /// backend (and disambiguates a folder that contains files for more than one
-    /// — e.g. a `.pt` alongside `main.py`). When absent, the backend is
-    /// auto-detected from the folder contents.
+    /// Optional explicit backend selector — the `name` a backend registers under
+    /// (e.g. `"torch"`, `"onnx"`). When set, it decides the model's backend (and
+    /// disambiguates a folder that contains files for more than one — e.g. a
+    /// `.pt` alongside `main.py`). When absent, the backend is auto-detected from
+    /// the folder contents. Validated against the backend registry at load time,
+    /// so adding a backend needs no change here.
     #[serde(default)]
-    pub backend: Option<ConfiguredBackend>,
+    pub backend: Option<String>,
     /// TensorFlow SavedModel signature key. Only meaningful for the `tensorflow`
     /// backend; defaults to `"serving_default"` when absent.
     #[serde(default)]
@@ -54,33 +56,6 @@ impl ModelConfig {
     #[cfg_attr(not(feature = "tensorflow"), allow(dead_code))]
     pub fn tf_signature(&self) -> &str {
         self.signature.as_deref().unwrap_or("serving_default")
-    }
-}
-
-/// An explicitly-declared backend kind in `nereid.yaml` (e.g. `backend: "onnx"`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConfiguredBackend {
-    Python,
-    Torch,
-    Onnx,
-    Tensorflow,
-}
-
-impl<'de> Deserialize<'de> for ConfiguredBackend {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        match String::deserialize(deserializer)?.as_str() {
-            "python" => Ok(ConfiguredBackend::Python),
-            // "torch" is the canonical name; "rust" is a deprecated alias.
-            "torch" | "rust" => Ok(ConfiguredBackend::Torch),
-            "onnx" => Ok(ConfiguredBackend::Onnx),
-            "tensorflow" => Ok(ConfiguredBackend::Tensorflow),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid backend '{other}': expected \"python\", \"torch\", \"onnx\", or \"tensorflow\""
-            ))),
-        }
     }
 }
 

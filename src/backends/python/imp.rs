@@ -1,8 +1,3 @@
-//! Python (`main.py`) backend. Each model runs in a per-model virtualenv (built
-//! at startup from `requirements.txt`) as a subprocess per request, over the
-//! stdin / framed-`NEREID_OUTPUT_PATH` tensor contract. Out of process, so a
-//! crash in the model is contained.
-
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +8,7 @@ use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use super::{Backend, CheckpointStream, Contract, Tensor};
+use crate::backend::{Backend, CheckpointStream, Contract, Tensor};
 use crate::config::ModelConfig;
 use crate::proto::{CheckpointResponse, TensorChunk};
 
