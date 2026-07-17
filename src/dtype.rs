@@ -52,46 +52,6 @@ pub fn canonical_to_kserve(canonical: &str) -> Option<(&'static str, usize)> {
     })
 }
 
-/// The libtorch tensor kind for a canonical dtype name, for the Rust `.pt`
-/// inference path. `None` for names libtorch has no distinct kind for
-/// (`uint16`/`uint32`/`uint64`), which the Rust path therefore cannot serve.
-pub fn kind_from_canonical(canonical: &str) -> Option<tch::Kind> {
-    use tch::Kind::*;
-    Some(match canonical {
-        "bool" => Bool,
-        "uint8" => Uint8,
-        "int8" => Int8,
-        "int16" => Int16,
-        "int32" => Int,
-        "int64" => Int64,
-        "float16" => Half,
-        "float32" => Float,
-        "float64" => Double,
-        "bfloat16" => BFloat16,
-        _ => return None,
-    })
-}
-
-/// Inverse of [`kind_from_canonical`]: the canonical dtype name for a libtorch
-/// kind (used to label a Rust model's output tensor). `None` for kinds outside
-/// the supported set.
-pub fn canonical_from_kind(kind: tch::Kind) -> Option<&'static str> {
-    use tch::Kind::*;
-    Some(match kind {
-        Bool => "bool",
-        Uint8 => "uint8",
-        Int8 => "int8",
-        Int16 => "int16",
-        Int => "int32",
-        Int64 => "int64",
-        Half => "float16",
-        Float => "float32",
-        Double => "float64",
-        BFloat16 => "bfloat16",
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{canonical_to_kserve, kserve_fixed_width};

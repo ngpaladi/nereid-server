@@ -1,19 +1,14 @@
 // Parses and validates the server YAML configuration.
-// Defines server/model config types, maps configured devices to `tch::Device`,
-// and enforces basic checks (required fields, non-empty names, unique model names,
-// and positive queue capacity).
+// Defines the backend-agnostic server/model config types (device resolution and
+// any backend-specific handling live in the `backend` modules) and enforces
+// basic checks (required fields, non-empty names, unique model names, and
+// positive queue capacity).
 
 use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::ffi::CString;
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 
 use serde::Deserialize;
-use tch::{Cuda, Device};
-use tonic::Status;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,22 +28,42 @@ pub struct ServerSection {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub name: String,
+    // Read by the device-aware backends (torch/onnx/tensorflow); a build with
+    // only the Python backend never consults it.
+    #[cfg_attr(
+        not(any(feature = "torch", feature = "onnx", feature = "tensorflow")),
+        allow(dead_code)
+    )]
     pub device: ModelDevice,
     pub queue_capacity: usize,
     /// Optional explicit backend selector. When set, it decides the model's
-    /// backend (and disambiguates a folder that contains files for both — e.g.
-    /// a `.pt` alongside `main.py`). When absent, the backend is auto-detected
-    /// from the folder contents.
+    /// backend (and disambiguates a folder that contains files for more than one
+    /// — e.g. a `.pt` alongside `main.py`). When absent, the backend is
+    /// auto-detected from the folder contents.
     #[serde(default)]
     pub backend: Option<ConfiguredBackend>,
+    /// TensorFlow SavedModel signature key. Only meaningful for the `tensorflow`
+    /// backend; defaults to `"serving_default"` when absent.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "tensorflow"), allow(dead_code))]
+    pub signature: Option<String>,
 }
 
-/// An explicitly-declared backend kind in `nereid.yaml` (`backend: "python"` or
-/// `backend: "rust"`).
+impl ModelConfig {
+    /// The TensorFlow signature to serve, defaulting to `"serving_default"`.
+    #[cfg_attr(not(feature = "tensorflow"), allow(dead_code))]
+    pub fn tf_signature(&self) -> &str {
+        self.signature.as_deref().unwrap_or("serving_default")
+    }
+}
+
+/// An explicitly-declared backend kind in `nereid.yaml` (e.g. `backend: "onnx"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfiguredBackend {
     Python,
-    Rust,
+    Torch,
+    Onnx,
+    Tensorflow,
 }
 
 impl<'de> Deserialize<'de> for ConfiguredBackend {
@@ -58,9 +73,12 @@ impl<'de> Deserialize<'de> for ConfiguredBackend {
     {
         match String::deserialize(deserializer)?.as_str() {
             "python" => Ok(ConfiguredBackend::Python),
-            "rust" => Ok(ConfiguredBackend::Rust),
+            // "torch" is the canonical name; "rust" is a deprecated alias.
+            "torch" | "rust" => Ok(ConfiguredBackend::Torch),
+            "onnx" => Ok(ConfiguredBackend::Onnx),
+            "tensorflow" => Ok(ConfiguredBackend::Tensorflow),
             other => Err(serde::de::Error::custom(format!(
-                "invalid backend '{other}': expected \"python\" or \"rust\""
+                "invalid backend '{other}': expected \"python\", \"torch\", \"onnx\", or \"tensorflow\""
             ))),
         }
     }
@@ -95,73 +113,17 @@ impl<'de> Deserialize<'de> for ModelDevice {
 }
 
 impl ModelDevice {
-    pub fn to_tch_device(self) -> Result<Device, Status> {
+    /// The CUDA device index for GPU-capable backends, or `None` for CPU. Device
+    /// resolution and any libtorch/CUDA availability checks live in each backend
+    /// module (e.g. `backend::torch`), keeping this core config type
+    /// backend-agnostic.
+    #[cfg_attr(not(any(feature = "onnx", feature = "tensorflow")), allow(dead_code))]
+    pub fn cuda_index(self) -> Option<usize> {
         match self {
-            Self::Cpu => Ok(Device::Cpu),
-            Self::Cuda(index) => {
-                preload_libtorch_cuda();
-
-                if !Cuda::is_available() {
-                    return Err(Status::failed_precondition(
-                        "CUDA model configured but CUDA is not available",
-                    ));
-                }
-
-                let device_count = Cuda::device_count();
-                if i64::try_from(index).unwrap_or(i64::MAX) >= device_count {
-                    return Err(Status::failed_precondition(format!(
-                        "cuda device index {index} is out of range; {device_count} CUDA device(s) available"
-                    )));
-                }
-
-                Ok(Device::Cuda(index))
-            }
+            Self::Cpu => None,
+            Self::Cuda(index) => Some(index),
         }
     }
-}
-
-fn preload_libtorch_cuda() {
-    #[cfg(target_os = "linux")]
-    {
-        for library in ["libc10_cuda.so", "libtorch_cuda.so"] {
-            if let Err(err) = dlopen_library(library) {
-                eprintln!("failed to preload {library}: {err}");
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn dlopen_library(library: &str) -> Result<(), String> {
-    const RTLD_NOW: c_int = 2;
-    const RTLD_GLOBAL: c_int = 0x100;
-
-    let path = CString::new(library).map_err(|err| err.to_string())?;
-    let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
-    if handle.is_null() {
-        Err(dlopen_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn dlopen_error() -> String {
-    let error = unsafe { dlerror() };
-    if error.is_null() {
-        "unknown dlopen error".to_owned()
-    } else {
-        unsafe { std::ffi::CStr::from_ptr(error) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
-    fn dlerror() -> *const c_char;
 }
 
 pub fn load_server_config(path: &Path) -> Result<ServerConfig, Box<dyn std::error::Error>> {

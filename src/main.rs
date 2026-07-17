@@ -1,23 +1,20 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, transport::Server};
 
+mod backend;
 mod config;
 mod dtype;
-mod inference;
-mod model_runtime;
-mod python_backend;
 mod triton;
 
+use backend::{Contract, ModelManager, Tensor};
 use config::load_server_config;
-use model_runtime::{InputShapeContract, ModelManager, tensor_from_input_bytes};
 use proto::grpc_inference_service_server::GrpcInferenceServiceServer;
 use proto::nereid_server::{Nereid, NereidServer};
 use proto::{
-    CheckpointRequest, CheckpointResponse, HealthCheckRequest, HealthCheckResponse, TensorChunk,
-    ViewModelsRequest, ViewModelsResponse, checkpoint_request::Payload,
+    CheckpointRequest, HealthCheckRequest, HealthCheckResponse, ViewModelsRequest,
+    ViewModelsResponse, checkpoint_request::Payload,
 };
 use triton::TritonService;
 
@@ -25,88 +22,20 @@ pub mod proto {
     tonic::include_proto!("inference");
 }
 
-type CheckpointStream =
-    tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
-
-fn output_to_stream(
-    model_name: &str,
-    output_shape: Vec<i64>,
-    output_bytes: Vec<u8>,
-) -> CheckpointStream {
-    const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
-
-    let num_chunks = output_bytes.len().div_ceil(OUTPUT_CHUNK_BYTES);
-    let response_capacity = usize::max(2, num_chunks + 2);
-    let (tx, rx) = mpsc::channel::<Result<CheckpointResponse, Status>>(response_capacity);
-
-    let model_name = model_name.to_string();
-    tokio::spawn(async move {
-        let _ = tx
-            .send(Ok(CheckpointResponse {
-                chunk: format!("Rust inference completed for model '{model_name}'"),
-                done: false,
-                exit_code: 0,
-                output_chunk: None,
-            }))
-            .await;
-
-        if output_bytes.is_empty() {
-            let _ = tx
-                .send(Ok(CheckpointResponse {
-                    chunk: String::new(),
-                    done: false,
-                    exit_code: 0,
-                    output_chunk: Some(TensorChunk {
-                        tensor_name: "output".to_string(),
-                        shape: output_shape.clone(),
-                        data: Vec::new(),
-                        chunk_index: 0,
-                        end_of_tensor: true,
-                    }),
-                }))
-                .await;
-        } else {
-            for (chunk_index, data_chunk) in output_bytes.chunks(OUTPUT_CHUNK_BYTES).enumerate() {
-                let _ = tx
-                    .send(Ok(CheckpointResponse {
-                        chunk: String::new(),
-                        done: false,
-                        exit_code: 0,
-                        output_chunk: Some(TensorChunk {
-                            tensor_name: "output".to_string(),
-                            shape: output_shape.clone(),
-                            data: data_chunk.to_vec(),
-                            chunk_index: chunk_index as u64,
-                            end_of_tensor: chunk_index + 1 == num_chunks,
-                        }),
-                    }))
-                    .await;
-            }
-        }
-
-        let _ = tx
-            .send(Ok(CheckpointResponse {
-                chunk: String::new(),
-                done: true,
-                exit_code: 0,
-                output_chunk: None,
-            }))
-            .await;
-    });
-
-    tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)
-}
+type CheckpointStream = backend::CheckpointStream;
 
 /// Drain the tensor chunks of a checkpoint stream, validating each chunk's shape
-/// against `contract` and reassembling the data. Returns the concatenated
-/// little-endian float32 bytes and the effective (batch-normalized) request
-/// shape. Shared by the Rust inference path and the Python path (when a Python
-/// model declares an input contract).
+/// against the model's `contract` and reassembling the data into the single
+/// float32 input tensor. The `Checkpoint` wire contract is little-endian float32;
+/// a request that omits the declared batch dimension is expanded to batch 1.
 async fn collect_input_tensor(
     stream: &mut tonic::Streaming<CheckpointRequest>,
-    contract: &InputShapeContract,
+    contract: &Contract,
     model_name: &str,
-) -> Result<(Vec<u8>, Vec<i64>), Status> {
+) -> Result<Tensor, Status> {
+    let spec = contract.inputs.first().ok_or_else(|| {
+        Status::internal(format!("model '{model_name}' has no declared input tensor"))
+    })?;
     let mut tensor_bytes = Vec::<u8>::new();
     let mut request_shape = None::<Vec<i64>>;
     let mut seen_end_of_tensor = false;
@@ -135,7 +64,7 @@ async fn collect_input_tensor(
                     return Err(Status::invalid_argument("tensor chunk shape is required"));
                 }
 
-                contract.validate_request_shape(&chunk.shape, model_name)?;
+                contract.validate_input_shape(spec, &chunk.shape, model_name)?;
 
                 match &request_shape {
                     Some(shape) if shape != &chunk.shape => {
@@ -159,8 +88,13 @@ async fn collect_input_tensor(
         request_shape.ok_or_else(|| Status::invalid_argument("no tensor chunks provided"))?;
     // A request that omits the model's declared batch dimension is expanded to
     // batch size 1 before inference.
-    let request_shape = contract.normalize_request_shape(request_shape);
-    Ok((tensor_bytes, request_shape))
+    let request_shape = contract.normalize_request_shape(spec, request_shape);
+    Ok(Tensor {
+        name: "input".to_string(),
+        shape: request_shape,
+        dtype: "float32".to_string(),
+        data: tensor_bytes,
+    })
 }
 
 #[derive(Clone)]
@@ -231,79 +165,30 @@ impl Nereid for NereidService {
             return Err(Status::invalid_argument("model_name is required"));
         }
 
-        if let Some(model_dir) = self.model_manager.python_model_dir(&model_name) {
-            // Every Python model has a required contract declaring output_shape.
-            // When it also declares input_shape, the validated tensor is piped
-            // in on stdin; otherwise the request stream is drained and no tensor
-            // is sent. Either way, main.py replies with a typed output tensor.
-            let contract = self
-                .model_manager
-                .input_contract(&model_name)
-                .ok_or_else(|| {
-                    Status::internal(format!(
-                        "Python model '{model_name}' is missing its contract"
-                    ))
-                })?
-                .clone();
-
-            let (input, expected_batch) = if contract.has_input() {
-                let (bytes, shape) =
-                    collect_input_tensor(&mut stream, &contract, &model_name).await?;
-                let batch = if contract.max_batch_size() > 0 {
-                    shape.first().copied()
-                } else {
-                    None
-                };
-                (
-                    Some(python_backend::PythonInput {
-                        shape,
-                        bytes,
-                        dtype: "float32".to_string(),
-                    }),
-                    batch,
-                )
-            } else {
-                tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
-                (None, None)
-            };
-
-            let python_stream = python_backend::spawn_python_checkpoint_stream(
-                &model_name,
-                model_dir,
-                input,
-                contract,
-                expected_batch,
-            )?;
-            return Ok(Response::new(python_stream));
-        }
-
-        let input_contract = self
+        let contract = self
             .model_manager
-            .input_contract(&model_name)
+            .contract(&model_name)
+            .cloned()
             .ok_or_else(|| {
                 Status::not_found(format!(
                     "model '{model_name}' is not configured in nereid.yaml"
                 ))
-            })?
-            .clone();
+            })?;
 
-        let (tensor_bytes, request_shape) =
-            collect_input_tensor(&mut stream, &input_contract, &model_name).await?;
-        // The Checkpoint tensor contract is little-endian float32.
-        let input_tensor =
-            tensor_from_input_bytes(&tensor_bytes, &request_shape, &model_name, tch::Kind::Float)?;
-        let response_rx = self.model_manager.enqueue(&model_name, input_tensor)?;
-        let (output_shape, output_bytes, _dtype) = response_rx.await.map_err(|_| {
-            Status::internal(format!(
-                "worker response channel closed for model '{model_name}'"
-            ))
-        })??;
+        // When the model declares an input tensor, validate and reassemble it
+        // from the request stream; otherwise drain the (input-less) stream. The
+        // backend then streams its `Checkpoint` response (Python backends also
+        // interleave stdout/stderr log chunks).
+        let input = if contract.has_input() {
+            Some(collect_input_tensor(&mut stream, &contract, &model_name).await?)
+        } else {
+            tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
+            None
+        };
 
-        Ok(Response::new(output_to_stream(
-            &model_name,
-            output_shape,
-            output_bytes,
-        )))
+        Ok(Response::new(
+            self.model_manager.checkpoint(&model_name, input)?,
+        ))
     }
 }
 
@@ -356,16 +241,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod checkpoint_e2e_tests {
     use super::*;
     use crate::config::{ModelConfig, ModelDevice, ServerConfig, ServerSection};
-    use crate::inference::run_forward_pass;
     use proto::checkpoint_request::Payload;
     use proto::nereid_client::NereidClient;
     use proto::{CheckpointMeta, HealthCheckRequest, TensorChunk, ViewModelsRequest};
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tch::{CModule, Device, Tensor};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
+
+    /// Run a single-input/single-output `.pt` model's forward pass directly and
+    /// serialize its float32 output to little-endian bytes — the "expected"
+    /// oracle the server's streamed output is compared against.
+    fn direct_forward_f32(model_path: &Path, input: &[f32], shape: &[i64]) -> (Vec<i64>, Vec<u8>) {
+        let model = CModule::load_on_device(model_path.to_str().expect("utf-8 path"), Device::Cpu)
+            .expect("model should load");
+        let input_tensor = Tensor::from_slice(input).reshape(shape);
+        let output = model
+            .forward_ts(&[input_tensor])
+            .expect("direct forward pass")
+            .to_device(Device::Cpu)
+            .contiguous();
+        let out_shape = output.size();
+        let numel = output.numel();
+        let mut bytes = vec![0u8; numel * 4];
+        output.reshape([-1]).copy_data_u8(&mut bytes, numel);
+        (out_shape, bytes)
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -424,6 +327,7 @@ mod checkpoint_e2e_tests {
             device: ModelDevice::Cpu,
             queue_capacity: 4,
             backend: None,
+            signature: None,
         }
     }
 
@@ -601,14 +505,8 @@ print('sum:', sum(values))
         let input_values: Vec<f32> = (0..16).map(|v| v as f32).collect();
 
         // Expected: load model3 and run the forward pass directly on CPU.
-        let model = CModule::load_on_device(
-            model_path.to_str().expect("valid UTF-8 model path"),
-            Device::Cpu,
-        )
-        .expect("model should load");
-        let input_tensor = Tensor::from_slice(&input_values).reshape([1, 16]);
-        let (expected_shape, expected_bytes, _dtype) =
-            run_forward_pass(&model, Device::Cpu, &input_tensor).expect("direct forward pass");
+        let (expected_shape, expected_bytes) =
+            direct_forward_f32(&model_path, &input_values, &[1, 16]);
 
         // Actual: same input through the full gRPC server.
         let addr = spawn_test_server(ml_backends, vec![cpu_model("model3")]).await;
