@@ -1053,6 +1053,64 @@ mod triton_e2e_tests {
         assert_eq!(got, expected, "cxxadd must compute input + 1");
     }
 
+    /// The C++ subprocess backend (feature `cpp`) serves the committed `cppadd`
+    /// model (`main.cpp`, `output = input + 1`) end to end over ModelInfer. The
+    /// server compiles `main.cpp` to a `model` executable on startup, then runs
+    /// it per request through the same `Backend` dispatch as every other engine.
+    /// Needs a C++ compiler on PATH.
+    #[cfg(feature = "cpp")]
+    #[tokio::test]
+    async fn cpp_model_infer_returns_input_plus_one() {
+        assert!(
+            fixtures_dir().join("cppadd").join("main.cpp").is_file(),
+            "cppadd fixture missing"
+        );
+        let input_values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let expected: Vec<f32> = input_values.iter().map(|v| v + 1.0).collect();
+
+        let addr = spawn_triton_server("cppadd").await;
+        let mut client = connect(addr).await;
+
+        let meta = client
+            .model_metadata(ModelMetadataRequest {
+                name: "cppadd".to_string(),
+                version: String::new(),
+            })
+            .await
+            .expect("model_metadata")
+            .into_inner();
+        assert_eq!(meta.platform, "cpp_subprocess");
+
+        let response = client
+            .model_infer(ModelInferRequest {
+                model_name: "cppadd".to_string(),
+                model_version: String::new(),
+                id: "cpp-1".to_string(),
+                parameters: Default::default(),
+                inputs: vec![InferInputTensor {
+                    name: "input".to_string(),
+                    datatype: FP32.to_string(),
+                    shape: vec![1, 4],
+                    parameters: Default::default(),
+                    contents: None,
+                }],
+                outputs: Vec::new(),
+                raw_input_contents: vec![f32_le_bytes(&input_values)],
+            })
+            .await
+            .expect("cpp model_infer should succeed")
+            .into_inner();
+
+        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.outputs[0].shape, vec![1, 4]);
+        let raw = &response.raw_output_contents[0];
+        let got: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, expected, "cppadd must compute input + 1");
+    }
+
     /// GPU smoke test: serve the ONNX `onnxadd` fixture on `device: cuda`, which
     /// drives ort's CUDA execution provider. Ignored by default (needs an NVIDIA
     /// GPU with a working CUDA + cuDNN stack); run with `--ignored`. A pass proves
