@@ -23,6 +23,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
@@ -70,7 +71,34 @@ pub fn unique_output_path(model_name: &str) -> PathBuf {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    std::env::temp_dir().join(format!("nereid-out-{safe}-{}-{n}.bin", std::process::id()))
+    scratch_dir().join(format!("nereid-out-{safe}-{}-{n}.bin", std::process::id()))
+}
+
+/// Where a model's output tensor is staged on its way back to the server.
+///
+/// The tensor is written and read once and then unlinked, so it has no business
+/// touching a disk-backed filesystem; `/dev/shm` is tmpfs, which keeps the whole
+/// round trip in page cache. Falls back to the platform temp dir when that isn't
+/// there (non-Linux, or a hardened container that removes it).
+///
+/// `$NEREID_SCRATCH_DIR` overrides both. That matters in containers: Docker
+/// gives `/dev/shm` only 64 MB by default, which a large enough output tensor
+/// will exhaust, and the failure surfaces as the model failing to write rather
+/// than as anything obviously about scratch space. Point it at a roomier
+/// directory (or raise `--shm-size`) if you serve big tensors.
+fn scratch_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Some(dir) = std::env::var_os("NEREID_SCRATCH_DIR") {
+            return PathBuf::from(dir);
+        }
+        let shm = PathBuf::from("/dev/shm");
+        if shm.is_dir() {
+            return shm;
+        }
+        std::env::temp_dir()
+    })
+    .clone()
 }
 
 /// Read a child pipe to EOF (so the process can't wedge on a full pipe),
