@@ -9,9 +9,9 @@ changes.
 The package, service name, RPC names, and message field numbers in `proto/grpc_service.proto` are
 vendored **verbatim** from
 [Triton's `grpc_service.proto`](https://github.com/triton-inference-server/common/blob/main/protobuf/grpc_service.proto),
-so the wire format is byte-compatible. This is **wire**-parity: models are still authored against
-nereid's own contracts (a `.pt` file, a `main.py`, a SavedModel, …), not Triton's model repository
-layout.
+so the wire format is byte-compatible. That's parity on the wire and nothing more: models are still
+written against nereid's own contracts (a `.pt` file, a `main.py`, a SavedModel, …), not against
+Triton's model repository layout.
 
 ## Implemented RPCs
 
@@ -29,10 +29,11 @@ and streaming `ModelStreamInfer`.
 
 ## Verifying compatibility
 
-Wire compatibility is established by a **stock `tritonclient`** built from Triton's own proto stubs
-— not nereid's vendored copy — so it's a genuine cross-implementation check, not a self-consistent
-round-trip. The committed checker `scripts/triton_compat_check.py` runs it across the example
-models:
+It would be easy to convince ourselves of compatibility by having nereid's own client talk to
+nereid's own server, but that only proves the two agree with each other. So the check uses a stock
+`tritonclient`, built from Triton's proto stubs rather than our vendored copy, which makes it a
+real cross-implementation test. The committed checker `scripts/triton_compat_check.py` runs it
+across the example models:
 
 ```bash
 pip install -r scripts/requirements.txt

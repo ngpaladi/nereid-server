@@ -15,10 +15,11 @@ cargo run          # reads ./nereid.yaml
 
 ## `./build.sh` — the libtorch-aware build driver
 
-`cargo build` links libtorch *dynamically* and leaves the binary needing `LD_LIBRARY_PATH` at
-runtime. `./build.sh` wraps `cargo build`, resolves the libtorch dependency, selects backends, and
-can produce a self-contained or statically linked binary. Run `./build.sh --help` for the full
-option list.
+`cargo build` links libtorch dynamically and hands you a binary that needs `LD_LIBRARY_PATH` set
+before it will run. That's fine on your laptop and a nuisance everywhere else, so `./build.sh`
+wraps `cargo build`: it works out where libtorch is coming from, selects your backends, and can
+produce a self-contained or statically linked binary. `./build.sh --help` has the full option
+list.
 
 ### Linking modes (`--link`)
 
@@ -61,8 +62,22 @@ In precedence order:
 cargo build --no-default-features --features onnx,tensorflow   # the same, via cargo
 ```
 
-`--backends <csv>` picks an exact set (turning off the `torch`+`python` defaults);
-`--onnx` / `--tensorflow` add on top. `--link bundled` bundles whichever runtimes are linked.
+`--backends <csv>` picks an exact set, which turns off the `torch`+`python` defaults, while
+`--onnx` / `--tensorflow` add to whatever is already selected. `--link bundled` bundles whichever
+runtimes ended up linked.
+
+Those are Cargo features, so they can only name backends that `Cargo.toml` already knows about. If
+you've dropped your own backend into `src/backends/` (or pointed a git submodule at one), there is
+no feature for it, so the build takes a second selection by name pattern instead — `$NEREID_BACKENDS`
+or a `backends.conf` file:
+
+```bash
+NEREID_BACKENDS="onnx,tensorflow" cargo build --no-default-features --features onnx,tensorflow
+NEREID_BACKENDS="!torch" ./build.sh          # everything discovered except torch
+```
+
+`*` matches any run of characters and a leading `!` excludes; unset means everything that was
+discovered. [Backends](backends.md#adding-your-own-backend) has the details.
 
 ### HPC & managed environments
 
@@ -77,8 +92,8 @@ Python.
 
 ## Running the built binary directly
 
-`cargo run` / `cargo test` set `LD_LIBRARY_PATH` for you, but a binary you run directly
-(`./target/debug/grpc-test`, a container, systemd) will hit:
+`cargo run` and `cargo test` set `LD_LIBRARY_PATH` for you, which is why this only bites once you
+run the binary yourself — from a container, from systemd, or just `./target/debug/grpc-test`:
 
 ```
 error while loading shared libraries: libtorch_cpu.so: cannot open shared object file
@@ -90,7 +105,7 @@ Fix it, cleanest first:
 2. Build `--link bundled` and run `dist/grpc-test/grpc-test` — the path is baked in.
 3. Set it yourself: `export LD_LIBRARY_PATH=<libtorch>/lib:$LD_LIBRARY_PATH`.
 
-A native-only build (`--backends onnx`) links no libtorch, so none of this applies to it.
+A native-only build (`--backends onnx`) links no libtorch at all, so none of this applies to it.
 
 ## Configure and run
 

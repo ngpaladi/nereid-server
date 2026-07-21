@@ -10,9 +10,9 @@ contain depends on the backend:
 | ONNX | `model_inference.textproto`, one `.onnx` file |
 | TensorFlow | `model_inference.textproto`, a SavedModel (`saved_model.pb` + `variables/`) |
 
-The backend is auto-detected from these contents. If a folder matches more than one (or none),
-set `backend:` in `nereid.yaml` to disambiguate; the declared backend is authoritative and only its
-own required files are checked.
+The server works out the backend from these contents. If a folder matches more than one of them (or
+none at all), set `backend:` in `nereid.yaml` to settle it; what you declare wins, and only that
+backend's own required files are checked.
 
 ## `model_inference.textproto`
 
@@ -58,8 +58,9 @@ to the model, so the `input {}` blocks must match the model's expected input ord
 
 ## Subprocess tensor contract
 
-The Python backend (and any subprocess backend) speaks one language-agnostic contract, so the model
-can be written in anything that can read stdin and write a file.
+The Python backend — and any other backend that runs a model as a child process — speaks one
+language-agnostic contract. Nothing about it is Python-specific, so a model can be written in
+anything that can read stdin and write a file.
 
 **Input (optional).** When `input_shape` is declared, the server validates the request tensor and
 delivers it to the process:
@@ -87,8 +88,9 @@ with open(os.environ["NEREID_OUTPUT_PATH"], "wb") as f:
     f.write(struct.pack("<%df" % len(result), *result))
 ```
 
-A subprocess model that exits `0` without writing a valid output tensor is a contract violation and
-the request fails.
+A model that exits `0` without writing a valid output tensor has broken the contract, so the
+request fails. Exiting cleanly is not the same as having produced an answer, and the server would
+otherwise have nothing to send back.
 
 ## `nereid.yaml`
 
