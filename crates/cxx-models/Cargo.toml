@@ -1,0 +1,11 @@
+[package]
+name = "cxx-models"
+version = "0.1.0"
+edition = "2021"
+description = "Compile-time C++ inference models for nereid-server, bridged with cxx."
+
+[dependencies]
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
