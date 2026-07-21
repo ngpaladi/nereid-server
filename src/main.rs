@@ -4,6 +4,10 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod backend;
+// The inference backends, discovered from `src/backends/` by build.rs. Declared
+// after `backend` (whose registry they populate); each self-registers, so this
+// is the only line that knows they exist.
+mod backends;
 mod config;
 mod dtype;
 mod triton;

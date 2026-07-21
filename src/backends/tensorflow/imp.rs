@@ -1,6 +1,3 @@
-//! TensorFlow backend, via libtensorflow SavedModels (`tensorflow` crate).
-//! In-process; single GPU selection via `device: cuda[:idx]`.
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -11,9 +8,9 @@ use tensorflow::{
 };
 use tonic::Status;
 
-use super::Tensor;
-use super::native_common::{bytes_to_vec, dispatch_dtype_tf, slice_to_bytes};
-use super::{Backend, Contract};
+use crate::backend::Tensor;
+use crate::backend::native_common::{bytes_to_vec, dispatch_dtype_tf, slice_to_bytes};
+use crate::backend::{Backend, Contract};
 use crate::config::ModelConfig;
 
 /// A resolved feed/fetch: the graph operation plus its output index.

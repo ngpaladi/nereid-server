@@ -107,6 +107,11 @@ Backend selection (build only the backends you want):
   --features <list>   Add an arbitrary comma-separated cargo feature list.
   # With no --backends, the default torch+python backends stay on and --onnx /
   # --tensorflow add to them. bundled builds bundle whichever runtimes are linked.
+  #
+  # $NEREID_BACKENDS (or a backends.conf beside Cargo.toml) independently selects
+  # which discovered backend folders are compiled in, by name pattern — the way
+  # to include or exclude an out-of-tree backend that has no Cargo feature.
+  # e.g. NEREID_BACKENDS='!torch' ./build.sh    (see the README)
 
 Device:
   --device <dev>      cpu (default), cuda, or cuda:<cuXYZ>. The version is the

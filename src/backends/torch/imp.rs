@@ -1,6 +1,5 @@
-//! TorchScript (`.pt`) backend, via libtorch (`tch`). All libtorch-specific code
-//! — device resolution, the `tch::Kind` dtype mapping, tensor (de)serialization,
-//! and the forward pass — lives here rather than in the core server.
+//! All libtorch-specific code — device resolution, the `tch::Kind` dtype
+//! mapping, tensor (de)serialization, and the forward pass — lives here.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -8,13 +7,13 @@ use std::sync::Mutex;
 use tch::{CModule, Cuda, Device, IValue, Kind, Tensor};
 use tonic::Status;
 
-use super::Tensor as NTensor;
-use super::{Backend, Contract};
+use crate::backend::Tensor as NTensor;
+use crate::backend::{Backend, Contract};
 use crate::config::{ModelConfig, ModelDevice};
 
 pub struct TorchBackend {
-    // libtorch's `CModule` isn't `Sync`; the `Mutex` serializes inference (as the
-    // per-model worker thread did before) and makes the backend shareable.
+    // libtorch's `CModule` isn't `Sync`; the `Mutex` serializes inference (as
+    // the per-model worker thread did before) and makes the backend shareable.
     module: Mutex<CModule>,
     device: Device,
     output_names: Vec<String>,
@@ -101,7 +100,7 @@ impl Backend for TorchBackend {
     }
 }
 
-fn find_exactly_one_pt_model_file(model_dir: &Path) -> Result<PathBuf, Status> {
+pub(super) fn find_exactly_one_pt_model_file(model_dir: &Path) -> Result<PathBuf, Status> {
     let entries = std::fs::read_dir(model_dir)
         .map_err(|err| Status::internal(format!("failed to read model directory: {err}")))?;
     let mut pt_files = Vec::new();
@@ -125,9 +124,9 @@ fn find_exactly_one_pt_model_file(model_dir: &Path) -> Result<PathBuf, Status> {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // Device resolution (moved out of the core config module).
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 fn to_tch_device(device: ModelDevice) -> Result<Device, Status> {
     match device {
         ModelDevice::Cpu => Ok(Device::Cpu),
@@ -197,9 +196,9 @@ unsafe extern "C" {
     fn dlerror() -> *const std::os::raw::c_char;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // Dtype <-> libtorch kind (moved out of the core dtype module).
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 fn kind_from_canonical(canonical: &str) -> Option<Kind> {
     use Kind::*;
     Some(match canonical {

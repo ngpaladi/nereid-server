@@ -169,6 +169,26 @@ cargo build --no-default-features --features onnx                # the same, via
 A model whose files need a backend the server wasn't built with fails at startup with a clear
 "rebuild with `--features …`" message.
 
+### Selecting backends the manifest doesn't know about
+Cargo features select the *in-tree* backends, because a feature can only name a backend
+`Cargo.toml` already lists. Backends are discovered, though — anyone can drop a folder (or a git
+submodule) into `src/backends/`, and such a backend has no feature to switch it off. So the
+build takes a second, independent selection **by name pattern**, `$NEREID_BACKENDS` or a
+`backends.conf` beside `Cargo.toml` (the env var wins; both use the same syntax):
+
+```bash
+NEREID_BACKENDS='onnx,tensorflow' cargo build --no-default-features --features onnx,tensorflow
+NEREID_BACKENDS='!torch'          cargo build      # everything discovered except torch
+NEREID_BACKENDS='*,!vendor-*'     cargo build      # drop a whole family of vendored backends
+```
+Patterns are comma- or newline-separated, `*` matches any run of characters, a leading `!`
+excludes (and beats any include), and `#` starts a comment in `backends.conf`. Unset or empty
+selects every discovered backend — the default. A build prints what the selection excluded, so a
+dropped backend is never silent.
+
+The two axes compose: the pattern decides which backend folders are *compiled in at all*, the
+feature decides whether an in-tree backend's engine (and its heavy dependency) comes with it.
+
 - **ONNX** — a folder with one `.onnx` file + `model_inference.textproto`. Runs on
   [ONNX Runtime](https://onnxruntime.ai/) via the `ort` crate, with the **CUDA execution
   provider** selected when the model's `device` is `cuda`.
@@ -348,8 +368,10 @@ grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50
 
 ## Project structure
 - `src/main.rs`: gRPC service implementation and server bootstrap.
-- `src/model_runtime.rs`: per-model backend detection, Rust `.pt` inference workers.
-- `src/python_backend.rs`: venv setup and `main.py` process streaming for Python models.
-- `build.rs`: compiles `.proto` files at build time.
+- `src/backend/`: the `Backend` trait, the `ModelManager`, and the registry that detects a
+  model's backend and loads it — all backend-agnostic.
+- `src/backends/<name>/`: one self-contained folder per backend (`mod.rs` registers it and
+  detects its folder shape; the feature-gated `imp.rs` is the engine).
+- `build.rs`: compiles `.proto` files and discovers the backend folders at build time.
 - `proto/inference.proto`: service and message definitions.
 - `python-client/client.py`: YAML-configured mock ED client.
