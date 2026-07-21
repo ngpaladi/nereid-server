@@ -33,6 +33,7 @@ fn load(model_dir: &Path, model_cfg: &ModelConfig) -> Result<(Box<dyn Backend>, 
 inventory::submit! {
     BackendRegistration {
         name: "onnx",
+        version: "0.1.0",
         aliases: &[],
         describes: "a .onnx model + model_inference.textproto",
         auto_detect: true,

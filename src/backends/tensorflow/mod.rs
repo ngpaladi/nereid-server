@@ -11,8 +11,15 @@ use crate::config::ModelConfig;
 /// A TensorFlow SavedModel folder (`saved_model.pb` + `variables/`) plus the
 /// tensor contract.
 fn detect(model_dir: &Path) -> bool {
-    model_dir.join("model_inference.textproto").is_file()
-        && crate::backend::dir_is_saved_model(model_dir)
+    model_dir.join("model_inference.textproto").is_file() && is_saved_model(model_dir)
+}
+
+/// The SavedModel on-disk layout: a `saved_model.pb` graph next to a
+/// `variables/` directory of weights. TensorFlow is the only backend that ships
+/// a model as a directory rather than a file, so this convention lives here
+/// rather than among the core's shared helpers.
+fn is_saved_model(model_dir: &Path) -> bool {
+    model_dir.join("saved_model.pb").is_file() && model_dir.join("variables").is_dir()
 }
 
 fn load(model_dir: &Path, model_cfg: &ModelConfig) -> Result<(Box<dyn Backend>, Contract), Status> {
@@ -34,6 +41,7 @@ fn load(model_dir: &Path, model_cfg: &ModelConfig) -> Result<(Box<dyn Backend>, 
 inventory::submit! {
     BackendRegistration {
         name: "tensorflow",
+        version: "0.1.0",
         aliases: &[],
         describes: "a SavedModel (saved_model.pb + variables/) + model_inference.textproto",
         auto_detect: true,

@@ -34,6 +34,7 @@ fn load(model_dir: &Path, model_cfg: &ModelConfig) -> Result<(Box<dyn Backend>, 
 inventory::submit! {
     BackendRegistration {
         name: "python",
+        version: "0.1.0",
         aliases: &[],
         describes: "main.py + requirements.txt",
         auto_detect: true,

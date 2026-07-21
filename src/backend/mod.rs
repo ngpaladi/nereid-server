@@ -118,6 +118,10 @@ impl ModelManager {
             let registration =
                 detect_backend(&model_dir, &model_cfg.name, model_cfg.backend.as_deref())?;
             let (backend, contract) = (registration.load)(&model_dir, model_cfg)?;
+            model_log(&format!(
+                "loaded model={} backend={} version={}",
+                model_cfg.name, registration.name, registration.version
+            ));
 
             model_names.push(model_cfg.name.clone());
             entries.insert(
@@ -314,6 +318,14 @@ pub struct BackendRegistration {
     /// The `backend:` value in `nereid.yaml` (and the Cargo feature that
     /// provides this backend).
     pub name: &'static str,
+    /// The backend's own version, `major.minor.patch`, independent of the
+    /// server's. Backends evolve on their own schedule — especially
+    /// out-of-tree ones vendored as submodules — so each advertises where it
+    /// is: bump the major when a revision changes the folder shape, the
+    /// contract, or the config a model must supply. Reported in the startup log
+    /// for every loaded model, so a deployment can be traced to the exact
+    /// backend revision that served it.
+    pub version: &'static str,
     /// Additional accepted `backend:` spellings (e.g. deprecated aliases).
     pub aliases: &'static [&'static str],
     /// A one-line description of the folder shape, for the ambiguity/no-match
@@ -336,8 +348,11 @@ fn registrations() -> impl Iterator<Item = &'static BackendRegistration> {
     inventory::iter::<BackendRegistration>()
 }
 
-/// Shared file-signature helpers, used by the backends' `detect` predicates
-/// (which live under `crate::backends`), hence `pub(crate)`.
+/// "Does the folder contain a file with this extension?" — the one file-signature
+/// helper that is genuinely backend-agnostic (torch's `.pt`, ONNX's `.onnx`, and
+/// any future single-file format). Used by the backends' `detect` predicates,
+/// which live under `crate::backends`, hence `pub(crate)`. Anything specific to
+/// one backend's folder shape belongs in that backend's own folder.
 pub(crate) fn dir_has_ext(model_dir: &Path, ext: &str) -> bool {
     std::fs::read_dir(model_dir)
         .map(|entries| {
@@ -346,10 +361,6 @@ pub(crate) fn dir_has_ext(model_dir: &Path, ext: &str) -> bool {
                 .any(|e| e.path().extension().is_some_and(|x| x == ext))
         })
         .unwrap_or(false)
-}
-
-pub(crate) fn dir_is_saved_model(model_dir: &Path) -> bool {
-    model_dir.join("saved_model.pb").is_file() && model_dir.join("variables").is_dir()
 }
 
 /// Pick the backend for a model: the explicitly-declared one, else the single

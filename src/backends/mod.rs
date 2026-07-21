@@ -6,6 +6,11 @@
 //! (which can be a git submodule) — nothing in the tree needs editing, and there
 //! is no central enum, match, detection list, or module list.
 //!
+//! Which of the discovered folders are compiled in is a build-time selection by
+//! name pattern (`$NEREID_BACKENDS` or `backends.conf`; see build.rs), rather
+//! than a Cargo feature list — a feature can only name a backend the manifest
+//! already knows about, which an out-of-tree one doesn't.
+//!
 //! Each backend's `mod.rs` holds its detection predicate and its
 //! `inventory::submit!` registration (pure and dependency-free, so the core
 //! discovers it at link time); only the engine in its feature-gated `imp`

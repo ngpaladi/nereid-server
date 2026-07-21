@@ -39,6 +39,7 @@ fn load(model_dir: &Path, model_cfg: &ModelConfig) -> Result<(Box<dyn Backend>, 
 inventory::submit! {
     BackendRegistration {
         name: "torch",
+        version: "0.1.0",
         // "rust" is the historical name for this backend.
         aliases: &["rust"],
         describes: "a .pt model + model_inference.textproto",
