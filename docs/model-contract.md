@@ -6,7 +6,7 @@ contain depends on the backend:
 | Backend | Required files |
 | --- | --- |
 | Python | `main.py`, `requirements.txt`, `model_inference.textproto` (declaring `output_shape`) |
-| Rust `.pt` | `model_inference.textproto`, one `.pt` file |
+| Torch | `model_inference.textproto`, one `.pt` file |
 | ONNX | `model_inference.textproto`, one `.onnx` file |
 | TensorFlow | `model_inference.textproto`, a SavedModel (`saved_model.pb` + `variables/`) |
 
