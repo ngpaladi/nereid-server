@@ -62,9 +62,11 @@ In precedence order:
 cargo build --no-default-features --features onnx,tensorflow   # the same, via cargo
 ```
 
-`--backends <csv>` picks an exact set, which turns off the `torch`+`python` defaults, while
-`--onnx` / `--tensorflow` add to whatever is already selected. `--link bundled` bundles whichever
-runtimes ended up linked.
+`--backends <csv>` is how you pick an exact set with `build.sh`: it turns off the `torch`+`python`
+defaults and builds only what you name. (Under the hood it's `build.sh` that passes Cargo's
+`--no-default-features` for you — that's a Cargo flag, not one `build.sh` accepts, so reach for it
+only when you drive `cargo` directly, as in the third line above.) `--onnx` / `--tensorflow` add to
+whatever's already selected, and `--link bundled` bundles whichever runtimes ended up linked.
 
 Those are Cargo features, so they can only name backends that `Cargo.toml` already knows about. If
 you've dropped your own backend into `src/backends/` (or pointed a git submodule at one), there is

@@ -6,9 +6,10 @@ nereid binds a single address (`server.bind_addr`) and serves two gRPC services 
 
 - **`inference.Nereid`** — nereid's own service: `HealthCheck`, `ViewModels`, and the streaming
   `Checkpoint` inference RPC.
-- **`inference.GRPCInferenceService`** — NVIDIA Triton's KServe v2 surface, vendored verbatim so
-  that a stock `tritonclient` can drive nereid unchanged (see
-  [Triton compatibility](triton.md)).
+- **`inference.GRPCInferenceService`** — the [KServe v2](https://kserve.github.io/website/docs/concepts/architecture/data-plane/v2-protocol)
+  gRPC surface, an open inference-protocol standard. nereid vendors the proto verbatim, so any
+  KServe v2 speaker — a stock `tritonclient` included — can drive it unchanged (see
+  [KServe v2 compatibility](triton.md)).
 
 They aren't two systems. Both are backed by the same models and the same `ModelManager`; they're
 just two front doors into it.
@@ -62,7 +63,7 @@ processes a model can have running at once.
 
 ## Request lifecycle
 
-- **`ModelInfer` (Triton, unary + streaming).** The richest path: single- and multi-tensor, the
+- **`ModelInfer` (KServe v2, unary + streaming).** The richest path: single- and multi-tensor, the
   full KServe dtype set. The handler checks the request datatype against the model's declared
   datatype, normalizes the batch dimension, builds the input tensors, takes a permit, and streams
   the typed output back.

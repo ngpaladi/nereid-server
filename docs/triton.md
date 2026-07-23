@@ -1,17 +1,19 @@
-# Triton compatibility (KServe v2)
+# KServe v2 compatibility
 
-nereid exposes NVIDIA Triton's `inference.GRPCInferenceService` on the same bind address as its
-native service, so a stock `tritonclient` (or any KServe v2 speaker) can drive nereid without code
-changes.
+nereid exposes `inference.GRPCInferenceService`, the
+[KServe v2 inference protocol](https://kserve.github.io/website/docs/concepts/architecture/data-plane/v2-protocol)
+over gRPC, on the same bind address as its native service. KServe v2 is an open standard rather
+than any one server's protocol, so anything that speaks it can drive nereid without code changes —
+a stock NVIDIA `tritonclient` among them, since Triton implements the same protocol.
 
 ## Wire parity, not authoring parity
 
 The package, service name, RPC names, and message field numbers in `proto/grpc_service.proto` are
-vendored **verbatim** from
-[Triton's `grpc_service.proto`](https://github.com/triton-inference-server/common/blob/main/protobuf/grpc_service.proto),
-so the wire format is byte-compatible. That's parity on the wire and nothing more: models are still
-written against nereid's own contracts (a `.pt` file, a `main.py`, a SavedModel, …), not against
-Triton's model repository layout.
+vendored **verbatim** from the KServe v2 spec (via
+[Triton's copy](https://github.com/triton-inference-server/common/blob/main/protobuf/grpc_service.proto)
+of it), so the wire format is byte-compatible. That's parity on the wire and nothing more: models
+are still written against nereid's own contracts (a `.pt` file, a `main.py`, a SavedModel, …), not
+against any other server's model-repository layout.
 
 ## Implemented RPCs
 
@@ -24,7 +26,7 @@ and streaming `ModelStreamInfer`.
   the typed `contents`.
 - nereid serves a single implicit model version, `"1"`.
 
-> **Not implemented (deferred):** Rust `UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror;
+> **Not implemented (deferred):** Torch `UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror;
 > Prometheus metrics; and the repository / config / statistics RPCs.
 
 ## Verifying compatibility

@@ -6,15 +6,20 @@ contents of its folder, or you can just say so with `backend:` in `nereid.yaml`.
 | Backend | Feature | Model folder | Heavy dependency | Isolation |
 | --- | --- | --- | --- | --- |
 | Torch (TorchScript) | `torch` *(default)* | `.pt` + textproto | libtorch (via `tch`) | in-process |
-| Python | `python` *(default)* | `main.py` + `requirements.txt` | none | subprocess |
+| Python | `python` *(default)* | `main.py` + `requirements.txt` | a per-model virtualenv (built at startup) | subprocess |
 | ONNX | `onnx` | `.onnx` + textproto | ONNX Runtime (via `ort`) | in-process |
 | TensorFlow | `tensorflow` | SavedModel + textproto | libtensorflow | in-process |
 
-You only build the ones you want. The default build keeps `torch` + `python`; pass
-`--no-default-features` with just the features you need, and an ONNX-only server never links
-libtorch. See [Building & running](building.md).
+The "heavy dependency" column is what a backend pulls in. For the compiled-in engines that's a
+linked native library; for Python it's not a crate dependency at all, but a per-model virtualenv
+built from `requirements.txt` — which, depending on what the model imports, can be the heaviest
+runtime cost of the lot.
 
-## Rust TorchScript (`.pt`)
+You only build the ones you want. The default build keeps `torch` + `python`; select an exact set
+with `./build.sh --backends …` (or, driving Cargo directly, `--no-default-features --features …`),
+and an ONNX-only server never links libtorch. See [Building & running](building.md).
+
+## Torch (TorchScript `.pt`)
 
 A folder with one `.pt` file (a TorchScript export) and a `model_inference.textproto`. The model
 is loaded into libtorch through [`tch`](https://github.com/LaurentMazare/tch-rs) and run in
@@ -35,8 +40,8 @@ has the details. Since it runs out of process, a model that crashes takes down o
 A folder with one `.onnx` file + textproto, run in process on
 [ONNX Runtime](https://onnxruntime.ai/) via the [`ort`](https://ort.pyke.io/) crate. If a model's
 `device` is `cuda`, ort's CUDA execution provider is selected for it. This path covers the full
-KServe dtype set, including `UINT16/32/64`, which the `.pt` path can't do because libtorch has no
-kind for them.
+KServe dtype set, including `UINT16/32/64`, which the Torch backend can't (libtorch has no kind for
+them).
 
 ## TensorFlow
 

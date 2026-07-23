@@ -28,5 +28,5 @@ nav:
   - Architecture: architecture.md
   - Backends: backends.md
   - Model contract: model-contract.md
-  - Triton compatibility: triton.md
+  - KServe v2 compatibility: triton.md
   - Building & running: building.md
