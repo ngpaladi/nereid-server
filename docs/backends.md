@@ -5,7 +5,7 @@ contents of its folder, or you can just say so with `backend:` in `nereid.yaml`.
 
 | Backend | Feature | Model folder | Heavy dependency | Isolation |
 | --- | --- | --- | --- | --- |
-| Rust TorchScript | `torch` *(default)* | `.pt` + textproto | libtorch (via `tch`) | in-process |
+| Torch (TorchScript) | `torch` *(default)* | `.pt` + textproto | libtorch (via `tch`) | in-process |
 | Python | `python` *(default)* | `main.py` + `requirements.txt` | none | subprocess |
 | ONNX | `onnx` | `.onnx` + textproto | ONNX Runtime (via `ort`) | in-process |
 | TensorFlow | `tensorflow` | SavedModel + textproto | libtensorflow | in-process |
