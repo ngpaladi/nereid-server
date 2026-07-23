@@ -212,6 +212,26 @@ python scripts/make_example_models.py   # needs `onnx` (and `tensorflow` for tfa
 **Dtype note:** the native path additionally supports `UINT16/32/64` (which the Rust `.pt` path
 cannot, as libtorch lacks those kinds); TensorFlow does not support `BF16`.
 
+## Compile-time C++ models (feature `cxx`)
+If you want a C++ model running in process with type-safe interop, and no subprocess or unsafe FFI
+in the way, nereid can link the C++ straight in through the [`cxx`](https://cxx.rs) crate. The C++
+lives in the `cxx-models` crate (`crates/cxx-models/`, meant to be vendored as a git submodule or
+workspace member): implement the `nereid::Model` interface in `cpp/`, register it by name in
+`create_model`, and rebuild with `./build.sh --cxx` (or `cargo build --features cxx`).
+
+Since the C++ is compiled into the binary and keyed by name, a model's folder holds nothing but a
+`model_inference.textproto`, and you select it with `backend: "cxx"` in `nereid.yaml`. It can't be
+auto-detected, because there is no file to detect — which is what the registry's
+`auto_detect: false` is for: the backend registers itself like any other, but is only ever
+selected by being named. It's served over the Triton `ModelInfer` path, single-tensor for now. See
+`crates/cxx-models` for the `cxxadd` example (`output = input + 1`) and `ml-backends/cxxadd` for
+its model folder.
+
+So this is the build-time counterpart to the other backends. Adding or changing a C++ model means
+recompiling the server, which is a real cost and worth being honest about; what you get for it is
+direct in-process interop with no process or loader machinery, and a boundary the compiler checks
+for you rather than one you hand-write and hope about.
+
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).
 If this file is missing or invalid, the server does not start.

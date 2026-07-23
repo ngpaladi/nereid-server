@@ -966,6 +966,93 @@ mod triton_e2e_tests {
         assert_eq!(got, expected, "tfadd must compute input + 1");
     }
 
+    /// The compile-time C++ backend (feature `cxx`) serves the committed `cxxadd`
+    /// model (a `cxx`-bridged C++ `output = input + 1`, compiled into the server)
+    /// end to end over ModelInfer. The C++ code is registered by name, so the
+    /// folder only supplies the contract and the model uses `backend: "cxx"`. It
+    /// flows through the same `Backend` dispatch as every other engine.
+    #[cfg(feature = "cxx")]
+    #[tokio::test]
+    async fn cxx_model_infer_returns_input_plus_one() {
+        use crate::config::{ModelConfig, ModelDevice, ServerConfig, ServerSection};
+        assert!(
+            fixtures_dir()
+                .join("cxxadd")
+                .join("model_inference.textproto")
+                .is_file(),
+            "cxxadd fixture missing"
+        );
+        let input_values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let expected: Vec<f32> = input_values.iter().map(|v| v + 1.0).collect();
+
+        let config = ServerConfig {
+            server: ServerSection {
+                bind_addr: "127.0.0.1:0".to_string(),
+                ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
+            },
+            models: vec![ModelConfig {
+                name: "cxxadd".to_string(),
+                device: ModelDevice::Cpu,
+                queue_capacity: 4,
+                // Declared, not detected: the C++ is compiled in, so there is
+                // nothing in the folder to detect it from.
+                backend: Some("cxx".to_string()),
+                signature: None,
+            }],
+        };
+        let model_manager =
+            Arc::new(ModelManager::from_config(&config).expect("cxx model should build"));
+        let triton = TritonService::new(model_manager);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(GrpcInferenceServiceServer::new(triton))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+
+        let mut client = connect(addr).await;
+        let meta = client
+            .model_metadata(ModelMetadataRequest {
+                name: "cxxadd".to_string(),
+                version: String::new(),
+            })
+            .await
+            .expect("model_metadata")
+            .into_inner();
+        assert_eq!(meta.platform, "nereid_cxx");
+
+        let response = client
+            .model_infer(ModelInferRequest {
+                model_name: "cxxadd".to_string(),
+                model_version: String::new(),
+                id: "cxx-1".to_string(),
+                parameters: Default::default(),
+                inputs: vec![InferInputTensor {
+                    name: "input".to_string(),
+                    datatype: FP32.to_string(),
+                    shape: vec![1, 4],
+                    parameters: Default::default(),
+                    contents: None,
+                }],
+                outputs: Vec::new(),
+                raw_input_contents: vec![f32_le_bytes(&input_values)],
+            })
+            .await
+            .expect("cxx model_infer should succeed")
+            .into_inner();
+
+        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.outputs[0].shape, vec![1, 4]);
+        let raw = &response.raw_output_contents[0];
+        let got: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, expected, "cxxadd must compute input + 1");
+    }
+
     /// GPU smoke test: serve the ONNX `onnxadd` fixture on `device: cuda`, which
     /// drives ort's CUDA execution provider. Ignored by default (needs an NVIDIA
     /// GPU with a working CUDA + cuDNN stack); run with `--ignored`. A pass proves

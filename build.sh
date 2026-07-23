@@ -99,11 +99,13 @@ libtorch source (highest precedence first):
 Backend selection (build only the backends you want):
   --backends <csv>    Exact backend set, e.g. --backends onnx (turns OFF the
                         default torch+python). Valid: torch, python, onnx,
-                        tensorflow, tensorflow-gpu. An ONNX/TF-only build links
-                        no libtorch at all.
+                        tensorflow, tensorflow-gpu, cxx. An ONNX/TF/cxx-only
+                        build links no libtorch at all.
   --onnx              Add the ONNX backend (ort / ONNX Runtime, CUDA-capable).
   --tensorflow        Add the TensorFlow backend (libtensorflow SavedModel).
   --tensorflow-gpu    Add TensorFlow linked against the libtensorflow GPU build.
+  --cxx               Add compile-time C++ models (cxx-bridged, linked in; needs
+                        a C++ compiler at build time).
   --features <list>   Add an arbitrary comma-separated cargo feature list.
   # With no --backends, the default torch+python backends stay on and --onnx /
   # --tensorflow add to them. bundled builds bundle whichever runtimes are linked.
@@ -152,6 +154,7 @@ while [[ $# -gt 0 ]]; do
     --onnx)             FEATURES+=("onnx"); shift ;;
     --tensorflow)       FEATURES+=("tensorflow"); shift ;;
     --tensorflow-gpu)   FEATURES+=("tensorflow-gpu"); shift ;;
+    --cxx)              FEATURES+=("cxx"); shift ;;
     --features)         FEATURES+=("${2:?--features needs a value}"); shift 2 ;;
     --features=*)       FEATURES+=("${1#*=}"); shift ;;
     --release)          PROFILE="release"; shift ;;
