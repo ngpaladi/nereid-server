@@ -9,10 +9,14 @@ contain depends on the backend:
 | Torch | `model_inference.textproto`, one `.pt` file |
 | ONNX | `model_inference.textproto`, one `.onnx` file |
 | TensorFlow | `model_inference.textproto`, a SavedModel (`saved_model.pb` + `variables/`) |
+| C++ subprocess (`cpp`) | `model_inference.textproto`, a `main.cpp` (or a `build.sh` / prebuilt `model`) |
+| Compile-time C++ (`cxx`) | `model_inference.textproto` only (the C++ is compiled into the server) |
 
 The server works out the backend from these contents. If a folder matches more than one of them (or
 none at all), set `backend:` in `nereid.yaml` to settle it; what you declare wins, and only that
-backend's own required files are checked.
+backend's own required files are checked. The `cxx` backend is the exception that always needs
+declaring: its folder is just a textproto, which carries no signature to detect, so `backend: "cxx"`
+is required rather than optional (see [Backends](backends.md#compile-time-c-cxx)).
 
 ## `model_inference.textproto`
 

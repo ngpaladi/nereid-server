@@ -9,6 +9,8 @@ contents of its folder, or you can just say so with `backend:` in `nereid.yaml`.
 | Python | `python` *(default)* | `main.py` + `requirements.txt` | a per-model virtualenv (built at startup) | subprocess |
 | ONNX | `onnx` | `.onnx` + textproto | ONNX Runtime (via `ort`) | in-process |
 | TensorFlow | `tensorflow` | SavedModel + textproto | libtensorflow | in-process |
+| C++ subprocess | `cpp` | `main.cpp` + textproto | a C++ compiler (at runtime) | subprocess |
+| Compile-time C++ | `cxx` | textproto only (code compiled in) | the `cxx-models` crate (linked in) | in-process |
 
 The "heavy dependency" column is what a backend pulls in. For the compiled-in engines that's a
 linked native library; for Python it's not a crate dependency at all, but a per-model virtualenv
@@ -50,6 +52,36 @@ the [`tensorflow`](https://github.com/tensorflow/rust) crate. The SavedModel sig
 `serving_default`, which you can override per model with `signature:` in `nereid.yaml`. GPU
 support needs the libtensorflow GPU build, and `BF16` isn't available on this path.
 
+## C++ subprocess (`cpp`)
+
+A folder with a `main.cpp` + textproto. This backend works like the Python one, just for C++: the
+server compiles `main.cpp` into a `model` executable at startup — the same idea as building a
+Python model's virtualenv — and runs it as a subprocess per request. It speaks the same
+[subprocess tensor contract](model-contract.md#subprocess-tensor-contract) as Python (raw tensor
+on stdin, a framed tensor back), so there's no unsafe FFI and no rebuilding the server to add a
+model. Because it runs out of process, a model that crashes takes down only itself.
+
+If one `c++ -O2 -std=c++17 main.cpp -o model` invocation isn't enough — extra sources, link flags —
+a folder can ship an executable `build.sh` instead, or just a prebuilt `model` binary. It needs a
+C++ compiler on `PATH` at runtime, since that's when the compile happens, and is served over the
+`ModelInfer` path, single-tensor for now. See `ml-backends/cppadd` (`output = input + 1`).
+
+## Compile-time C++ (`cxx`)
+
+The other way to serve C++, at the opposite trade-off: instead of a subprocess, the model's C++ is
+linked into the server through the [`cxx`](https://cxx.rs) crate and run in process, with a
+boundary the compiler checks rather than one you hand-write. The C++ lives in the `cxx-models`
+crate (`crates/cxx-models/`, meant to be vendored as a git submodule or workspace member):
+implement the `nereid::Model` interface, register it by name, and rebuild with `--features cxx`.
+
+Because the code is compiled in and keyed by name, a model's folder holds nothing but a
+`model_inference.textproto`, and you select it with `backend: "cxx"` — it's the one backend that
+can't be auto-detected, since there's no file to detect (see
+[the registry's `auto_detect: false`](#how-the-server-finds-a-backend) below). It's served over the
+`ModelInfer` path, single-tensor for now. The cost is that adding or changing a model recompiles
+the server; what you buy is direct in-process interop with no process or loader machinery. See
+`crates/cxx-models` for the `cxxadd` example and `ml-backends/cxxadd` for its model folder.
+
 ## Choosing a backend
 
 If a folder matches exactly one backend, that's the one you get. Set `backend:` in `nereid.yaml`
@@ -61,7 +93,7 @@ models:
   - name: "my_onnx_model"
     device: "cuda"
     queue_capacity: 16
-    backend: "onnx"    # "python" | "torch" (or "rust") | "onnx" | "tensorflow"
+    backend: "onnx"    # python | torch (or rust) | onnx | tensorflow | cpp | cxx
 ```
 
 A model whose files need a backend the server wasn't built with fails at startup and tells you
@@ -71,9 +103,9 @@ refuses to start.
 
 ## How the server finds a backend
 
-Nothing in the server core knows the four backends above exist. There's no enum of backend kinds
-and no `match` that dispatches to them, which is deliberate — every one of those would be a
-central file you'd have to edit to add a backend.
+Nothing in the server core knows the backends above exist. There's no enum of backend kinds and no
+`match` that dispatches to them, which is deliberate — every one of those would be a central file
+you'd have to edit to add a backend.
 
 Instead each backend lives in its own folder under `src/backends/<name>/` and submits a
 registration at link time:

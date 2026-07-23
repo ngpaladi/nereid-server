@@ -25,6 +25,7 @@ ones you want.
                      │              ──► Python     (main.py)     │
                      │              ──► ONNX       (ONNX Runtime)│
                      │              ──► TensorFlow (SavedModel)  │
+                     │              ──► C++        (cpp / cxx)   │
                      └───────────────────────────────────────────┘
 ```
 
@@ -32,8 +33,8 @@ ones you want.
 
 - **[Architecture](architecture.md)** — the two gRPC surfaces, the `ModelManager`, how requests are
   bounded, and how one gets to a backend.
-- **[Backends](backends.md)** — the four backends that ship today, how the server finds them, and
-  how you add one of your own.
+- **[Backends](backends.md)** — the backends that ship today, how the server finds them, and how you
+  add one of your own.
 - **[Model contract](model-contract.md)** — what goes in a model folder, what
   `model_inference.textproto` says, the batching rules, and the subprocess tensor contract.
 - **[KServe v2 compatibility](triton.md)** — how nereid speaks KServe v2 on the wire, which RPCs
