@@ -37,6 +37,10 @@ default = ["torch", "python"]
 torch = ["dep:tch"]
 # The Python `main.py` backend (no extra crate dependency).
 python = []
+# The C++ subprocess backend: compiles a model's `main.cpp` to an executable at
+# startup and runs it per request (no extra crate dependency; needs a C++
+# compiler on PATH at runtime).
+cpp = []
 # ONNX backend (ort / ONNX Runtime; CUDA execution provider compiled in, selected
 # at runtime when a model's device is `cuda`).
 onnx = ["dep:ort", "dep:half"]

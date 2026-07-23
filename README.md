@@ -232,6 +232,31 @@ recompiling the server, which is a real cost and worth being honest about; what 
 direct in-process interop with no process or loader machinery, and a boundary the compiler checks
 for you rather than one you hand-write and hope about.
 
+## C++ subprocess backend (feature `cpp`)
+A C++ model is served the same way a Python `main.py` model is: out of process. The folder ships a
+`main.cpp` alongside its `model_inference.textproto`, the server compiles it into a `model`
+executable at startup (the same idea as building a Python model's venv), and then runs it as a
+child process per request. Turn it on with `./build.sh --cpp` (or `cargo build --features cpp`).
+It needs a C++ compiler on `PATH` at runtime, since that's when the compiling happens.
+
+The model speaks the same language-agnostic tensor contract the Python backend uses, so there is
+no unsafe FFI anywhere and you never rebuild the server to add a model:
+- **input** (optional): raw little-endian bytes on stdin, with `NEREID_INPUT_SHAPE` /
+  `NEREID_INPUT_DTYPE` in the environment;
+- **output**: a framed tensor written to `NEREID_OUTPUT_PATH` — a header line
+  `"<dtype> <d0>,<d1>,...\n"` followed by the raw little-endian bytes.
+
+Running out of process is the whole point: a model that segfaults takes down its own process and
+nothing else, which is not something an in-process dynamically-loaded plugin can promise you. If
+`main.cpp` and one compiler invocation aren't enough — extra sources, link flags — a folder can
+ship an executable `build.sh` instead, or just a prebuilt `model` binary. `ml-backends/cppadd` is a
+complete example (`output = input + 1`); starting the server builds it for you, or you can compile
+it yourself with `c++ -O2 -std=c++17 main.cpp -o model`.
+
+It's served over the Triton `ModelInfer` path, single-tensor for now; the native `Checkpoint`
+streaming path and multi-tensor C++ models are both deferred. Detection is automatic from
+`main.cpp`, and you can set `backend: "cpp"` in `nereid.yaml` to be explicit about it.
+
 ## `nereid.yaml` configuration (required)
 `nereid.yaml` is loaded at server startup from the repository root (`./nereid.yaml`).
 If this file is missing or invalid, the server does not start.
