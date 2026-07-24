@@ -12,6 +12,9 @@ theme:
   features:
     - navigation.side.indexes
 
+extra_css:
+  - css/extra.css
+
 markdown_extensions:
   - attr_list
   - md_in_html
@@ -27,6 +30,6 @@ nav:
   - Overview: index.md
   - Architecture: architecture.md
   - Backends: backends.md
-  - Model contract: model-contract.md
-  - KServe v2 compatibility: triton.md
-  - Building & running: building.md
+  - Contract: model-contract.md
+  - KServe v2: triton.md
+  - Building: building.md

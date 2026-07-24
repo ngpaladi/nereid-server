@@ -11,23 +11,9 @@ ones you want.
 
 ## At a glance
 
-```text
-   gRPC client                 nereid-server
- (tritonclient,      ┌───────────────────────────────────────────┐
-  grpcurl, ...)      │  gRPC surfaces                            │
-      │   ModelInfer │    Nereid  +  KServe v2                   │
-      └─────────────►│         │                                 │
-        Checkpoint   │         ▼                                 │
-                     │    ModelManager                           │
-                     │         │  (per-model permits)            │
-                     │         ▼                                 │
-                     │      backend ──► Torch .pt  (libtorch)    │
-                     │              ──► Python     (main.py)     │
-                     │              ──► ONNX       (ONNX Runtime)│
-                     │              ──► TensorFlow (SavedModel)  │
-                     │              ──► C++        (cpp / cxx)   │
-                     └───────────────────────────────────────────┘
-```
+<figure markdown="span">
+  ![A gRPC client's ModelInfer and Checkpoint requests enter nereid-server through its Nereid and KServe v2 gRPC surfaces, feed a ModelManager holding per-model permits, and dispatch to one backend — Torch, Python, ONNX, TensorFlow, or C++.](diagrams/overview.svg){ width="820" style="max-width:100%;height:auto" loading="lazy" }
+</figure>
 
 ## What to read next
 

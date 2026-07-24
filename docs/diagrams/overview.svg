@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 430" role="img"
+     aria-label="A gRPC client sends ModelInfer and Checkpoint requests to nereid-server, whose gRPC surfaces (Nereid and KServe v2) feed a ModelManager holding per-model permits, which dispatches to one backend: Torch, Python, ONNX, TensorFlow, or C++.">
+  <defs>
+    <style>
+      .lbl   { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #ebdbb2; }
+      .name  { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #ebdbb2; font-size: 14px; }
+      .sub   { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #a89984; font-size: 11px; }
+      .edge  { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #bdae93; font-size: 10.5px; }
+      .box   { fill: #32302f; stroke: #7c6f64; stroke-width: 1.5; }
+      .arrow { fill: none; stroke: #bdae93; stroke-width: 1.6; }
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bdae93"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="820" height="430" fill="#282828"/>
+
+  <!-- client -->
+  <rect class="box" x="24" y="180" width="152" height="72" rx="8" stroke="#83a598"/>
+  <text class="name" x="100" y="208" text-anchor="middle">gRPC client</text>
+  <text class="sub"  x="100" y="226" text-anchor="middle">tritonclient,</text>
+  <text class="sub"  x="100" y="240" text-anchor="middle">grpcurl, …</text>
+
+  <!-- client -> server -->
+  <path class="arrow" d="M176,216 H246" marker-end="url(#ah)"/>
+  <text class="edge" x="211" y="207" text-anchor="middle">ModelInfer</text>
+  <text class="edge" x="211" y="231" text-anchor="middle">Checkpoint</text>
+
+  <!-- server container -->
+  <rect x="250" y="28" width="548" height="374" rx="10" fill="none" stroke="#665c54" stroke-width="1.5"/>
+  <text class="lbl" x="270" y="52" fill="#fabd2f" font-size="13px">nereid-server</text>
+
+  <!-- gRPC surfaces -->
+  <rect class="box" x="300" y="76" width="200" height="56" rx="8" stroke="#fabd2f"/>
+  <text class="name" x="400" y="100" text-anchor="middle">gRPC surfaces</text>
+  <text class="sub"  x="400" y="119" text-anchor="middle">Nereid  +  KServe v2</text>
+
+  <path class="arrow" d="M400,132 V154" marker-end="url(#ah)"/>
+
+  <!-- ModelManager -->
+  <rect class="box" x="300" y="156" width="200" height="56" rx="8"/>
+  <text class="name" x="400" y="180" text-anchor="middle">ModelManager</text>
+  <text class="sub"  x="400" y="199" text-anchor="middle">per-model permits</text>
+
+  <path class="arrow" d="M400,212 V234" marker-end="url(#ah)"/>
+
+  <!-- backend -->
+  <rect class="box" x="320" y="236" width="160" height="48" rx="8"/>
+  <text class="name" x="400" y="265" text-anchor="middle">backend</text>
+
+  <!-- backend -> list -->
+  <path class="arrow" d="M480,260 H520 V212 H556" marker-end="url(#ah)"/>
+
+  <!-- backends list -->
+  <rect class="box" x="560" y="92" width="210" height="242" rx="8"/>
+  <!-- Torch -->
+  <circle cx="586" cy="118" r="5" fill="#f38019"/>
+  <text class="name" x="602" y="123">Torch</text>
+  <text class="sub"  x="602" y="139">.pt · libtorch</text>
+  <!-- Python -->
+  <circle cx="586" cy="164" r="5" fill="#83a598"/>
+  <text class="name" x="602" y="169">Python</text>
+  <text class="sub"  x="602" y="185">main.py</text>
+  <!-- ONNX -->
+  <circle cx="586" cy="210" r="5" fill="#d3869b"/>
+  <text class="name" x="602" y="215">ONNX</text>
+  <text class="sub"  x="602" y="231">ONNX Runtime</text>
+  <!-- TensorFlow -->
+  <circle cx="586" cy="256" r="5" fill="#fabd2f"/>
+  <text class="name" x="602" y="261">TensorFlow</text>
+  <text class="sub"  x="602" y="277">SavedModel</text>
+  <!-- C++ -->
+  <circle cx="586" cy="302" r="5" fill="#8ec07c"/>
+  <text class="name" x="602" y="307">C++</text>
+  <text class="sub"  x="602" y="323">cpp · cxx</text>
+</svg>
