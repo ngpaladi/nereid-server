@@ -11,6 +11,51 @@
     white-space: nowrap;
 }
 
+/* Nudge the left nav panel down so it doesn't sit tight under the top bar. */
+#terminal-mkdocs-side-panel {
+    margin-top: 1.75rem;
+}
+
+/* Search lives at the top of the left nav (see overrides/ + the
+   navigation.top.search_button.hide feature). Styled as a search field so it
+   reads as an input, not a nav link, and opens the theme's search modal. */
+/* Separator rule between the nav list and the search box, sitting just below the
+   nav. The gap matches the nav's own item spacing: items carry no margin, so the
+   space between them is the line-height leading, i.e. line-height minus one em. */
+#terminal-mkdocs-side-search-sep {
+    margin: calc(var(--global-line-height) - 1em) 0 calc(var(--global-space) * 2);
+    border: none;
+    border-top: 1px solid var(--secondary-color);
+    opacity: 0.5;
+    width: 100%;
+}
+
+#terminal-mkdocs-side-search {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+    width: 100%;
+    margin: 0;
+    padding: 0.45em 0.7em;
+    border: 1px solid var(--secondary-color);
+    border-radius: 6px;
+    color: var(--secondary-color);
+    background: var(--code-bg-color);
+    text-decoration: none;
+    font-size: 0.95em;
+}
+
+#terminal-mkdocs-side-search:hover,
+#terminal-mkdocs-side-search:focus {
+    border-color: var(--primary-color);
+    color: var(--font-color);
+    outline: none;
+}
+
+#terminal-mkdocs-side-search .fa {
+    opacity: 0.85;
+}
+
 /* Diagrams render edge-to-edge of the content column without a code-block frame. */
 figure[markdown] {
     margin: 1.5rem 0;

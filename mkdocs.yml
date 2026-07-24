@@ -9,11 +9,16 @@ use_directory_urls: true
 theme:
   name: terminal
   palette: gruvbox_dark
+  custom_dir: overrides
   features:
     - navigation.side.indexes
+    - navigation.top.search_button.hide
 
 extra_css:
   - css/extra.css
+
+watch:
+  - overrides
 
 markdown_extensions:
   - attr_list
