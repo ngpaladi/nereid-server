@@ -1,0 +1,66 @@
+name: Docs
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "docs-requirements.txt"
+      - ".github/workflows/docs.yml"
+      # A new/renamed backend must update the canonical table, so changes here
+      # re-run the coverage check even when no doc file was touched.
+      - "src/backends/**"
+      - "scripts/check_backend_docs.sh"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "docs-requirements.txt"
+      - ".github/workflows/docs.yml"
+      - "src/backends/**"
+      - "scripts/check_backend_docs.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Build the docs site and fail on any warning (broken links, missing nav, ...).
+  # Runs on every PR that touches the docs.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Fail if a registered backend is missing from the canonical docs table.
+      - name: Check backend docs coverage
+        run: ./scripts/check_backend_docs.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install docs dependencies
+        run: pip install -r docs-requirements.txt
+      - name: Build (strict)
+        run: mkdocs build --strict
+      - name: Upload site artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  # Deploy to GitHub Pages, only from main. Requires Pages to be enabled for the
+  # repo with "GitHub Actions" as the source (Settings -> Pages).
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

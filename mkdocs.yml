@@ -1,0 +1,32 @@
+site_name: nereid-server
+site_description: A nifty little Rust inference server — architecture, backends, and build guide.
+repo_url: https://github.com/ngpaladi/nereid-server
+repo_name: ngpaladi/nereid-server
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+
+theme:
+  name: terminal
+  palette: gruvbox_dark
+  features:
+    - navigation.side.indexes
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+nav:
+  - Overview: index.md
+  - Architecture: architecture.md
+  - Backends: backends.md
+  - Model contract: model-contract.md
+  - KServe v2 compatibility: triton.md
+  - Building & running: building.md

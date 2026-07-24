@@ -8,6 +8,10 @@ Python scripts (`main.py`) run inside a per-model virtualenv, and — behind opt
 build features — **ONNX** and **TensorFlow** models served natively in-process (see
 [Native ONNX and TensorFlow backends](#native-onnx-and-tensorflow-backends)).
 
+📖 **Documentation:** the [`docs/`](docs/) folder is a full docs site (MkDocs) covering the
+architecture, backends, model contract, Triton compatibility, and the build system. Build it
+locally with `pip install -r docs-requirements.txt && mkdocs build` (or `mkdocs serve`).
+
 ## Proto
 - `proto/inference.proto` — the native Nereid service.
 - `proto/grpc_service.proto` — the Triton-compatible KServe v2 surface (see below).
@@ -317,7 +321,7 @@ This folder must exist in the project root and contain all ML model folders.
 a self-contained (or statically linked) binary. It also folds in the pieces an HPC
 build needs — `module load`, an external libtorch install, or a conda/pyenv/venv
 environment. Run `./build.sh --help` for the full option list; the
-**[build guide](docs/index.html)** has the detailed walkthrough. The three linking
+**[docs site](docs/building.md)** has the detailed walkthrough. The three linking
 modes:
 
 - **`dynamic`** (default) — ordinary build. Locates the libtorch `lib/` directory
