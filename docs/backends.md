@@ -3,6 +3,10 @@
 A **backend** is how a model actually runs. nereid works out which one a model needs from the
 contents of its folder, or you can just say so with `backend:` in `nereid.yaml`.
 
+This table is the **canonical list of backends** — other pages link here rather than repeat it, and
+CI checks that every registered backend appears below (see [contributing](#contributing)). Add a row
+here when you add a backend.
+
 | Backend | Feature | Model folder | Heavy dependency | Isolation |
 | --- | --- | --- | --- | --- |
 | Torch (TorchScript) | `torch` *(default)* | `.pt` + textproto | libtorch (via `tch`) | in-process |
@@ -176,3 +180,17 @@ rust-analyzer both walk the module tree, and that tree stops at the generated `i
 wires in `src/backends/`. CI therefore runs `rustfmt` on those files directly in addition to
 `cargo fmt --all --check`. rust-analyzer does run build scripts and should resolve the generated
 modules, though its support for `include!`-wired modules can be flaky.
+
+## Contributing
+
+Backend facts are spread across the docs — the table at the top of this page, the diagram on the
+overview, the folder contract in [Model contract](model-contract.md). To keep those from drifting,
+there is **one canonical source and everything else links to it**: the table at the top of this
+page. When you add (or rename) a backend, update that table; the other pages carry prose that
+references it rather than duplicating the rows.
+
+`scripts/check_backend_docs.sh` guards the one place duplication is unavoidable — that the docs and
+the code agree on which backends exist. It reads the registered `name` of every backend from
+`src/backends/*/mod.rs` and fails if any is missing from the table above, so registering a backend
+without documenting it breaks CI (it runs in the [Docs workflow](https://github.com/ngpaladi/nereid-server/blob/main/.github/workflows/docs.yml)).
+Run it locally with `./scripts/check_backend_docs.sh`.

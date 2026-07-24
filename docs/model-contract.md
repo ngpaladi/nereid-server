@@ -1,22 +1,19 @@
 # Model contract
 
-Every model is a folder under `<server.ml_backends_path>/<model_name>/`. What the folder must
-contain depends on the backend:
+Every model is a folder under `<server.ml_backends_path>/<model_name>/`. What files the folder must
+contain depends on the backend — the **Model folder** column of the
+[backends table](backends.md) is the canonical list, so it isn't repeated here.
 
-| Backend | Required files |
-| --- | --- |
-| Python | `main.py`, `requirements.txt`, `model_inference.textproto` (declaring `output_shape`) |
-| Torch | `model_inference.textproto`, one `.pt` file |
-| ONNX | `model_inference.textproto`, one `.onnx` file |
-| TensorFlow | `model_inference.textproto`, a SavedModel (`saved_model.pb` + `variables/`) |
-| C++ subprocess (`cpp`) | `model_inference.textproto`, a `main.cpp` (or a `build.sh` / prebuilt `model`) |
-| Compile-time C++ (`cxx`) | `model_inference.textproto` only (the C++ is compiled into the server) |
+Two things every folder has in common, whatever the backend:
 
-The server works out the backend from these contents. If a folder matches more than one of them (or
-none at all), set `backend:` in `nereid.yaml` to settle it; what you declare wins, and only that
-backend's own required files are checked. The `cxx` backend is the exception that always needs
-declaring: its folder is just a textproto, which carries no signature to detect, so `backend: "cxx"`
-is required rather than optional (see [Backends](backends.md#compile-time-c-cxx)).
+- a `model_inference.textproto` (below) declaring the model's tensor shapes and datatype — the
+  subprocess backends (Python and `cpp`) additionally require it to declare `output_shape`, since
+  every reply is a typed tensor;
+- exactly one backend's worth of files. The server works out which backend from the folder's
+  contents; if a folder matches more than one (or none), set `backend:` in `nereid.yaml` to settle
+  it and only that backend's files are checked. The `cxx` backend is the exception that always
+  needs declaring — its folder is just a textproto, which carries no signature to detect (see
+  [Backends](backends.md#compile-time-c-cxx)).
 
 ## `model_inference.textproto`
 

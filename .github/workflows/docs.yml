@@ -8,12 +8,18 @@ on:
       - "mkdocs.yml"
       - "docs-requirements.txt"
       - ".github/workflows/docs.yml"
+      # A new/renamed backend must update the canonical table, so changes here
+      # re-run the coverage check even when no doc file was touched.
+      - "src/backends/**"
+      - "scripts/check_backend_docs.sh"
   pull_request:
     paths:
       - "docs/**"
       - "mkdocs.yml"
       - "docs-requirements.txt"
       - ".github/workflows/docs.yml"
+      - "src/backends/**"
+      - "scripts/check_backend_docs.sh"
   workflow_dispatch:
 
 permissions:
@@ -26,6 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Fail if a registered backend is missing from the canonical docs table.
+      - name: Check backend docs coverage
+        run: ./scripts/check_backend_docs.sh
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
