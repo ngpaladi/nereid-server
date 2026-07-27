@@ -39,21 +39,9 @@ Each model gets a semaphore with `queue_capacity` permits. A request takes a per
 blocking backend off the async runtime, and gives the permit back when it's done; if no permit is
 available, the call is rejected right away with `ResourceExhausted`.
 
-```text
-  Client            gRPC handler          permits          backend
-    │  ModelInfer        │                   │                │
-    ├───────────────────►│                   │                │
-    │                    │ validate dtype/   │                │
-    │                    │ shape/batch       │                │
-    │                    ├─── try_acquire ──►│                │
-    │                    │                   │ (none free?)   │
-    │  RESOURCE_EXHAUSTED│◄── unavailable ───┤                │
-    │◄───────────────────┤                   │                │
-    │                    │                   ├──── infer ────►│
-    │                    │◄──────── output tensor ────────────┤
-    │  ModelInferResponse│                   │                │
-    │◄───────────────────┤                   │                │
-```
+<figure markdown="span">
+  ![Backpressure sequence. The gRPC handler validates a ModelInfer request, then tries to acquire a permit. If none are free it returns RESOURCE_EXHAUSTED to the client immediately; otherwise it runs infer on the backend, receives the output tensor, and returns a ModelInferResponse.](diagrams/backpressure.svg){ width="740" style="max-width:100%;height:auto" loading="lazy" }
+</figure>
 
 So nereid sheds load rather than growing a backlog it has no real intention of getting through.
 That's the more useful behavior for a client that is going to retry anyway: a fast rejection is

@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 412" role="img"
+     aria-label="Backpressure sequence. The gRPC handler validates a ModelInfer request, then tries to acquire a permit. If none are free it returns RESOURCE_EXHAUSTED to the client immediately. Otherwise it runs infer on the backend, receives the output tensor, and returns a ModelInferResponse.">
+  <defs>
+    <style>
+      .actor  { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #ebdbb2; font-size: 13px; }
+      .msg    { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #d5c4a1; font-size: 11.5px; }
+      .note   { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; fill: #a89984; font-size: 10.5px; }
+      .tag    { font-family: Menlo, Monaco, "DejaVu Sans Mono", monospace; font-size: 10.5px; font-style: italic; }
+      .life   { stroke: #665c54; stroke-width: 1.3; stroke-dasharray: 3 4; }
+      .solid  { fill: none; stroke: #bdae93; stroke-width: 1.6; }
+      .ret    { fill: none; stroke: #a89984; stroke-width: 1.4; stroke-dasharray: 5 4; }
+    </style>
+    <marker id="s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bdae93"/>
+    </marker>
+    <marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="none" stroke="#a89984" stroke-width="1.4"/>
+    </marker>
+    <marker id="red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="none" stroke="#fb4934" stroke-width="1.6"/>
+    </marker>
+    <marker id="grn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="none" stroke="#b8bb26" stroke-width="1.6"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="740" height="412" fill="#282828"/>
+
+  <!-- lifelines -->
+  <line class="life" x1="90"  y1="62" x2="90"  y2="392"/>
+  <line class="life" x1="292" y1="62" x2="292" y2="392"/>
+  <line class="life" x1="472" y1="62" x2="472" y2="392"/>
+  <line class="life" x1="652" y1="62" x2="652" y2="392"/>
+
+  <!-- actor heads -->
+  <g>
+    <rect x="42"  y="24" width="96"  height="34" rx="7" fill="#32302f" stroke="#83a598" stroke-width="1.5"/>
+    <text class="actor" x="90"  y="46" text-anchor="middle">Client</text>
+    <rect x="226" y="24" width="132" height="34" rx="7" fill="#32302f" stroke="#fabd2f" stroke-width="1.5"/>
+    <text class="actor" x="292" y="46" text-anchor="middle">gRPC handler</text>
+    <rect x="428" y="24" width="88"  height="34" rx="7" fill="#32302f" stroke="#8ec07c" stroke-width="1.5"/>
+    <text class="actor" x="472" y="46" text-anchor="middle">permits</text>
+    <rect x="606" y="24" width="92"  height="34" rx="7" fill="#32302f" stroke="#f38019" stroke-width="1.5"/>
+    <text class="actor" x="652" y="46" text-anchor="middle">backend</text>
+  </g>
+
+  <!-- 1. ModelInfer -->
+  <path class="solid" d="M90,92 H288" marker-end="url(#s)"/>
+  <text class="msg" x="189" y="86" text-anchor="middle">ModelInfer</text>
+
+  <!-- validate note on handler -->
+  <rect x="230" y="104" width="124" height="36" rx="6" fill="#32302f" stroke="#fabd2f" stroke-width="1.3"/>
+  <text class="note" x="292" y="120" text-anchor="middle">validate</text>
+  <text class="note" x="292" y="133" text-anchor="middle">dtype · shape · batch</text>
+
+  <!-- 2. try_acquire -->
+  <path class="solid" d="M292,168 H468" marker-end="url(#s)"/>
+  <text class="msg" x="382" y="162" text-anchor="middle">try_acquire</text>
+
+  <!-- reject fragment -->
+  <rect x="52" y="184" width="648" height="74" rx="6" fill="none" stroke="#fb4934" stroke-width="1" opacity="0.5"/>
+  <text class="tag" x="64" y="199" fill="#fb4934">[queue full — no permit]</text>
+
+  <path class="ret" d="M472,214 H296" marker-end="url(#r)"/>
+  <text class="note" x="384" y="209" text-anchor="middle">unavailable</text>
+
+  <path d="M292,244 H92" fill="none" stroke="#fb4934" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#red)"/>
+  <text class="msg" x="192" y="238" text-anchor="middle" fill="#fb4934">RESOURCE_EXHAUSTED</text>
+
+  <!-- success fragment -->
+  <rect x="52" y="278" width="648" height="104" rx="6" fill="none" stroke="#b8bb26" stroke-width="1" opacity="0.5"/>
+  <text class="tag" x="64" y="293" fill="#b8bb26">[permit acquired]</text>
+
+  <path class="solid" d="M292,310 H648" marker-end="url(#s)"/>
+  <text class="msg" x="472" y="304" text-anchor="middle">infer</text>
+
+  <path class="ret" d="M652,340 H296" marker-end="url(#r)"/>
+  <text class="note" x="474" y="334" text-anchor="middle">output tensor</text>
+
+  <path d="M292,370 H92" fill="none" stroke="#b8bb26" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#grn)"/>
+  <text class="msg" x="192" y="364" text-anchor="middle" fill="#b8bb26">ModelInferResponse</text>
+</svg>

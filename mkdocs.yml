@@ -9,8 +9,16 @@ use_directory_urls: true
 theme:
   name: terminal
   palette: gruvbox_dark
+  custom_dir: overrides
   features:
     - navigation.side.indexes
+    - navigation.top.search_button.hide
+
+extra_css:
+  - css/extra.css
+
+watch:
+  - overrides
 
 markdown_extensions:
   - attr_list
@@ -27,6 +35,6 @@ nav:
   - Overview: index.md
   - Architecture: architecture.md
   - Backends: backends.md
-  - Model contract: model-contract.md
-  - KServe v2 compatibility: triton.md
-  - Building & running: building.md
+  - Contract: model-contract.md
+  - KServe v2: triton.md
+  - Building: building.md

@@ -1,0 +1,21 @@
+{#
+  Override of terminal theme's side panel: adds a search box at the bottom of the
+  left navigation, below the page list and per-page TOC. Pairs with the
+  `navigation.top.search_button.hide` feature, which removes search from the top
+  bar. The trigger opens the theme's existing #mkdocs_search_modal (rendered
+  globally by base.html whenever the search plugin is enabled).
+#}
+{%- set features = config.theme.features or [] -%}
+{%- if "navigation.side.hide" not in features -%}
+<aside id="terminal-mkdocs-side-panel">
+    {%- block side_nav %}{% include "partials/side-nav/side-nav.html" %}{%- endblock side_nav %}
+    {%- block side_toc %}{% include "partials/side-panel/side-toc.html" %}{%- endblock side_toc %}
+    {%- if 'search' in config.plugins %}
+    <hr id="terminal-mkdocs-side-search-sep">
+    <a href="#" id="terminal-mkdocs-side-search" data-toggle="modal" data-target="#mkdocs_search_modal" role="button" aria-label="Search" property="item" typeof="SearchAction">
+        <i aria-hidden="true" class="fa fa-search"></i>
+        <span property="name">Search</span>
+    </a>
+    {%- endif %}
+</aside>
+{%- endif -%}
