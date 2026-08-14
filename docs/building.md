@@ -120,3 +120,60 @@ cargo run    # or ./build.sh --run
 
 The server binds `server.bind_addr` and loads models from `server.ml_backends_path` — see the
 [model contract](model-contract.md).
+
+## Container image
+
+Every published GitHub release builds a `linux/amd64` image and pushes it to the GitHub
+Container Registry:
+
+```bash
+docker pull ghcr.io/ngpaladi/nereid-server:latest
+```
+
+Tags follow the release tag: `{version}`, `{major}.{minor}`, `{major}`, plus a long
+`sha-<commit>` tag on every build. `latest` moves only for a full release — a prerelease
+never claims it.
+
+### Running it
+
+The server reads `nereid.yaml` from its working directory and resolves
+`server.ml_backends_path` relative to it. The image sets `WORKDIR /nereid`, so that is where
+the config and the model folders belong:
+
+```bash
+docker run --rm -p 50051:50051 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server:latest
+```
+
+Two things differ from a host run:
+
+- **Bind a non-loopback address.** `nereid.yaml.example` uses `[::1]:50051`, which inside a
+  container is reachable only from that container. Use `[::]:50051` (or `0.0.0.0:50051`).
+- **The container runs unprivileged**, as uid 10001. The Python backend builds a `venv/`
+  *inside* each model folder, so a mounted model directory has to be writable by that uid —
+  otherwise run with `--user "$(id -u):$(id -g)"` to match the host owner.
+
+### What's in it
+
+A two-stage build. The builder runs `./build.sh --release --link bundled --fetch-libtorch`,
+so libtorch is downloaded with its sha256 verified and its shared objects end up next to the
+binary under an `$ORIGIN/lib` rpath. The runtime stage is `debian:bookworm-slim` plus
+`python3`/`python3-venv` (for the Python backend's per-model virtualenv) and that bundle at
+`/opt/nereid` — no Rust toolchain, no `target/`.
+
+The image ships the default backends (TorchScript `.pt` + Python), which is what makes it
+roughly 600 MB — the bundled libtorch is ~470 MB of that. The `BUILD_ARGS` build argument is
+passed
+straight through to `build.sh`, so a leaner or differently-equipped image is one flag away:
+
+```bash
+docker build --build-arg BUILD_ARGS="--backends onnx" -t nereid-server:onnx .   # links no libtorch
+docker build --build-arg BUILD_ARGS="--onnx --tensorflow" -t nereid-server:all .
+```
+
+### Building or publishing by hand
+
+The **Container image** workflow also takes a `workflow_dispatch`. Left alone it builds and
+smoke-tests without publishing; tick `push` to publish the result under the branch and commit
+tags. The smoke test checks the two things a container gets wrong first — that every shared
+object the binary needs resolves inside the image, and that the server starts and reads its
+config — not that any model serves.

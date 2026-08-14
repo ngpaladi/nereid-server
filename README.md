@@ -395,6 +395,28 @@ cxx11 ABI (PyTorch additionally provides builds with the pre-cxx11 ABI for older
 including 2.5.1), and must have been built against a CUDA version compatible with the system's
 CUDA libraries and drivers.
 
+## Container image
+Every published GitHub release builds a `linux/amd64` image and pushes it to GHCR:
+```bash
+docker pull ghcr.io/ngpaladi/nereid-server:latest    # also :<version>, :<major>.<minor>, :<major>, :sha-<commit>
+```
+The server reads `nereid.yaml` from its working directory and resolves
+`server.ml_backends_path` relative to it; the image sets `WORKDIR /nereid`, so mount the
+config and model folders there:
+```bash
+docker run --rm -p 50051:50051 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server:latest
+```
+Set `bind_addr: "[::]:50051"` in that config — the example's `[::1]` is loopback-only and
+unreachable from outside the container. The container runs as uid 10001, so a mounted model
+folder must be writable by it (the Python backend builds a `venv/` inside each one) or run
+with `--user "$(id -u):$(id -g)"`.
+
+The image is built by `Dockerfile` from `./build.sh --release --link bundled --fetch-libtorch`
+(the *bundled* mode above) on a `debian:bookworm-slim` runtime. It carries the default
+torch+python backends — pass `--build-arg BUILD_ARGS="--backends onnx"` for a leaner one. See
+the **[docs site](docs/building.md#container-image)** for details, and the *Container image*
+workflow's `workflow_dispatch` for building or publishing outside a release.
+
 ## Python mock ED client
 The Python client is a YAML-configured mock ED producer runner. It supports fixed shapes, a list of possible shapes, and random shape generation for variable-shape models.
 

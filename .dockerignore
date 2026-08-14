@@ -1,0 +1,29 @@
+# Keep the build context small: the image build only needs the sources, the
+# manifests, `proto/`, and `build.sh`/`build.rs`. Everything below is either
+# generated, huge, or runtime-only state that must never be baked into a layer.
+
+# Cargo output — `target/` holds the extracted libtorch and is tens of GB.
+target
+dist
+.cache
+
+# Repo metadata / CI / docs site
+.git
+.gitignore
+.github
+site
+
+# Model folders and Python client state. The server reads models from a mounted
+# `ml_backends_path` at runtime, so none of this is needed to build the binary.
+ml-backends
+python-client
+**/__pycache__
+**/venv
+**/.venv
+
+# Local runtime config — a container gets its config mounted in, never copied.
+nereid.yaml
+
+# Editor / tool leftovers
+**/*.rs.bk
+**/mutants.out*
