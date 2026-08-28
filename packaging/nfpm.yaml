@@ -1,0 +1,120 @@
+# nfpm recipe for the nereid-server .deb / .rpm (see .github/workflows/packages.yml).
+#
+# What gets packaged is the *relocatable bundle* that
+# `./build.sh --release --link bundled` produces in dist/grpc-test: the binary
+# plus every shared object it needs (libtorch is ~470 MB of it), with the rpath
+# already patched to $ORIGIN/lib. That is why this recipe can drop the tree into
+# /usr/lib/nereid-server verbatim and declare almost no library dependencies —
+# the bundle carries its own.
+#
+# Build it with:
+#   VERSION=1.2.3 nfpm package -f packaging/nfpm.yaml -p deb -t dist/pkg
+#   VERSION=1.2.3 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/pkg
+# from the repo root, with dist/grpc-test already populated.
+
+name: nereid-server
+arch: amd64
+platform: linux
+# Supplied by the workflow from the release tag (leading "v" stripped).
+version: ${VERSION}
+release: "1"
+section: net
+priority: optional
+maintainer: ngpaladi <ngpaladi@gmail.com>
+description: |
+  A nifty little Rust inference server (gRPC, KServe v2 compatible).
+  Serves TorchScript .pt models and Python main.py models over gRPC, speaking
+  both the native Nereid protocol and Triton's KServe v2 GRPCInferenceService.
+vendor: ngpaladi
+homepage: https://github.com/ngpaladi/nereid-server
+license: MIT
+
+depends:
+  # The Python backend creates a per-model virtualenv at load time and runs
+  # main.py inside it; that venv's `pip install -r requirements.txt` needs TLS
+  # roots. libgomp is the OpenMP runtime libtorch links against — the bundle
+  # usually ships its own copy, but naming it here keeps a partial bundle from
+  # failing at load time. Overridden per-format below, where the names differ.
+  - python3
+  - ca-certificates
+
+overrides:
+  deb:
+    depends:
+      - python3
+      - python3-venv
+      - ca-certificates
+      - libgomp1
+  rpm:
+    depends:
+      - python3
+      - ca-certificates
+      - libgomp
+
+contents:
+  # The bundle, verbatim. $ORIGIN/lib resolves relative to the real path of the
+  # binary — the loader follows /usr/bin/nereid-server through to
+  # /usr/lib/nereid-server/grpc-test first — so the symlink below is safe.
+  - src: dist/grpc-test/grpc-test
+    dst: /usr/lib/nereid-server/grpc-test
+    file_info:
+      mode: 0755
+  - src: dist/grpc-test/lib
+    dst: /usr/lib/nereid-server/lib
+    type: tree
+
+  # `grpc-test` is the cargo package name, and renaming it is a source change,
+  # not a packaging one. Everything user-facing goes through this symlink.
+  - src: /usr/lib/nereid-server/grpc-test
+    dst: /usr/bin/nereid-server
+    type: symlink
+
+  - src: packaging/nereid-server.service
+    dst: /usr/lib/systemd/system/nereid-server.service
+    file_info:
+      mode: 0644
+
+  # The state directory the unit uses as its working directory. postinstall
+  # chowns it to `nereid`; ml-backends is where model folders go.
+  - dst: /var/lib/nereid-server
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /var/lib/nereid-server/ml-backends
+    type: dir
+    file_info:
+      mode: 0755
+
+  # config|noreplace: an upgrade never clobbers an edited nereid.yaml.
+  - src: packaging/nereid.yaml
+    dst: /var/lib/nereid-server/nereid.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - src: nereid.yaml.example
+    dst: /usr/share/doc/nereid-server/nereid.yaml.example
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/nereid-server/README.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/nereid-server/LICENSE
+    file_info:
+      mode: 0644
+
+scripts:
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+# ~600 MB of mostly-compressible shared objects. xz is slow but is the one
+# codec both dpkg and rpm have understood for a decade, and this runs once per
+# release.
+deb:
+  compression: xz
+rpm:
+  compression: xz

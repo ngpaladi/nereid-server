@@ -1,0 +1,205 @@
+name: Linux packages
+
+# Builds the .deb and .rpm and attaches them to a release. `workflow_dispatch`
+# exercises the same path before a release exists (or rebuilds one by hand): it
+# builds and smoke-tests by default, and only attaches assets when you tick
+# `upload` and name the tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Attach the packages to a release (unchecked = build and smoke-test only)"
+        type: boolean
+        default: false
+      tag:
+        description: "Release tag to version against, and to attach to when `upload` is ticked (e.g. v1.2.3)"
+        type: string
+        default: ""
+
+# `contents: write` is what lets the upload step add release assets — this is
+# the one place these packages differ from the container workflow, which only
+# ever reads the repo.
+permissions:
+  contents: write
+
+env:
+  # Pin the packager: a floating "latest" would change how the .deb and .rpm are
+  # laid out between two releases of this repo for no visible reason.
+  NFPM_VERSION: "2.47.0"
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    # Same shape as the container build: a cold build compiles the full
+    # dependency tree, links libtorch, and then xz-compresses ~600 MB.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same reasoning as the container workflow: the builder image, the cargo
+      # registry, the fetched libtorch, `target/` and the extracted bundle do
+      # not all fit on a stock runner. If this job ever dies with a cryptic I/O
+      # error, disk is the first thing to check.
+      - name: Free up runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built from packaging/Dockerfile.el9, not the repo's main Dockerfile: a
+      # package inherits the glibc of whatever built it, and that becomes a hard
+      # floor for every machine it can be installed on, so the packages get
+      # their own build stage on the oldest base worth supporting. Enterprise
+      # Linux 9 (glibc 2.34) puts that floor at RHEL/Rocky/AlmaLinux 9+,
+      # Debian 12+, Ubuntu 22.04+ and Fedora 38+, and is supported until 2032.
+      #
+      # That stage deliberately mirrors the main Dockerfile's: same name, same
+      # `./build.sh --release --link bundled --fetch-libtorch`, bundle at the
+      # same /src/dist/grpc-test — so the extraction below doesn't care which
+      # one produced it. The container image keeps its own Debian base; nothing
+      # in a container cares what the host's glibc is.
+      - name: Build the relocatable bundle
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/Dockerfile.el9
+          target: builder
+          platforms: linux/amd64
+          load: true
+          tags: nereid-builder:${{ github.sha }}
+
+      # The bundle is /src/dist/grpc-test — the binary with its rpath already
+      # patched to $ORIGIN/lib, plus lib/ holding every shared object it needs.
+      - name: Extract the bundle from the builder image
+        env:
+          BUILDER_IMAGE: nereid-builder:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cid="$(docker create "$BUILDER_IMAGE")"
+          mkdir -p dist
+          docker cp "$cid:/src/dist/grpc-test" dist/grpc-test
+          docker rm "$cid" >/dev/null
+          # Reclaim the multi-GB builder image now that the bundle is out; the
+          # xz compression below still needs room to work.
+          docker image rm "$BUILDER_IMAGE" >/dev/null || true
+          docker builder prune -af >/dev/null || true
+          echo "bundle contents:"
+          ls -l dist/grpc-test
+          du -sh dist/grpc-test
+          df -h /
+
+      # nfpm writes both formats from one recipe, and unlike cargo-deb /
+      # cargo-generate-rpm it is happy to package an arbitrary file tree —
+      # which is what a bundled libtorch is.
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.deb \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb"
+          sudo dpkg -i /tmp/nfpm.deb
+          nfpm --version
+
+      # Release runs take the published tag; a manual run takes the `tag` input,
+      # falling back to 0.0.0 so a dry run still produces installable packages.
+      #
+      # The tag has to be semver (`v1.2.3`, `v1.2.3-rc1`): nfpm parses it under
+      # its default semver schema and rejects anything else — two hours later,
+      # at the packaging step, not here.
+      - name: Derive the package version
+        id: version
+        # Both tag values arrive through the environment rather than being
+        # interpolated into the script: a `${{ }}` expansion is pasted in as
+        # literal shell text, so a tag containing shell metacharacters would run
+        # as code here.
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="$RELEASE_TAG"
+          else
+            tag="$INPUT_TAG"
+          fi
+          version="${tag#v}"
+          if [ -z "$version" ]; then
+            version="0.0.0"
+            echo "no tag given — versioning this dry run as $version"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the .deb and .rpm
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkg
+          nfpm package -f packaging/nfpm.yaml -p deb -t dist/pkg
+          nfpm package -f packaging/nfpm.yaml -p rpm -t dist/pkg
+          ls -lh dist/pkg
+
+      # Install each package in a clean container of the *oldest* distro its
+      # glibc floor claims to support, so the check is against the binding end
+      # of that claim — Ubuntu 22.04 (2.35) for the deb family, AlmaLinux 9
+      # (2.34) for the rpm one. smoke-test.sh greps ldd for "not found", which catches a
+      # missing version symbol ("version `GLIBC_2.34' not found") as readily as
+      # a missing library — so these two runs are what actually verifies the
+      # cross-distro story, not just the packaging.
+      - name: Smoke-test the .deb (Ubuntu 22.04 — lowest deb target)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w ubuntu:22.04 \
+            sh -c '/w/packaging/smoke-test.sh /w/dist/pkg/*.deb'
+
+      # AlmaLinux 9 is the load-bearing test: it is the build base's own glibc,
+      # so it sits exactly on the floor — if anything in the bundle reached for
+      # a newer symbol, this is where it surfaces.
+      - name: Smoke-test the .rpm (AlmaLinux 9 — the glibc floor)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w almalinux:9 \
+            sh -c '/w/packaging/smoke-test.sh /w/dist/pkg/*.rpm'
+
+      # And the other end of the family, where the dependency names are most
+      # likely to have drifted. `fedora:latest` rather than a pinned release: a
+      # pinned tag quietly rots into an end-of-life image whose repos only
+      # resolve from the archive.
+      - name: Smoke-test the .rpm (Fedora — current)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w fedora:latest \
+            sh -c '/w/packaging/smoke-test.sh /w/dist/pkg/*.rpm'
+
+      # Always keep the artifacts, so a dry run is useful without touching a
+      # release and a failed upload doesn't mean rebuilding for two hours.
+      - name: Upload the packages as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nereid-server-packages-${{ steps.version.outputs.version }}
+          path: dist/pkg/*
+          if-no-files-found: error
+          # Already xz-compressed; a zip pass over ~200 MB buys nothing.
+          compression-level: 0
+
+      - name: Attach the packages to the release
+        if: ${{ github.event_name == 'release' || inputs.upload }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo '::error::upload was requested but no tag was given'; exit 1
+          fi
+          gh release upload "$TAG" dist/pkg/* --clobber

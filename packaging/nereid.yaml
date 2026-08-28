@@ -1,0 +1,29 @@
+# nereid-server configuration.
+#
+# Installed as a conffile: your edits survive package upgrades.
+#
+# The server reads this file from its working directory, which the systemd unit
+# pins to /var/lib/nereid-server, and resolves `ml_backends_path` relative to
+# that same directory. Drop each model folder under
+# /var/lib/nereid-server/ml-backends and add a matching entry to `models` below.
+#
+# `models` must list at least one model — the server refuses to start otherwise,
+# which is why nereid-server.service is installed disabled. Configure this file,
+# then:
+#
+#     systemctl enable --now nereid-server
+#
+# See /usr/share/doc/nereid-server/nereid.yaml.example for the fully annotated
+# reference (per-model `device`, `queue_capacity` and `backend` keys).
+
+server:
+  # [::] rather than the example config's loopback [::1], so the service is
+  # reachable from off-box. Narrow it if you only want local clients.
+  bind_addr: "[::]:50051"
+
+  ml_backends_path: "ml-backends"
+
+models: []
+  # - name: "model3"
+  #   device: "cpu"
+  #   queue_capacity: 16

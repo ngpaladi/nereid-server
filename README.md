@@ -417,6 +417,50 @@ torch+python backends — pass `--build-arg BUILD_ARGS="--backends onnx"` for a 
 the **[docs site](docs/building.md#container-image)** for details, and the *Container image*
 workflow's `workflow_dispatch` for building or publishing outside a release.
 
+## Linux packages (`.deb` / `.rpm`)
+Every published GitHub release also attaches a `.deb` and an `.rpm` for `x86_64`, built
+from the same bundle as the container image:
+```bash
+sudo apt install ./nereid-server_<version>-1_amd64.deb     # Debian / Ubuntu
+sudo dnf install ./nereid-server-<version>-1.x86_64.rpm    # Fedora / openSUSE
+```
+They carry their own libtorch (rpath `$ORIGIN/lib`), so there is no `LD_LIBRARY_PATH` to
+set and no libtorch to install — which is also why they are ~200 MB compressed.
+
+What lands where:
+
+| Path | Contents |
+| --- | --- |
+| `/usr/bin/nereid-server` | symlink to the binary |
+| `/usr/lib/nereid-server/` | the bundle: binary + `lib/*.so` |
+| `/usr/lib/systemd/system/nereid-server.service` | the unit, installed **disabled** |
+| `/var/lib/nereid-server/nereid.yaml` | your config (a conffile — upgrades never clobber it) |
+| `/var/lib/nereid-server/ml-backends/` | where model folders go |
+| `/usr/share/doc/nereid-server/` | `nereid.yaml.example`, README, LICENSE |
+
+The unit runs as the `nereid` system user with `WorkingDirectory=/var/lib/nereid-server`,
+which is how the server finds its config — it reads `nereid.yaml` from the working directory
+and resolves `ml_backends_path` relative to it. The shipped config has an empty `models`
+list and the server refuses to start on an empty list, so configure it first:
+```bash
+sudo cp -r mymodel /var/lib/nereid-server/ml-backends/
+sudo -e /var/lib/nereid-server/nereid.yaml     # add an entry under `models:`
+sudo chown -R nereid:nereid /var/lib/nereid-server
+sudo systemctl enable --now nereid-server
+```
+Uninstalling leaves `/var/lib/nereid-server` and its models in place.
+
+**Compatibility:** the packages are built on Enterprise Linux 9 (glibc 2.34), so they need
+RHEL/Rocky/AlmaLinux 9+, Debian 12+, Ubuntu 22.04+, or Fedora 38+. Each release is installed
+and run in `almalinux:9` and `ubuntu:22.04` — the binding end of that floor in each package
+family — before the assets are attached.
+
+Built by the *Linux packages* workflow from `packaging/nfpm.yaml`, on the EL9 build stage in
+`packaging/Dockerfile.el9` — the container image keeps its own Debian base, since nothing in
+a container cares what the host's glibc is. The workflow's `workflow_dispatch` builds and
+smoke-tests outside a release (`packaging/smoke-test.sh` installs each package in a clean
+container and runs it).
+
 ## Python mock ED client
 The Python client is a YAML-configured mock ED producer runner. It supports fixed shapes, a list of possible shapes, and random shape generation for variable-shape models.
 
