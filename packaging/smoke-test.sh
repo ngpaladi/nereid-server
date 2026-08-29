@@ -57,7 +57,30 @@ if [ -n "$missing" ]; then
     echo "$missing" >&2
     exit 1
 fi
-echo "OK: all shared libraries resolve out of the bundle"
+# "Resolved" is not the same as "resolved from the bundle": a host copy of
+# libtorch sitting on the loader path would satisfy the check above while the
+# bundle itself was broken, and the package would then be silently depending on
+# something it does not ship. So pin it down — every library the bundle carries
+# that the binary actually links against must resolve to the bundle's own copy.
+bundle_dir=/usr/lib/nereid-server/lib
+checked=0
+for so in "$bundle_dir"/*.so*; do
+    soname="$(basename "$so")"
+    # ldd prints "<soname> => <path> (<addr>)"; an exact field match avoids
+    # having to escape the dots in the soname into a regex.
+    resolved="$(printf '%s\n' "$deps" | awk -v n="$soname" '$1 == n && $2 == "=>" {print $3; exit}')"
+    # Not every file in the bundle is a direct dependency of the binary (libtorch
+    # ships extras that only its own libraries pull in) — those are fine.
+    [ -n "$resolved" ] || continue
+    if [ "$resolved" != "$bundle_dir/$soname" ]; then
+        echo "$soname resolved outside the bundle: $resolved" >&2
+        echo "the package is depending on a library it does not ship" >&2
+        exit 1
+    fi
+    checked=$((checked + 1))
+done
+[ "$checked" -gt 0 ] || { echo "no bundled library was linked at all — is the bundle empty?" >&2; exit 1; }
+echo "OK: all shared libraries resolve, and the $checked bundled one(s) come from $bundle_dir"
 
 # 2. The packaged files landed where the unit expects them.
 #

@@ -422,7 +422,7 @@ Every published GitHub release also attaches a `.deb` and an `.rpm` for `x86_64`
 from the same bundle as the container image:
 ```bash
 sudo apt install ./nereid-server_<version>-1_amd64.deb     # Debian / Ubuntu
-sudo dnf install ./nereid-server-<version>-1.x86_64.rpm    # Fedora / openSUSE
+sudo dnf install ./nereid-server-<version>-1.x86_64.rpm    # RHEL / Rocky / AlmaLinux / Fedora
 ```
 They carry their own libtorch (rpath `$ORIGIN/lib`), so there is no `LD_LIBRARY_PATH` to
 set and no libtorch to install — which is also why they are ~200 MB compressed.

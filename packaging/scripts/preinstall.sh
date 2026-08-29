@@ -18,6 +18,11 @@ for candidate in /usr/sbin/nologin /sbin/nologin /usr/bin/false /bin/false; do
     fi
 done
 
+# The ${nologin:+...} form expands to two separate words (--shell and the path)
+# when a shell was found and to nothing at all when none was — the quotes inside
+# it are shell syntax, not literal characters, in both bash and dash. Leaving it
+# unquoted is what allows the whole option to disappear; quoting the expansion
+# would pass an empty argument instead.
 if ! getent passwd nereid >/dev/null 2>&1; then
     if command -v useradd >/dev/null 2>&1; then
         useradd --system --no-create-home --home-dir /var/lib/nereid-server \

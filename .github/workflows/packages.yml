@@ -102,10 +102,18 @@ jobs:
       # cargo-generate-rpm it is happy to package an arbitrary file tree —
       # which is what a bundled libtorch is.
       - name: Install nfpm
+        env:
+          # sha256 of nfpm_<NFPM_VERSION>_amd64.deb, taken from that release's
+          # checksums.txt. Pinned here rather than fetched next to the download:
+          # a checksum pulled from the same place as the artifact only catches
+          # corruption, while one committed to this repo has to get past review
+          # to change. Update both this and NFPM_VERSION together.
+          NFPM_SHA256: "3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97"
         run: |
           set -euo pipefail
           curl -fsSL -o /tmp/nfpm.deb \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb"
+          echo "${NFPM_SHA256}  /tmp/nfpm.deb" | sha256sum -c -
           sudo dpkg -i /tmp/nfpm.deb
           nfpm --version
 
@@ -136,8 +144,21 @@ jobs:
             version="0.0.0"
             echo "no tag given — versioning this dry run as $version"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # Validate before anything downstream sees it. Two things this buys:
+          # nfpm parses the version under its default semver schema and would
+          # otherwise reject it two hours from now at the packaging step, with a
+          # whole libtorch build already spent; and `tag` can come from a
+          # free-form workflow_dispatch input, so an unvalidated value carrying a
+          # newline would write extra keys into $GITHUB_OUTPUT. The character set
+          # below admits no newline, which closes that structurally.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$ ]]; then
+            echo "::error::tag [$tag] is not semver — nfpm needs MAJOR.MINOR.PATCH, e.g. v1.2.3 or v1.2.3-rc1"
+            exit 1
+          fi
+
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Build the .deb and .rpm
         env:
