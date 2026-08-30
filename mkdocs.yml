@@ -1,5 +1,10 @@
 site_name: nereid-server
 site_description: A nifty little Rust inference server — architecture, backends, and build guide.
+# Required, not optional: the theme's site-name link in the top-left falls back
+# to "/" when this is unset, and this site is served from a subpath, so "/" is
+# the parent domain's homepage rather than the docs root. Setting it also gives
+# the 404 page's "Return Home" button somewhere correct to go.
+site_url: https://www.noahpaladino.com/nereid-server/
 repo_url: https://github.com/ngpaladi/nereid-server
 repo_name: ngpaladi/nereid-server
 docs_dir: docs

@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+#
+# EL9 build stage for the nereid-server .deb / .rpm.
+#
+# The repo's main Dockerfile builds the container image on Debian, and its
+# runtime is a container — nothing there cares what the host's glibc is. A
+# distro package is the opposite: it inherits the glibc of whatever built it,
+# and that becomes a hard floor for every machine it can be installed on. So
+# the packages get their own build stage, on the oldest base we want to
+# support, and the image keeps its Debian one.
+#
+# Enterprise Linux 9 (glibc 2.34, gcc 11) is that base. It puts the floor at
+# RHEL/Rocky/AlmaLinux 9+, Debian 12+, Ubuntu 22.04+ and Fedora 38+, and EL9 is
+# supported until 2032 — unlike the Debian oldstable this replaced, which was
+# weeks from leaving LTS.
+#
+# Only libtorch's own shared objects get bundled beside the binary, so
+# libstdc++ still comes from the host at runtime. That is fine in both
+# directions here: libtorch itself needs no more than GLIBCXX_3.4.26, EL9
+# provides 3.4.29, and every newer target in the matrix provides more.
+#
+# Deliberately mirrors the main Dockerfile's builder stage — same stage name,
+# same WORKDIR, same build.sh invocation — so the packaging workflow extracts
+# the bundle from /src/dist/grpc-test either way.
+#
+#   docker build -f packaging/Dockerfile.el9 --target builder -t nereid-builder .
+
+ARG EL9_IMAGE=almalinux:9
+
+FROM ${EL9_IMAGE} AS builder
+
+# patchelf is the only one of these that isn't in the EL9 base repos — it lives
+# in EPEL. Without it build.sh falls back to an LD_LIBRARY_PATH wrapper script
+# and the bundle stops being a single self-contained executable, which is the
+# whole premise of the package layout.
+#
+# gcc-c++ is not optional either: torch-sys compiles a C++ shim against
+# libtorch. curl is deliberately absent — EL9 ships curl-minimal, and asking
+# for the full build conflicts with it.
+RUN dnf install -y --setopt=install_weak_deps=False epel-release \
+    && dnf install -y --setopt=install_weak_deps=False \
+        gcc gcc-c++ make unzip patchelf \
+    && dnf clean all
+
+# Floats on stable, the way the main Dockerfile's `rust:1` tag does. The crate
+# is edition 2024, so this needs to stay >= 1.85.
+ARG RUST_VERSION=stable
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && rustc --version
+
+WORKDIR /src
+
+# Extra flags forwarded verbatim to build.sh (backend selection, device, ...),
+# matching the main Dockerfile.
+ARG BUILD_ARGS=""
+
+COPY . .
+
+RUN ./build.sh --release --link bundled --fetch-libtorch ${BUILD_ARGS}
