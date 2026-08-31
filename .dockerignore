@@ -13,6 +13,12 @@ dist
 .github
 site
 
+# Distro packaging (nfpm recipe, systemd unit, maintainer scripts). It packages
+# the bundle the builder stage produces, so it is never needed *inside* the
+# build — and keeping it out means editing a package script can't invalidate
+# the `COPY . .` layer and force a full image rebuild.
+packaging
+
 # Model folders and Python client state. The server reads models from a mounted
 # `ml_backends_path` at runtime, so none of this is needed to build the binary.
 ml-backends

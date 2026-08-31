@@ -1,0 +1,35 @@
+[Unit]
+Description=nereid-server — a nifty little Rust inference server (gRPC, KServe v2 compatible)
+Documentation=https://github.com/ngpaladi/nereid-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nereid
+Group=nereid
+
+# The server reads `nereid.yaml` from its working directory and resolves
+# `server.ml_backends_path` relative to it (src/main.rs), so the working
+# directory *is* the configuration contract — there is no --config flag.
+WorkingDirectory=/var/lib/nereid-server
+ExecStart=/usr/bin/nereid-server
+
+Restart=on-failure
+RestartSec=5s
+
+# The Python backend builds a per-model virtualenv inside the model folder the
+# first time that model loads, so /var/lib/nereid-server must stay writable and
+# the venv's `pip install` needs outbound network. ProtectSystem=full (not
+# =strict) is therefore the ceiling here: it makes /usr, /boot and /etc
+# read-only while leaving /var alone.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

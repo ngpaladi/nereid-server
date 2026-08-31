@@ -30,7 +30,8 @@
     width: 100%;
 }
 
-#terminal-mkdocs-side-search {
+#terminal-mkdocs-side-search,
+#terminal-mkdocs-side-repo {
     display: flex;
     align-items: center;
     gap: 0.55em;
@@ -46,14 +47,26 @@
 }
 
 #terminal-mkdocs-side-search:hover,
-#terminal-mkdocs-side-search:focus {
+#terminal-mkdocs-side-search:focus,
+#terminal-mkdocs-side-repo:hover,
+#terminal-mkdocs-side-repo:focus {
     border-color: var(--primary-color);
     color: var(--font-color);
     outline: none;
 }
 
-#terminal-mkdocs-side-search .fa {
+#terminal-mkdocs-side-search .fa,
+#terminal-mkdocs-side-repo svg {
     opacity: 0.85;
+}
+
+/* The repo link sits directly under search, sharing its box style. */
+#terminal-mkdocs-side-repo {
+    margin-top: 0.5em;
+}
+
+#terminal-mkdocs-side-repo svg {
+    flex: 0 0 auto;
 }
 
 /* Diagrams render edge-to-edge of the content column without a code-block frame. */

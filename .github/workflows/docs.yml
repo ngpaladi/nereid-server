@@ -6,6 +6,10 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      # Theme template overrides. mkdocs.yml lists these under `watch`, and a
+      # broken one fails `mkdocs build --strict` exactly like a bad doc page,
+      # so an overrides-only change has to build too.
+      - "overrides/**"
       - "docs-requirements.txt"
       - ".github/workflows/docs.yml"
       # A new/renamed backend must update the canonical table, so changes here
@@ -16,6 +20,7 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      - "overrides/**"
       - "docs-requirements.txt"
       - ".github/workflows/docs.yml"
       - "src/backends/**"

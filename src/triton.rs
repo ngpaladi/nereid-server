@@ -841,8 +841,10 @@ mod triton_e2e_tests {
         assert_eq!(response.outputs[0].shape, vec![1, 4], "output shape");
         let raw = &response.raw_output_contents[0];
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "pymul must compute input * 2 + 1");
     }
@@ -899,8 +901,10 @@ mod triton_e2e_tests {
         assert_eq!(response.outputs[0].shape, vec![1, 4]);
         let raw = &response.raw_output_contents[0];
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "onnxadd must compute input + 1");
     }
@@ -960,8 +964,10 @@ mod triton_e2e_tests {
         assert_eq!(response.outputs[0].shape, vec![1, 4]);
         let raw = &response.raw_output_contents[0];
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "tfadd must compute input + 1");
     }
@@ -1047,8 +1053,10 @@ mod triton_e2e_tests {
         assert_eq!(response.outputs[0].shape, vec![1, 4]);
         let raw = &response.raw_output_contents[0];
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "cxxadd must compute input + 1");
     }
@@ -1105,8 +1113,10 @@ mod triton_e2e_tests {
         assert_eq!(response.outputs[0].shape, vec![1, 4]);
         let raw = &response.raw_output_contents[0];
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "cppadd must compute input + 1");
     }
@@ -1175,8 +1185,10 @@ mod triton_e2e_tests {
             .into_inner();
         let raw = &response.raw_output_contents[0];
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -1409,8 +1421,10 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
         let decode = |t: &InferOutputTensor, raw: &[u8]| -> (String, Vec<f32>) {
             (
                 t.name.clone(),
-                raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
             )
         };
@@ -1545,8 +1559,10 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
         assert_eq!(response.outputs[0].datatype, "INT64", "output datatype");
         assert_eq!(response.outputs[0].shape, vec![1, 4]);
         let got: Vec<i64> = response.raw_output_contents[0]
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "rustint must compute input + 1 in int64");
     }
@@ -1593,8 +1609,10 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
         assert_eq!(response.outputs[0].datatype, "INT32", "output datatype");
         assert_eq!(response.outputs[0].shape, vec![1, 4]);
         let got: Vec<i32> = response.raw_output_contents[0]
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "pyaddint must compute input + 1 in int32");
     }
@@ -1643,8 +1661,10 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             .into_inner();
         assert_eq!(response.outputs[0].shape, vec![2]);
         let got: Vec<f32> = response.raw_output_contents[0]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, vec![7.0, 8.0]);
 
@@ -2016,8 +2036,10 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             let infer = resp.infer_response.expect("infer_response present");
             let expected: Vec<f32> = batches[seen].iter().map(|v| v * 2.0 + 1.0).collect();
             let got: Vec<f32> = infer.raw_output_contents[0]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             assert_eq!(got, expected, "stream response {seen} arithmetic");
             seen += 1;
