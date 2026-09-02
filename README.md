@@ -418,8 +418,14 @@ the **[docs site](docs/building.md#container-image)** for details, and the *Cont
 workflow's `workflow_dispatch` for building or publishing outside a release.
 
 ## Linux packages (`.deb` / `.rpm`)
-Every published GitHub release also attaches a `.deb` and an `.rpm` for `x86_64`, built
-from the same bundle as the container image:
+Every published GitHub release attaches a `.deb` and an `.rpm` for `x86_64`, built from the
+same bundle as the container image. On the RHEL family there is a dnf repository, so
+upgrades come with everything else:
+```bash
+sudo dnf config-manager --add-repo https://www.noahpaladino.com/nereid-server/rpm/nereid-server.repo
+sudo dnf install nereid-server
+```
+Or install a downloaded package directly:
 ```bash
 sudo apt install ./nereid-server_<version>-1_amd64.deb     # Debian / Ubuntu
 sudo dnf install ./nereid-server-<version>-1.x86_64.rpm    # RHEL / Rocky / AlmaLinux / Fedora
@@ -454,6 +460,17 @@ Uninstalling leaves `/var/lib/nereid-server` and its models in place.
 RHEL/Rocky/AlmaLinux 9+, Debian 12+, Ubuntu 22.04+, or Fedora 38+. Each release is installed
 and run in `almalinux:9` and `ubuntu:22.04` — the binding end of that floor in each package
 family — before the assets are attached.
+
+The dnf repository is published as part of the docs site by `packaging/make-rpm-repo.sh`,
+which regenerates it from the release assets whenever the packages workflow finishes. Only
+the *metadata* is hosted there — one package is ~200 MB and GitHub Pages caps a site at
+1 GB — so `primary.xml` carries an `xml:base` that sends `dnf` to the release download URL
+for the package itself. The `.repo` sets `gpgcheck=1` and `repo_gpgcheck=1`; the RPMs are
+signed by the packages workflow, and an unsigned one is left out of the metadata rather than
+listed and then refused. `packaging/test-rpm-repo.sh` installs from the generated repository
+in `almalinux:9` and `fedora:latest` on every docs build. See
+[the install page](https://www.noahpaladino.com/nereid-server/install/) for the user-facing
+version. There is no apt repository yet.
 
 Built by the *Linux packages* workflow from `packaging/nfpm.yaml`, on the EL9 build stage in
 `packaging/Dockerfile.el9` — the container image keeps its own Debian base, since nothing in
