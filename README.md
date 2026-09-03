@@ -26,7 +26,9 @@ so the wire format is byte-compatible. This is **wire**-parity, not authoring-pa
 are still written against nereid's own contracts (a `.pt` file or a `main.py`).
 
 **Implemented RPCs:** `ServerLive`, `ServerReady`, `ModelReady`, `ServerMetadata`,
-`ModelMetadata`, unary `ModelInfer`, and streaming `ModelStreamInfer`. Both backends are
+`ModelMetadata`, unary `ModelInfer`, streaming `ModelStreamInfer`, and `RepositoryIndex` (every
+configured model, version `"1"`, state `READY` — the discovery call CMSSW's SONIC client makes on
+connect; a named `repository_name` is `UNIMPLEMENTED`, as in Triton). Both backends are
 servable:
 - **Rust `.pt`** — single-tensor and multi-tensor (nested `input {}`/`output {}` blocks in
   the textproto); datatypes are the libtorch kinds (`FP16/32/64`, `INT8/16/32/64`, `UINT8`,
@@ -43,7 +45,7 @@ servable:
 The request datatype must match the model's declared `data_type` (default `FP32`). nereid
 serves a single implicit model version, `"1"`. **Not implemented (deferred):** Rust
 `UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror, Prometheus metrics, and the
-repository/config/statistics RPCs.
+model load/unload, config and statistics RPCs.
 
 ### Verifying compatibility
 Wire compatibility is established by a **stock `tritonclient`** (built from Triton's own proto

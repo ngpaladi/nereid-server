@@ -16,8 +16,10 @@ Usage:
         --model pymul:mul --model pyaddint:addint --model model3 \
         --stream pymul
 
-Each ``--model`` is ``NAME`` or ``NAME:MODE``. For every model the script checks
-readiness, metadata, and one ``infer()``. Modes assert real arithmetic:
+The script first fetches the repository index (``RepositoryIndex``, the call
+CMSSW's SONIC client makes on connect) and requires every model named below to
+be listed there as ``READY``. Each ``--model`` is ``NAME`` or ``NAME:MODE``.
+For every model the script checks readiness, metadata, and one ``infer()``. Modes assert real arithmetic:
 ``mul`` -> ``input*2+1`` in FP32 (the ``ml-backends/pymul`` fixture);
 ``addint`` -> ``input+1`` in INT32 (``ml-backends/pyaddint``, the non-float
 datatype path). ``--stream NAME`` additionally drives the streaming
@@ -35,6 +37,22 @@ import tritonclient.grpc as grpcclient
 def _concrete_shape(meta_shape):
     """Variable (-1) dims become 1 so we can build a concrete request."""
     return [d if d > 0 else 1 for d in meta_shape]
+
+
+def check_repository_index(client, names) -> None:
+    """``RepositoryIndex`` must list every model we are about to drive as READY."""
+    index = client.get_model_repository_index()
+    listed = {m.name: (m.version, m.state) for m in index.models}
+    print(f"repository index: {sorted(listed)}", flush=True)
+    for name in names:
+        if name not in listed:
+            raise SystemExit(f"FAIL: {name} missing from the repository index {sorted(listed)}")
+        version, state = listed[name]
+        if state != "READY":
+            raise SystemExit(f"FAIL: {name} is {state!r} in the repository index, not READY")
+        if version != "1":
+            raise SystemExit(f"FAIL: {name} is version {version!r} in the repository index, not '1'")
+    print(f"repository index lists {len(names)} model(s) as READY ✓", flush=True)
 
 
 def check_model(client, spec: str) -> None:
@@ -149,6 +167,10 @@ def main() -> int:
         raise SystemExit("FAIL: server is not live/ready")
     print(f"server live & ready at {args.url}", flush=True)
 
+    check_repository_index(
+        client,
+        sorted({spec.split(":", 1)[0] for spec in models} | set(args.multis) | set(args.streams)),
+    )
     for spec in models:
         check_model(client, spec)
     for name in args.multis:
