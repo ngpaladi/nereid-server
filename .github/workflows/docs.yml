@@ -17,9 +17,13 @@ on:
       - "src/backends/**"
       - "scripts/check_backend_docs.sh"
       # The dnf repository published at /rpm/ is generated into the site by
-      # these scripts, so a change to one is a change to the site.
+      # these scripts, so a change to one is a change to the site. The public
+      # key is published there too, and is the one file here that could ever be
+      # replaced on its own — a rotation that did not redeploy would leave the
+      # old key served against metadata signed by the new one.
       - "packaging/make-rpm-repo.sh"
       - "packaging/test-rpm-repo.sh"
+      - "packaging/RPM-GPG-KEY-nereid"
   pull_request:
     paths:
       - "docs/**"
@@ -31,6 +35,7 @@ on:
       - "scripts/check_backend_docs.sh"
       - "packaging/make-rpm-repo.sh"
       - "packaging/test-rpm-repo.sh"
+      - "packaging/RPM-GPG-KEY-nereid"
 
   # A release's .rpm is not attached until the Linux packages workflow finishes
   # — up to two hours after the release is published. Triggering on the release
