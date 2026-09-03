@@ -17,6 +17,8 @@ ones you want.
 
 ## What to read next
 
+- **[Install](install.md)** — the dnf repository, what the packages lay down, and getting the
+  service running.
 - **[Architecture](architecture.md)** — the two gRPC surfaces, the `ModelManager`, how requests are
   bounded, and how one gets to a backend.
 - **[Backends](backends.md)** — the backends that ship today, how the server finds them, and how you
