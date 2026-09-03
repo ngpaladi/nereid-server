@@ -2,9 +2,9 @@
 //!
 //! nereid exposes the *inference request* subset of NVIDIA Triton's metrics —
 //! the `nv_inference_*` counts, cumulative latencies, and the pending-request
-//! gauge — on an HTTP `/metrics` endpoint (`server.metrics_addr`), so a
-//! Prometheus scrape config, Grafana dashboard, or alert rule written for Triton
-//! reads nereid unchanged. Every series carries Triton's `model` and `version`
+//! gauge — rendered in the text exposition format for the `/metrics` endpoint
+//! (`crate::http`, on `server.http_addr`), so a Prometheus scrape config,
+//! Grafana dashboard, or alert rule written for Triton reads nereid unchanged. Every series carries Triton's `model` and `version`
 //! labels; nereid's single implicit version is `"1"`.
 //!
 //! Deliberately out of scope: Triton's GPU/CPU/memory utilization metrics, the
@@ -34,16 +34,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::Router;
-use axum::http::header::CONTENT_TYPE;
-use axum::routing::get;
-use tokio::net::TcpListener;
 use tonic::{Code, Status};
 
 use crate::triton::MODEL_VERSION;
 
-/// The Prometheus text exposition format's content type.
-const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
+/// The Prometheus text exposition format's content type, for whoever serves
+/// [`InferenceMetrics::render`] over HTTP.
+pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Triton's `reason` label on `nv_inference_request_failure`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,34 +402,17 @@ impl Drop for RequestTimer {
         if !self.finished {
             // The handler's future was dropped mid-request: the client hung up
             // or the call was cancelled before a response could be recorded.
-            self.record_failure(self.reason.unwrap_or(FailureReason::Canceled));
+            // That is a cancellation whatever was observed before the drop —
+            // a pinned reason is only ever committed by an explicit `fail`.
+            self.record_failure(FailureReason::Canceled);
             self.close();
         }
     }
 }
 
-/// Serve `GET /metrics` on an already-bound listener. Plain HTTP/1.1: that is
-/// what Prometheus scrapes, and it is deliberately separate from the gRPC
-/// (HTTP/2) bind address, as Triton's metrics port is.
-pub async fn serve_on(
-    listener: TcpListener,
-    metrics: Arc<InferenceMetrics>,
-) -> std::io::Result<()> {
-    let app = Router::new().route(
-        "/metrics",
-        get(move || {
-            let body = metrics.render();
-            async move { ([(CONTENT_TYPE, TEXT_FORMAT)], body) }
-        }),
-    );
-    axum::serve(listener, app).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The value of the series `name{labels}` in rendered text.
     fn series(text: &str, name: &str, labels: &str) -> Option<u64> {
@@ -567,9 +547,15 @@ mod tests {
         timer.fail(&Status::invalid_argument("backend rejected dtype"));
         assert_eq!(failure("BACKEND"), Some(2));
 
-        // Dropping an unfinished timer is a cancellation.
+        // Dropping an unfinished timer is a cancellation — even when a reason
+        // was pinned: the pin only takes effect through an explicit `fail`.
         drop(metrics.begin("model3").unwrap());
         assert_eq!(failure("CANCELED"), Some(1));
+        let mut pinned_then_dropped = metrics.begin("model3").unwrap();
+        pinned_then_dropped.backend_failed();
+        drop(pinned_then_dropped);
+        assert_eq!(failure("CANCELED"), Some(2));
+        assert_eq!(failure("BACKEND"), Some(2), "the pin was not committed");
 
         let text = metrics.render();
         assert_eq!(series(&text, "nv_inference_request_success", M3), Some(0));
@@ -597,49 +583,5 @@ mod tests {
             ),
             "{text}"
         );
-    }
-
-    /// Talk plain HTTP/1.1 to the endpoint the way a Prometheus scraper does.
-    async fn http_get(addr: SocketAddr, path: &str) -> String {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        stream
-            .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            )
-            .await
-            .expect("write request");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
-        String::from_utf8(response).expect("utf-8 response")
-    }
-
-    #[tokio::test]
-    async fn http_endpoint_serves_prometheus_text() {
-        let metrics = Arc::new(InferenceMetrics::new(["model3"]));
-        metrics.begin("model3").unwrap().succeed();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_on(listener, metrics));
-
-        let response = http_get(addr, "/metrics").await;
-        let (head, body) = response.split_once("\r\n\r\n").expect("headers and body");
-        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
-        let head_lower = head.to_ascii_lowercase();
-        assert!(
-            head_lower.contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
-            "{head}"
-        );
-        assert!(
-            body.contains("nv_inference_request_success{model=\"model3\",version=\"1\"} 1"),
-            "{body}"
-        );
-
-        let other = http_get(addr, "/nope").await;
-        assert!(other.starts_with("HTTP/1.1 404"), "{other}");
     }
 }

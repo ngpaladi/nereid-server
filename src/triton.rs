@@ -16,7 +16,8 @@
 //! nereid serves a single implicit model version, `"1"`.
 //!
 //! Every request is accounted in Triton's `nv_inference_*` Prometheus metrics
-//! (see `crate::metrics`), which the server serves on `server.metrics_addr`.
+//! (see `crate::metrics`). The KServe v2 HTTP health endpoints (`/v2/health/*`)
+//! and `/metrics` are served by `crate::http` on `server.http_addr`.
 //!
 //! Not implemented (deferred): `BYTES` (variable-length) tensors, the HTTP/REST
 //! `/v2` mirror, and the repository/config/statistics RPCs.
@@ -201,7 +202,7 @@ fn build_input_tensors(
 
 /// Whether a requested model version is servable. nereid has no version
 /// concept, so only the implicit version `"1"` (or an empty selector) exists.
-fn version_available(model_version: &str) -> bool {
+pub(crate) fn version_available(model_version: &str) -> bool {
     model_version.is_empty() || model_version == MODEL_VERSION
 }
 
@@ -648,7 +649,7 @@ mod triton_e2e_tests {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: ml_backends.to_string_lossy().into_owned(),
-                metrics_addr: None,
+                http_addr: None,
             },
             models: vec![ModelConfig {
                 name: model_name.to_string(),
@@ -1043,7 +1044,7 @@ mod triton_e2e_tests {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
-                metrics_addr: None,
+                http_addr: None,
             },
             models: vec![ModelConfig {
                 name: "cxxadd".to_string(),
@@ -1189,7 +1190,7 @@ mod triton_e2e_tests {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
-                metrics_addr: None,
+                http_addr: None,
             },
             models: vec![ModelConfig {
                 name: "onnxadd".to_string(),

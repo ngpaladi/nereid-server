@@ -1,10 +1,12 @@
 server:
   bind_addr: "[::1]:50051"
 
-  # Optional: serve Prometheus metrics (Triton's nv_inference_* request metrics)
-  # at http://<metrics_addr>/metrics. Plain HTTP, so it must differ from the
-  # gRPC bind_addr; 8002 is Triton's convention. Omit the key to serve none.
-  metrics_addr: "[::1]:8002"
+  # Optional plain-HTTP address: Prometheus metrics (Triton's nv_inference_*
+  # request metrics) at /metrics, and the KServe v2 health endpoints for
+  # Kubernetes probes at /v2/health/live, /v2/health/ready and
+  # /v2/models/<name>/ready. Must differ from the gRPC bind_addr; 8002 is
+  # Triton's convention. Omit the key to serve no HTTP.
+  http_addr: "[::1]:8002"
 
   # This folder must exist in the project root and contain all ML model folders.
   ml_backends_path: "ml-backends"

@@ -10,6 +10,7 @@ mod backend;
 mod backends;
 mod config;
 mod dtype;
+mod http;
 mod metrics;
 mod triton;
 
@@ -221,24 +222,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|status| std::io::Error::other(status.to_string()))?,
     );
 
-    // Prometheus metrics (Triton's `nv_inference_*` request metrics) on their
-    // own plain-HTTP address, when configured. Bound here, before serving, so a
-    // bad or busy address fails startup rather than silently going unscraped.
-    if let Some(metrics_addr) = &config.server.metrics_addr {
-        let metrics_addr: std::net::SocketAddr = metrics_addr.parse().map_err(|err| {
-            std::io::Error::other(format!(
-                "invalid server.metrics_addr '{metrics_addr}': {err}"
-            ))
+    // The plain-HTTP surface — Prometheus metrics and the KServe v2 health
+    // probes — on its own address, when configured. Bound here, before serving,
+    // so a bad or busy address fails startup rather than silently going
+    // unscraped.
+    if let Some(http_addr) = &config.server.http_addr {
+        let http_addr: std::net::SocketAddr = http_addr.parse().map_err(|err| {
+            std::io::Error::other(format!("invalid server.http_addr '{http_addr}': {err}"))
         })?;
-        let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-        println!(
-            "Prometheus metrics at http://{}/metrics",
-            listener.local_addr()?
-        );
-        let registry = model_manager.metrics().clone();
+        let listener = tokio::net::TcpListener::bind(http_addr).await?;
+        let http_root = format!("http://{}", listener.local_addr()?);
+        println!("Prometheus metrics at {http_root}/metrics");
+        println!("HTTP health at {http_root}/v2/health/live and /v2/health/ready");
+        let manager = model_manager.clone();
         tokio::spawn(async move {
-            if let Err(err) = metrics::serve_on(listener, registry).await {
-                eprintln!("[nereid-server] metrics endpoint stopped: {err}");
+            if let Err(err) = http::serve_on(listener, manager).await {
+                eprintln!("[nereid-server] HTTP endpoint stopped: {err}");
             }
         });
     }
@@ -343,7 +342,7 @@ mod checkpoint_e2e_tests {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: ml_backends_path.to_string_lossy().into_owned(),
-                metrics_addr: None,
+                http_addr: None,
             },
             models,
         };

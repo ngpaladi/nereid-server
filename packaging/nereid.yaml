@@ -21,10 +21,11 @@ server:
   # reachable from off-box. Narrow it if you only want local clients.
   bind_addr: "[::]:50051"
 
-  # Prometheus metrics (Triton's nv_inference_* request metrics) at
-  # http://<metrics_addr>/metrics. Plain HTTP on its own port — 8002 is Triton's
-  # convention. Remove the key to serve none.
-  metrics_addr: "[::]:8002"
+  # Plain HTTP on its own port (8002 is Triton's convention): Prometheus
+  # metrics at /metrics, and the KServe v2 health endpoints for Kubernetes
+  # probes at /v2/health/live and /v2/health/ready. Remove the key to serve
+  # no HTTP.
+  http_addr: "[::]:8002"
 
   ml_backends_path: "ml-backends"
 

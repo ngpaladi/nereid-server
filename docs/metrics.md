@@ -9,13 +9,14 @@ response-cache metrics, and its opt-in latency summaries and histograms are not.
 
 ## Enabling
 
-Set `server.metrics_addr`; when it is absent nothing is served. It must differ from
-`server.bind_addr`, which speaks gRPC. Triton's convention is port `8002`:
+Set `server.http_addr`; when it is absent no HTTP is served. It must differ from
+`server.bind_addr`, which speaks gRPC. Triton's convention is port `8002`. The same address also
+serves the [KServe v2 health endpoints](triton.md#http-health-endpoints) for Kubernetes probes.
 
 ```yaml
 server:
   bind_addr: "[::]:50051"
-  metrics_addr: "[::]:8002"
+  http_addr: "[::]:8002"
   ml_backends_path: "ml-backends"
 ```
 

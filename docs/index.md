@@ -41,7 +41,8 @@ ones you want.
   [KServe v2 compatibility](triton.md).
 - **Observable like Triton.** The inference request metrics — `nv_inference_*` counts, latencies,
   and the pending gauge — are served for Prometheus under Triton's names, so existing dashboards
-  and alerts carry over. See [Metrics](metrics.md).
+  and alerts carry over, and the KServe v2 `/v2/health/*` endpoints answer Kubernetes probes.
+  See [Metrics](metrics.md).
 - **Backends are discovered, not listed.** Each one lives in its own folder and registers itself at
   link time, so nothing in the core enumerates them, and adding a backend doesn't mean editing the
   core. An ONNX-only build links no libtorch at all.
