@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -22,6 +23,13 @@ pub struct ServerConfig {
 pub struct ServerSection {
     pub bind_addr: String,
     pub ml_backends_path: String,
+    /// The plain-HTTP address: Prometheus `GET /metrics` and the KServe v2
+    /// health endpoints (`/v2/health/live`, `/v2/health/ready`,
+    /// `/v2/models/{name}/ready`) for Kubernetes probes. E.g. `"[::]:8002"`,
+    /// Triton's metrics port. Absent: no HTTP is served. Kept separate from
+    /// `bind_addr` because that one speaks gRPC.
+    #[serde(default)]
+    pub http_addr: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -125,6 +133,23 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::
         .into());
     }
 
+    if let Some(http_addr) = &config.server.http_addr {
+        if http_addr.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "server.http_addr must be non-empty when set (omit it to serve no HTTP)",
+            )
+            .into());
+        }
+        if same_socket_addr(http_addr, &config.server.bind_addr) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "server.http_addr must differ from server.bind_addr (http_addr is plain HTTP, bind_addr is gRPC)",
+            )
+            .into());
+        }
+    }
+
     if config.models.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -163,6 +188,17 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Whether two address strings name the same socket: compared as parsed
+/// `SocketAddr`s when both parse (so `[::1]:1` == ` [::1]:1 ` and
+/// `[0:0::1]:1`), else as trimmed strings.
+fn same_socket_addr(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    match (a.parse::<SocketAddr>(), b.parse::<SocketAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ModelDevice, ServerConfig, validate_server_config};
@@ -187,6 +223,75 @@ models:
         .expect("config should parse");
 
         validate_server_config(&config).expect("config should validate");
+        assert!(
+            config.server.http_addr.is_none(),
+            "HTTP is off unless configured"
+        );
+    }
+
+    #[test]
+    fn config_parses_http_addr() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+  http_addr: "[::1]:8002"
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#,
+        )
+        .expect("config should parse");
+
+        validate_server_config(&config).expect("config should validate");
+        assert_eq!(config.server.http_addr.as_deref(), Some("[::1]:8002"));
+    }
+
+    #[test]
+    fn config_rejects_http_addr_equal_to_bind_addr() {
+        // The same socket spelled three ways: verbatim, padded, and with the
+        // IPv6 address in a different (but equivalent) notation.
+        for spelling in ["[::1]:50051", "  [::1]:50051 ", "[0:0:0:0:0:0:0:1]:50051"] {
+            let config = parse_config(&format!(
+                r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+  http_addr: "{spelling}"
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#
+            ))
+            .expect("config should parse");
+
+            assert!(
+                validate_server_config(&config).is_err(),
+                "http_addr {spelling:?} names the gRPC socket"
+            );
+        }
+    }
+
+    #[test]
+    fn config_rejects_empty_http_addr() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+  http_addr: ""
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(validate_server_config(&config).is_err());
     }
 
     #[test]

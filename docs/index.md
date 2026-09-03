@@ -25,6 +25,8 @@ ones you want.
   `model_inference.textproto` says, the batching rules, and the subprocess tensor contract.
 - **[KServe v2 compatibility](triton.md)** — how nereid speaks KServe v2 on the wire, which RPCs
   are implemented, and how to check that for yourself.
+- **[Prometheus metrics](metrics.md)** — Triton's inference request metrics, served on `/metrics`,
+  and what each one measures in nereid.
 - **[Building & running](building.md)** — `build.sh`, the libtorch dependency, linking modes, HPC
   builds, and choosing your backends.
 
@@ -37,6 +39,10 @@ ones you want.
 - **Speaks the KServe v2 standard.** The `inference.GRPCInferenceService` surface is vendored from
   the KServe v2 spec, so what goes over the wire is byte-compatible with any client of it. See
   [KServe v2 compatibility](triton.md).
+- **Observable like Triton.** The inference request metrics — `nv_inference_*` counts, latencies,
+  and the pending gauge — are served for Prometheus under Triton's names, so existing dashboards
+  and alerts carry over, and the KServe v2 `/v2/health/*` endpoints answer Kubernetes probes.
+  See [Metrics](metrics.md).
 - **Backends are discovered, not listed.** Each one lives in its own folder and registers itself at
   link time, so nothing in the core enumerates them, and adding a backend doesn't mean editing the
   core. An ONNX-only build links no libtorch at all.
