@@ -250,13 +250,17 @@ HTML
 # 6. Publish. Written into a staging dir and swapped in, so a failure above
 #    leaves any existing output untouched rather than half-replaced.
 # ---------------------------------------------------------------------------
-rm -rf "$out_dir"
-mkdir -p "$out_dir"
-cp -r "$work/pkgs/repodata" "$out_dir/repodata"
-cp "$work/nereid-server.repo" "$work/index.html" "$out_dir/"
+stage="${out_dir}.staging"
+rm -rf "$stage"
+mkdir -p "$stage"
+cp -r "$work/pkgs/repodata" "$stage/repodata"
+cp "$work/nereid-server.repo" "$work/index.html" "$stage/"
 if [ "$have_pubkey" -eq 1 ]; then
-    cp "$work/RPM-GPG-KEY-nereid" "$out_dir/"
+    cp "$work/RPM-GPG-KEY-nereid" "$stage/"
 fi
+
+rm -rf "$out_dir"
+mv "$stage" "$out_dir"
 
 log "==> wrote $out_dir"
 ls -l "$out_dir" "$out_dir/repodata" >&2
