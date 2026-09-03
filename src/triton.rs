@@ -15,8 +15,11 @@
 //! datatype must match the model's declared `data_type` (default `FP32`).
 //! nereid serves a single implicit model version, `"1"`.
 //!
+//! Every request is accounted in Triton's `nv_inference_*` Prometheus metrics
+//! (see `crate::metrics`), which the server serves on `server.metrics_addr`.
+//!
 //! Not implemented (deferred): `BYTES` (variable-length) tensors, the HTTP/REST
-//! `/v2` mirror, Prometheus metrics, and the repository/config RPCs.
+//! `/v2` mirror, and the repository/config/statistics RPCs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,6 +30,7 @@ use tonic::{Request, Response, Status};
 
 use crate::backend::{Contract, ModelManager, Tensor, TensorSpec};
 use crate::dtype;
+use crate::metrics::RequestTimer;
 use crate::proto::grpc_inference_service_server::GrpcInferenceService;
 use crate::proto::model_infer_request::InferInputTensor;
 use crate::proto::model_infer_response::InferOutputTensor;
@@ -43,8 +47,9 @@ use crate::proto::{
 const FP32: &str = "FP32";
 
 /// nereid serves a single, implicit model version. A request may name it
-/// explicitly (`"1"`) or leave it empty; any other version is unavailable.
-const MODEL_VERSION: &str = "1";
+/// explicitly (`"1"`) or leave it empty; any other version is unavailable. It
+/// is also the `version` label on every Prometheus series.
+pub(crate) const MODEL_VERSION: &str = "1";
 
 /// Build the model's input tensors from a KServe `ModelInfer` request, in the
 /// contract's declared input order. Backend-agnostic: it validates
@@ -389,10 +394,7 @@ impl TritonService {
     /// through `ModelManager` (with its per-model backpressure), and output
     /// serialization — one path for every backend and for single- and
     /// multi-tensor models alike.
-    async fn infer_once(
-        &self,
-        mut request: ModelInferRequest,
-    ) -> Result<ModelInferResponse, Status> {
+    async fn infer_once(&self, request: ModelInferRequest) -> Result<ModelInferResponse, Status> {
         let model_name = request.model_name.trim().to_string();
         if model_name.is_empty() {
             return Err(Status::invalid_argument("model_name is required"));
@@ -413,13 +415,36 @@ impl TritonService {
                 ))
             })?;
 
-        let (inputs, expected_batch) = build_input_tensors(&contract, &mut request, &model_name)?;
-        let outputs = self.model_manager.infer(&model_name, inputs).await?;
+        // From here the request is attributed to the model in the metrics:
+        // every exit below is a counted success or a counted failure.
+        let mut timer = self.model_manager.begin_request(&model_name)?;
+        let result = self
+            .infer_timed(&contract, request, model_name, &mut timer)
+            .await;
+        match &result {
+            Ok(_) => timer.succeed(),
+            Err(status) => timer.fail(status),
+        }
+        result
+    }
+
+    /// The input → execute → output body of [`Self::infer_once`], marking the
+    /// phase boundaries on `timer`.
+    async fn infer_timed(
+        &self,
+        contract: &Contract,
+        mut request: ModelInferRequest,
+        model_name: String,
+        timer: &mut RequestTimer,
+    ) -> Result<ModelInferResponse, Status> {
+        let (inputs, expected_batch) = build_input_tensors(contract, &mut request, &model_name)?;
+        timer.input_ready();
+        let outputs = self.model_manager.infer(&model_name, inputs, timer).await?;
 
         if contract.strict_output_dtype {
-            serialize_multi(&contract, &request, model_name, outputs)
+            serialize_multi(contract, &request, model_name, outputs)
         } else {
-            serialize_single(&contract, &request, model_name, outputs, expected_batch)
+            serialize_single(contract, &request, model_name, outputs, expected_batch)
         }
     }
 }
@@ -607,10 +632,23 @@ mod triton_e2e_tests {
         model_name: &str,
         queue_capacity: usize,
     ) -> SocketAddr {
+        spawn_triton_server_with_manager(ml_backends, model_name, queue_capacity)
+            .await
+            .0
+    }
+
+    /// Like [`spawn_triton_server_qc`], also handing back the `ModelManager`
+    /// (for reading the metrics it records).
+    async fn spawn_triton_server_with_manager(
+        ml_backends: PathBuf,
+        model_name: &str,
+        queue_capacity: usize,
+    ) -> (SocketAddr, Arc<ModelManager>) {
         let config = ServerConfig {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: ml_backends.to_string_lossy().into_owned(),
+                metrics_addr: None,
             },
             models: vec![ModelConfig {
                 name: model_name.to_string(),
@@ -622,7 +660,7 @@ mod triton_e2e_tests {
         };
         let model_manager =
             Arc::new(ModelManager::from_config(&config).expect("model manager should build"));
-        let triton = TritonService::new(model_manager);
+        let triton = TritonService::new(model_manager.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -635,7 +673,17 @@ mod triton_e2e_tests {
                 .serve_with_incoming(incoming)
                 .await;
         });
-        addr
+        (addr, model_manager)
+    }
+
+    /// The integer sample of the series `name{labels}` in rendered metrics.
+    fn metric(text: &str, name: &str, labels: &str) -> u64 {
+        let prefix = format!("{name}{{{labels}}} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("series {name}{{{labels}}} missing from:\n{text}"))
+            .parse()
+            .expect("integer sample")
     }
 
     async fn connect(addr: SocketAddr) -> GrpcInferenceServiceClient<tonic::transport::Channel> {
@@ -995,6 +1043,7 @@ mod triton_e2e_tests {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
+                metrics_addr: None,
             },
             models: vec![ModelConfig {
                 name: "cxxadd".to_string(),
@@ -1140,6 +1189,7 @@ mod triton_e2e_tests {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
+                metrics_addr: None,
             },
             models: vec![ModelConfig {
                 name: "onnxadd".to_string(),
@@ -2149,6 +2199,151 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             exhausted, 1,
             "the other should be ResourceExhausted: {a:?} {b:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
+    }
+
+    // ---------------------------------------------------------------------
+    // Prometheus metrics
+    // ---------------------------------------------------------------------
+
+    /// Every `ModelInfer` request lands in Triton's `nv_inference_*` series
+    /// for its model: a batch-2 success counts one request, two inferences and
+    /// one execution with non-zero latencies; a shape mismatch is one `OTHER`
+    /// failure; a request for an unknown model is attributed to no one.
+    #[tokio::test]
+    async fn model_infer_is_counted_in_prometheus_metrics() {
+        assert!(fixtures_dir().join("model3").is_dir(), "model3 missing");
+        let (addr, manager) = spawn_triton_server_with_manager(fixtures_dir(), "model3", 4).await;
+        let mut client = connect(addr).await;
+        let labels = "model=\"model3\",version=\"1\"";
+
+        let before = manager.metrics().render();
+        assert_eq!(metric(&before, "nv_inference_request_success", labels), 0);
+        assert_eq!(
+            metric(&before, "nv_inference_pending_request_count", labels),
+            0
+        );
+
+        let values: Vec<f32> = (0..32).map(|v| v as f32).collect();
+        client
+            .model_infer(infer_request("model3", vec![2, 16], f32_le_bytes(&values)))
+            .await
+            .expect("batch-2 infer should succeed");
+
+        let status = client
+            .model_infer(infer_request(
+                "model3",
+                vec![1, 15],
+                f32_le_bytes(&values[..15]),
+            ))
+            .await
+            .expect_err("shape mismatch must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
+        let status = client
+            .model_infer(infer_request(
+                "ghost",
+                vec![1, 16],
+                f32_le_bytes(&values[..16]),
+            ))
+            .await
+            .expect_err("unknown model must be rejected");
+        assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+
+        let text = manager.metrics().render();
+        assert_eq!(metric(&text, "nv_inference_request_success", labels), 1);
+        assert_eq!(metric(&text, "nv_inference_count", labels), 2, "batch of 2");
+        assert_eq!(metric(&text, "nv_inference_exec_count", labels), 1);
+        assert_eq!(
+            metric(
+                &text,
+                "nv_inference_request_failure",
+                &format!("{labels},reason=\"OTHER\"")
+            ),
+            1,
+            "the shape mismatch"
+        );
+        for reason in ["REJECTED", "CANCELED", "BACKEND"] {
+            assert_eq!(
+                metric(
+                    &text,
+                    "nv_inference_request_failure",
+                    &format!("{labels},reason=\"{reason}\"")
+                ),
+                0
+            );
+        }
+        assert!(
+            metric(&text, "nv_inference_request_duration_us", labels) > 0,
+            "request latency accumulates"
+        );
+        assert!(
+            metric(&text, "nv_inference_compute_infer_duration_us", labels) > 0,
+            "backend execution latency accumulates"
+        );
+        assert!(
+            metric(&text, "nv_inference_request_duration_us", labels)
+                >= metric(&text, "nv_inference_compute_infer_duration_us", labels),
+            "the request span contains the backend execution"
+        );
+        assert_eq!(
+            metric(&text, "nv_inference_pending_request_count", labels),
+            0,
+            "nothing in flight after the calls return"
+        );
+        assert!(
+            !text.contains("model=\"ghost\""),
+            "an unconfigured model has no series"
+        );
+    }
+
+    /// A queue-full rejection is a `REJECTED` failure, and only the request
+    /// that actually ran is a success.
+    #[tokio::test]
+    async fn backpressure_rejection_is_counted_as_rejected() {
+        let main_py = "\
+import os, sys, time
+sys.stdin.buffer.read()
+time.sleep(1.0)
+shape = os.environ['NEREID_INPUT_SHAPE']
+with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
+    f.write(('float32 ' + shape + '\\n').encode('utf-8'))
+    import struct
+    f.write(struct.pack('<4f', 0.0, 0.0, 0.0, 0.0))
+";
+        let (ml_backends, name) = make_temp_python_model(
+            "metrics-rejected",
+            main_py,
+            "input_shape: [4]\nmax_batch_size: 4\noutput_shape: [4]\n",
+        );
+        let (addr, manager) = spawn_triton_server_with_manager(ml_backends.clone(), &name, 1).await;
+        let payload = f32_le_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        let call = || async {
+            let mut client = connect(addr).await;
+            client
+                .model_infer(infer_request(&name, vec![1, 4], payload.clone()))
+                .await
+        };
+        let (a, b) = tokio::join!(call(), call());
+        assert_eq!(
+            [&a, &b].iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{a:?} {b:?}"
+        );
+
+        let labels = format!("model=\"{name}\",version=\"1\"");
+        let text = manager.metrics().render();
+        assert_eq!(metric(&text, "nv_inference_request_success", &labels), 1);
+        assert_eq!(
+            metric(
+                &text,
+                "nv_inference_request_failure",
+                &format!("{labels},reason=\"REJECTED\"")
+            ),
+            1
+        );
+        assert_eq!(metric(&text, "nv_inference_exec_count", &labels), 1);
 
         let _ = std::fs::remove_dir_all(&ml_backends);
     }

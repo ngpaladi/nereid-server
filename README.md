@@ -42,7 +42,7 @@ servable:
 
 The request datatype must match the model's declared `data_type` (default `FP32`). nereid
 serves a single implicit model version, `"1"`. **Not implemented (deferred):** Rust
-`UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror, Prometheus metrics, and the
+`UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror and the
 repository/config/statistics RPCs.
 
 ### Verifying compatibility
@@ -72,6 +72,30 @@ python scripts/triton_compat_check.py --url 127.0.0.1:50051 \
     `input_shape`, the validated request tensor is piped into `main.py` on stdin.
   - `model_inference.textproto` + `.pt` model -> runs Rust inference for that model and streams
     the output tensor.
+- With `server.metrics_addr` set, `GET /metrics` on that address serves Prometheus metrics for
+  every inference request (both `Checkpoint` and KServe v2 `ModelInfer`), under Triton's
+  `nv_inference_*` names and labels — see [Prometheus metrics](#prometheus-metrics).
+
+## Prometheus metrics
+nereid exports Triton's **inference request** metrics — `nv_inference_request_success`,
+`nv_inference_request_failure{reason}`, `nv_inference_count`, `nv_inference_exec_count`, the
+cumulative `nv_inference_*_duration_us` latency counters, and the
+`nv_inference_pending_request_count` gauge — with Triton's `model`/`version` labels, so scrape
+configs, dashboards, and alerts written for Triton work as they are. The GPU/CPU/memory, cache,
+and summary/histogram metrics are not implemented.
+
+Enable it with `server.metrics_addr` (plain HTTP, separate from the gRPC `bind_addr`; Triton's
+convention is port 8002):
+```yaml
+server:
+  bind_addr: "[::]:50051"
+  metrics_addr: "[::]:8002"
+```
+```bash
+curl -s http://localhost:8002/metrics
+```
+What each series measures in nereid, the `reason` values, and example PromQL are in the
+**[docs site](docs/metrics.md)**.
 
 ## Model folder contract
 Each model must be a folder under `<server.ml_backends_path>/<model_name>/` with:
@@ -277,12 +301,14 @@ It is required because the server uses it to:
 - choose execution device per model (`cpu`, `cuda`, or `cuda:<index>` on multi-GPU systems)
 - size each model request queue (`queue_capacity`)
 - choose the server bind address (`server.bind_addr`)
+- optionally serve Prometheus metrics (`server.metrics_addr`; omitted = off)
 - find model folders (`server.ml_backends_path`)
 
 Example (`nereid.yaml.example`):
 ```yaml
 server:
   bind_addr: "[::1]:50051"
+  metrics_addr: "[::1]:8002"   # optional: Prometheus /metrics (plain HTTP)
   ml_backends_path: "ml-backends"
 
 models:
@@ -404,10 +430,11 @@ The server reads `nereid.yaml` from its working directory and resolves
 `server.ml_backends_path` relative to it; the image sets `WORKDIR /nereid`, so mount the
 config and model folders there:
 ```bash
-docker run --rm -p 50051:50051 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server:latest
+docker run --rm -p 50051:50051 -p 8002:8002 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server:latest
 ```
-Set `bind_addr: "[::]:50051"` in that config — the example's `[::1]` is loopback-only and
-unreachable from outside the container. The container runs as uid 10001, so a mounted model
+Set `bind_addr: "[::]:50051"` (and `metrics_addr: "[::]:8002"` if you want Prometheus metrics)
+in that config — the example's `[::1]` is loopback-only and unreachable from outside the
+container. The container runs as uid 10001, so a mounted model
 folder must be writable by it (the Python backend builds a `venv/` inside each one) or run
 with `--user "$(id -u):$(id -g)"`.
 

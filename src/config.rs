@@ -22,6 +22,11 @@ pub struct ServerConfig {
 pub struct ServerSection {
     pub bind_addr: String,
     pub ml_backends_path: String,
+    /// Where to serve Prometheus metrics (`GET /metrics`, plain HTTP), e.g.
+    /// `"[::]:8002"` — Triton's default metrics port. Absent: metrics are not
+    /// served. Kept separate from `bind_addr` because that one speaks gRPC.
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -125,6 +130,23 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::
         .into());
     }
 
+    if let Some(metrics_addr) = &config.server.metrics_addr {
+        if metrics_addr.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "server.metrics_addr must be non-empty when set (omit it to disable metrics)",
+            )
+            .into());
+        }
+        if metrics_addr == &config.server.bind_addr {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "server.metrics_addr must differ from server.bind_addr (metrics are plain HTTP, the bind address is gRPC)",
+            )
+            .into());
+        }
+    }
+
     if config.models.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -187,6 +209,68 @@ models:
         .expect("config should parse");
 
         validate_server_config(&config).expect("config should validate");
+        assert!(
+            config.server.metrics_addr.is_none(),
+            "metrics are off unless configured"
+        );
+    }
+
+    #[test]
+    fn config_parses_metrics_addr() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+  metrics_addr: "[::1]:8002"
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#,
+        )
+        .expect("config should parse");
+
+        validate_server_config(&config).expect("config should validate");
+        assert_eq!(config.server.metrics_addr.as_deref(), Some("[::1]:8002"));
+    }
+
+    #[test]
+    fn config_rejects_metrics_addr_equal_to_bind_addr() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+  metrics_addr: "[::1]:50051"
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(validate_server_config(&config).is_err());
+    }
+
+    #[test]
+    fn config_rejects_empty_metrics_addr() {
+        let config = parse_config(
+            r#"
+server:
+  bind_addr: "[::1]:50051"
+  ml_backends_path: "ml-backends"
+  metrics_addr: ""
+models:
+  - name: "model3"
+    device: "cpu"
+    queue_capacity: 16
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(validate_server_config(&config).is_err());
     }
 
     #[test]

@@ -18,11 +18,13 @@ pub(crate) mod native_common;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tonic::Status;
 
 use crate::config::{ModelConfig, ServerConfig};
+use crate::metrics::{InferenceMetrics, RequestTimer};
 use crate::proto::{CheckpointResponse, TensorChunk};
 
 pub use contract::{Contract, TensorSpec};
@@ -74,6 +76,8 @@ struct ModelEntry {
 pub struct ModelManager {
     model_names: Vec<String>,
     entries: HashMap<String, ModelEntry>,
+    /// Per-model Prometheus counters, shared with the `/metrics` endpoint.
+    metrics: Arc<InferenceMetrics>,
 }
 
 fn model_log(msg: &str) {
@@ -134,14 +138,32 @@ impl ModelManager {
             );
         }
 
+        let metrics = Arc::new(InferenceMetrics::new(model_names.iter().cloned()));
         Ok(Self {
             model_names,
             entries,
+            metrics,
         })
     }
 
     pub fn configured_models(&self) -> Vec<String> {
         self.model_names.clone()
+    }
+
+    /// The Prometheus registry every request is accounted in.
+    pub fn metrics(&self) -> &Arc<InferenceMetrics> {
+        &self.metrics
+    }
+
+    /// Open the metrics accounting for one request to `model_name`. Call it as
+    /// soon as the request has named a configured model, before building its
+    /// inputs, so `compute_input` and validation failures are attributed.
+    pub fn begin_request(&self, model_name: &str) -> Result<RequestTimer, Status> {
+        self.metrics.begin(model_name).ok_or_else(|| {
+            Status::not_found(format!(
+                "model '{model_name}' is not configured in nereid.yaml"
+            ))
+        })
     }
 
     pub fn is_configured(&self, model_name: &str) -> bool {
@@ -161,11 +183,14 @@ impl ModelManager {
     /// Run one inference. Inputs must already be validated and in the model's
     /// declared input order. Bounds in-flight requests by the model's
     /// `queue_capacity` (full -> `ResourceExhausted`) and runs the blocking
-    /// backend off the async runtime.
+    /// backend off the async runtime. Records the queue wait, the backend's
+    /// execution time, and the batch size on `timer`; the caller still ends the
+    /// timer with the request's overall outcome.
     pub async fn infer(
         &self,
         model_name: &str,
         inputs: Vec<Tensor>,
+        timer: &mut RequestTimer,
     ) -> Result<Vec<Tensor>, Status> {
         let entry = self.entries.get(model_name).ok_or_else(|| {
             Status::not_found(format!(
@@ -177,39 +202,57 @@ impl ModelManager {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("model queue full, retry later"))?;
+        let batch = inference_count(&entry.contract, &inputs);
         let backend = entry.backend.clone();
         let name = model_name.to_string();
-        let result = tokio::task::spawn_blocking(move || backend.infer(inputs))
-            .await
-            .map_err(|err| Status::internal(format!("inference task failed to join: {err}")))?;
+        let execution = run_backend(backend, inputs).await;
+        let result = match execution {
+            Ok(execution) => {
+                timer.executed(execution.queued, execution.ran, batch);
+                execution.result
+            }
+            Err(status) => Err(status),
+        };
         match &result {
             Ok(_) => model_log(&format!("job completed model={name}")),
-            Err(status) => model_log(&format!(
-                "job failed model={name} error={}",
-                status.message()
-            )),
+            Err(status) => {
+                timer.backend_failed();
+                model_log(&format!(
+                    "job failed model={name} error={}",
+                    status.message()
+                ))
+            }
         }
         result
     }
 
     /// The backend's `Checkpoint` stream. Backends may provide a richer stream
-    /// (Python: live log chunks); otherwise the output tensor is streamed.
+    /// (Python: live log chunks); otherwise the output tensor is streamed. Takes
+    /// over `timer` and ends it when the stream does: `done` with exit code 0
+    /// is a success, anything else a failure.
     pub fn checkpoint(
         &self,
         model_name: &str,
         input: Option<Tensor>,
+        mut timer: RequestTimer,
     ) -> Result<CheckpointStream, Status> {
-        let entry = self.entries.get(model_name).ok_or_else(|| {
-            Status::not_found(format!(
-                "model '{model_name}' is not configured in nereid.yaml"
-            ))
-        })?;
+        let entry = match self.entries.get(model_name) {
+            Some(entry) => entry,
+            None => {
+                let status = Status::not_found(format!(
+                    "model '{model_name}' is not configured in nereid.yaml"
+                ));
+                timer.fail(&status);
+                return Err(status);
+            }
+        };
+        let batch = inference_count(&entry.contract, input.as_slice());
         if let Some(stream) =
             entry
                 .backend
                 .checkpoint_stream(model_name, input.clone(), &entry.contract)
         {
-            return Ok(stream);
+            return Ok(record_stream(stream, timer, batch));
         }
         // Default: run inference and stream the single output tensor.
         let backend = entry.backend.clone();
@@ -226,31 +269,126 @@ impl ModelManager {
             let permit = match permits.try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    send_err(Status::resource_exhausted("model queue full, retry later")).await;
+                    let status = Status::resource_exhausted("model queue full, retry later");
+                    timer.fail(&status);
+                    send_err(status).await;
                     return;
                 }
             };
             let inputs = input.into_iter().collect::<Vec<_>>();
-            let result = tokio::task::spawn_blocking(move || backend.infer(inputs)).await;
+            let execution = run_backend(backend, inputs).await;
             drop(permit);
-            let outputs = match result {
-                Ok(Ok(outputs)) => outputs,
-                Ok(Err(status)) => {
-                    send_err(status).await;
-                    return;
+            let outputs = match execution {
+                Ok(execution) => {
+                    timer.executed(execution.queued, execution.ran, batch);
+                    match execution.result {
+                        Ok(outputs) => outputs,
+                        Err(status) => {
+                            timer.backend_failed();
+                            timer.fail(&status);
+                            send_err(status).await;
+                            return;
+                        }
+                    }
                 }
-                Err(err) => {
-                    send_err(Status::internal(format!(
-                        "inference task failed to join: {err}"
-                    )))
-                    .await;
+                Err(status) => {
+                    timer.backend_failed();
+                    timer.fail(&status);
+                    send_err(status).await;
                     return;
                 }
             };
             stream_outputs(&tx, &name, outputs).await;
+            timer.succeed();
         });
         Ok(CheckpointStream::new(rx))
     }
+}
+
+/// The number of inferences a request represents for `nv_inference_count`: its
+/// batch size when the model declares a batch dimension, else 1 (an input-less
+/// model runs once).
+fn inference_count(contract: &Contract, inputs: &[Tensor]) -> u64 {
+    inputs
+        .first()
+        .and_then(|tensor| contract.expected_batch(&tensor.shape))
+        .map_or(1, |batch| u64::try_from(batch).unwrap_or(1).max(1))
+}
+
+/// One timed run of a backend's blocking `infer` on the blocking pool.
+struct Execution {
+    /// How long the request waited for a blocking worker to pick it up.
+    queued: Duration,
+    /// How long the backend's `infer` ran.
+    ran: Duration,
+    result: Result<Vec<Tensor>, Status>,
+}
+
+/// Run `backend.infer` off the async runtime, timing the wait and the run.
+/// `Err` only when the blocking task itself fails to join (it panicked).
+async fn run_backend(backend: Arc<dyn Backend>, inputs: Vec<Tensor>) -> Result<Execution, Status> {
+    let queued_at = Instant::now();
+    let (started, result) = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        (started, backend.infer(inputs))
+    })
+    .await
+    .map_err(|err| Status::internal(format!("inference task failed to join: {err}")))?;
+    Ok(Execution {
+        queued: started.duration_since(queued_at),
+        ran: started.elapsed(),
+        result,
+    })
+}
+
+/// Relay a backend-provided `Checkpoint` stream, ending `timer` when it ends.
+/// The backend ran the request as one opaque step, so its whole span counts as
+/// `compute_infer`; a terminal `done` with exit code 0 is a success, a non-zero
+/// exit or an error status a backend failure, and a client that stops reading
+/// a cancellation.
+fn record_stream(inner: CheckpointStream, mut timer: RequestTimer, batch: u64) -> CheckpointStream {
+    let mut inner = inner.into_inner();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<CheckpointResponse, Status>>(64);
+    tokio::spawn(async move {
+        let mut outcome: Option<Result<(), Status>> = None;
+        while let Some(item) = inner.recv().await {
+            match &item {
+                Ok(response) if response.done => {
+                    outcome = Some(if response.exit_code == 0 {
+                        Ok(())
+                    } else {
+                        Err(Status::internal(format!(
+                            "model process exited with code {}",
+                            response.exit_code
+                        )))
+                    });
+                }
+                Err(status) => outcome = Some(Err(status.clone())),
+                Ok(_) => {}
+            }
+            if tx.send(item).await.is_err() {
+                outcome = Some(Err(Status::cancelled("client stopped reading the stream")));
+                break;
+            }
+        }
+        match outcome {
+            Some(Ok(())) => {
+                let ran = timer.phase_elapsed();
+                timer.executed(Duration::ZERO, ran, batch);
+                timer.succeed();
+            }
+            Some(Err(status)) => {
+                if status.code() != tonic::Code::Cancelled {
+                    timer.backend_failed();
+                }
+                timer.fail(&status);
+            }
+            None => timer.fail(&Status::internal(
+                "checkpoint stream ended without a result",
+            )),
+        }
+    });
+    CheckpointStream::new(rx)
 }
 
 /// Stream a completed inference's output tensor(s) as `Checkpoint` responses:

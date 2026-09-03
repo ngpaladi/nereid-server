@@ -26,8 +26,11 @@ and streaming `ModelStreamInfer`.
   the typed `contents`.
 - nereid serves a single implicit model version, `"1"`.
 
+Every inference request is also accounted in Triton's Prometheus metrics — see
+[Metrics](metrics.md).
+
 > **Not implemented (deferred):** Torch `UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror;
-> Prometheus metrics; and the repository / config / statistics RPCs.
+> and the repository / config / statistics RPCs.
 
 ## Verifying compatibility
 

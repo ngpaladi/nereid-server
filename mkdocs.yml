@@ -42,4 +42,5 @@ nav:
   - Backends: backends.md
   - Contract: model-contract.md
   - KServe v2: triton.md
+  - Metrics: metrics.md
   - Building: building.md
