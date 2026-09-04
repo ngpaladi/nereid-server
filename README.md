@@ -481,6 +481,11 @@ View models:
 grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Nereid/ViewModels
 ```
 
+## AI-generated code
+nereid is developed with the help of AI coding tools. How they are used, what stays with the
+human maintainers, and the review policy every change is held to are set out in
+[docs/ai-code-policy.md](docs/ai-code-policy.md).
+
 ## Project structure
 - `src/main.rs`: gRPC service implementation and server bootstrap.
 - `src/backend/`: the `Backend` trait, the `ModelManager`, and the registry that detects a
