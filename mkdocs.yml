@@ -43,3 +43,4 @@ nav:
   - Contract: model-contract.md
   - KServe v2: triton.md
   - Building: building.md
+  - AI Code: ai-code-policy.md

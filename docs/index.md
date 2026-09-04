@@ -27,6 +27,8 @@ ones you want.
   are implemented, and how to check that for yourself.
 - **[Building & running](building.md)** — `build.sh`, the libtorch dependency, linking modes, HPC
   builds, and choosing your backends.
+- **[AI-generated code](ai-code-policy.md)** — how AI tools are used in developing nereid, and the
+  review policy every change is held to.
 
 ## Core ideas
 
