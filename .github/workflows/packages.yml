@@ -170,6 +170,93 @@ jobs:
           nfpm package -f packaging/nfpm.yaml -p rpm -t dist/pkg
           ls -lh dist/pkg
 
+      # Sign the .rpm. Two things need this: `rpm -K` on a downloaded package,
+      # and the dnf repository published on the docs site, whose .repo sets
+      # gpgcheck=1 — packaging/make-rpm-repo.sh leaves an unsigned package out
+      # of the metadata entirely rather than advertising one dnf will refuse.
+      #
+      # The .deb is not signed here on purpose: apt verifies the signature on a
+      # repository's Release file rather than on individual .deb files, and
+      # there is no apt repository yet.
+      - name: Check for a package signing key
+        id: signing
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.NEREID_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            # A release that ships an unsigned .rpm is a release the dnf
+            # repository silently will not carry, and the failure would only
+            # surface later as "why is the new version not showing up". Fail
+            # here, where the cause is obvious.
+            echo "::error::NEREID_GPG_PRIVATE_KEY is not set — a release .rpm must be signed"
+            exit 1
+          else
+            echo "::warning::no signing key; this dry run produces an unsigned .rpm"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign the .rpm
+        if: ${{ steps.signing.outputs.enabled == 'true' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.NEREID_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.NEREID_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
+
+          # A throwaway keyring under the runner's workspace, not ~/.gnupg, so
+          # nothing about the key outlives the step.
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          key_id="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
+          [ -n "$key_id" ] || { echo "::error::the secret imported no secret key"; exit 1; }
+
+          # Only rpm's *extra* args are overridden rather than the whole
+          # %__gpg_sign_cmd: that macro's default already handles digest
+          # selection and quoting, and replacing it wholesale is how signing
+          # setups silently stop matching the rpm version on the runner.
+          extra="--batch --pinentry-mode loopback"
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            printf '%s' "$GPG_PASSPHRASE" > "$GNUPGHOME/pass"
+            chmod 600 "$GNUPGHOME/pass"
+            extra="$extra --passphrase-file $GNUPGHOME/pass"
+          fi
+          # %__gpg has to be set explicitly: Debian and Ubuntu's rpm defaults it
+          # to /usr/bin/gpg2, which has not existed since Ubuntu 22.04, and
+          # rpmsign fails with a bare "Could not exec gpg: No such file or
+          # directory" that says nothing about which path it tried.
+          cat > "$HOME/.rpmmacros" <<EOF
+          %__gpg $(command -v gpg)
+          %_gpg_name $key_id
+          %_gpg_sign_cmd_extra_args $extra
+          EOF
+
+          rpmsign --addsign dist/pkg/*.rpm
+
+          # Assert rather than assume: rpmsign reports some failures only on
+          # stderr, and an unsigned package would not be noticed until the
+          # repository quietly declined to list it.
+          #
+          # Which header tag holds the signature depends on the rpm that reads
+          # the package — 4.16 through 6.0 all write RSAHEADER, while the older
+          # SIGPGP/SIGGPG pair is what pre-4.16 used — so ask about all four and
+          # take any of them as a yes.
+          for r in dist/pkg/*.rpm; do
+            flags="$(rpm -qp --nosignature --queryformat \
+              '%|RSAHEADER?{1}:{0}|%|DSAHEADER?{1}:{0}|%|SIGPGP?{1}:{0}|%|SIGGPG?{1}:{0}|' "$r")"
+            case "$flags" in
+              *1*) : ;;
+              *) echo "::error::$r is still unsigned"; exit 1 ;;
+            esac
+            echo "signed $(basename "$r"): $(rpm -qp --nosignature \
+              --queryformat '%{RSAHEADER:pgpsig}' "$r")"
+          done
+
       # Install each package in a clean container of the *oldest* distro its
       # glibc floor claims to support, so the check is against the binding end
       # of that claim — Ubuntu 22.04 (2.35) for the deb family, AlmaLinux 9

@@ -38,6 +38,7 @@ markdown_extensions:
 
 nav:
   - Overview: index.md
+  - Install: install.md
   - Architecture: architecture.md
   - Backends: backends.md
   - Contract: model-contract.md
