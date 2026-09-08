@@ -7,8 +7,9 @@
 //! upstream in `proto/grpc_service.proto`.
 //!
 //! Implemented: `ServerLive/Ready`, `ModelReady`, `ServerMetadata`,
-//! `ModelMetadata`, unary `ModelInfer`, and streaming `ModelStreamInfer`. This
-//! surface is backend-agnostic: it validates the request against the model's
+//! `ModelMetadata`, unary `ModelInfer`, streaming `ModelStreamInfer`, and
+//! `RepositoryIndex` (the model list a client such as CMSSW's SONIC fetches on
+//! connect). This surface is backend-agnostic: it validates the request against the model's
 //! [`Contract`], builds canonical [`Tensor`]s, and dispatches through
 //! `ModelManager` — so every backend (TorchScript, ONNX, TensorFlow, Python) and
 //! both single- and multi-tensor models flow through one path. The request
@@ -16,7 +17,8 @@
 //! nereid serves a single implicit model version, `"1"`.
 //!
 //! Not implemented (deferred): `BYTES` (variable-length) tensors, the HTTP/REST
-//! `/v2` mirror, Prometheus metrics, and the repository/config RPCs.
+//! `/v2` mirror, Prometheus metrics, and the model load/unload, config and
+//! statistics RPCs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,11 +33,12 @@ use crate::proto::grpc_inference_service_server::GrpcInferenceService;
 use crate::proto::model_infer_request::InferInputTensor;
 use crate::proto::model_infer_response::InferOutputTensor;
 use crate::proto::model_metadata_response::TensorMetadata;
+use crate::proto::repository_index_response::ModelIndex;
 use crate::proto::{
     ModelInferRequest, ModelInferResponse, ModelMetadataRequest, ModelMetadataResponse,
-    ModelReadyRequest, ModelReadyResponse, ModelStreamInferResponse, ServerLiveRequest,
-    ServerLiveResponse, ServerMetadataRequest, ServerMetadataResponse, ServerReadyRequest,
-    ServerReadyResponse,
+    ModelReadyRequest, ModelReadyResponse, ModelStreamInferResponse, RepositoryIndexRequest,
+    RepositoryIndexResponse, ServerLiveRequest, ServerLiveResponse, ServerMetadataRequest,
+    ServerMetadataResponse, ServerReadyRequest, ServerReadyResponse,
 };
 
 /// KServe spells 32-bit float exactly this way; it's also the default datatype
@@ -45,6 +48,12 @@ const FP32: &str = "FP32";
 /// nereid serves a single, implicit model version. A request may name it
 /// explicitly (`"1"`) or leave it empty; any other version is unavailable.
 const MODEL_VERSION: &str = "1";
+
+/// The `RepositoryIndex` state of every nereid model. Triton's states are
+/// `READY`, `UNAVAILABLE`, `LOADING`, `UNLOADING` and `UNKNOWN`; nereid loads
+/// each configured model before it starts serving and refuses to start
+/// otherwise, so a model it serves at all is in exactly this one.
+const MODEL_STATE_READY: &str = "READY";
 
 /// Build the model's input tensors from a KServe `ModelInfer` request, in the
 /// contract's declared input order. Backend-agnostic: it validates
@@ -336,6 +345,36 @@ impl GrpcInferenceService for TritonService {
         request: Request<ModelInferRequest>,
     ) -> Result<Response<ModelInferResponse>, Status> {
         Ok(Response::new(self.infer_once(request.into_inner()).await?))
+    }
+
+    /// The model repository index: one `READY` entry per configured model, in
+    /// `nereid.yaml` order, at version `"1"`. Clients that discover what a
+    /// server can serve — CMSSW's SONIC `TritonService` among them — call this
+    /// on connect. nereid has one implicit repository (`server.ml_backends_path`)
+    /// and loads all of it at startup, so `ready: true` filters nothing out and
+    /// naming a `repository_name` is rejected exactly as Triton rejects it.
+    async fn repository_index(
+        &self,
+        request: Request<RepositoryIndexRequest>,
+    ) -> Result<Response<RepositoryIndexResponse>, Status> {
+        let request = request.into_inner();
+        if !request.repository_name.is_empty() {
+            return Err(Status::unimplemented(
+                "'repository_name' specification is not supported",
+            ));
+        }
+        let models = self
+            .model_manager
+            .configured_models()
+            .into_iter()
+            .map(|name| ModelIndex {
+                name,
+                version: MODEL_VERSION.to_string(),
+                state: MODEL_STATE_READY.to_string(),
+                reason: String::new(),
+            })
+            .collect();
+        Ok(Response::new(RepositoryIndexResponse { models }))
     }
 
     type ModelStreamInferStream = ReceiverStream<Result<ModelStreamInferResponse, Status>>;
@@ -797,6 +836,79 @@ mod triton_e2e_tests {
         // model3's contract is input_shape [16], max_batch 10 -> advertised
         // shape carries a leading -1 batch dimension.
         assert_eq!(meta.inputs[0].shape, vec![-1, 16]);
+    }
+
+    /// `RepositoryIndex` lists every configured model as `READY` at version
+    /// `"1"`, in config order; `ready: true` changes nothing (everything nereid
+    /// serves is loaded); naming a repository is `Unimplemented`, as in Triton.
+    #[tokio::test]
+    async fn repository_index_lists_configured_models() {
+        assert!(fixtures_dir().join("model3").is_dir(), "model3 missing");
+        assert!(fixtures_dir().join("multi").is_dir(), "multi missing");
+        let config = ServerConfig {
+            server: ServerSection {
+                bind_addr: "127.0.0.1:0".to_string(),
+                ml_backends_path: fixtures_dir().to_string_lossy().into_owned(),
+            },
+            models: ["multi", "model3"]
+                .map(|name| ModelConfig {
+                    name: name.to_string(),
+                    device: ModelDevice::Cpu,
+                    queue_capacity: 4,
+                    backend: None,
+                    signature: None,
+                })
+                .to_vec(),
+        };
+        let model_manager =
+            Arc::new(ModelManager::from_config(&config).expect("model manager should build"));
+        let triton = TritonService::new(model_manager);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(GrpcInferenceServiceServer::new(triton))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        let mut client = connect(addr).await;
+
+        for ready in [false, true] {
+            let index = client
+                .repository_index(RepositoryIndexRequest {
+                    repository_name: String::new(),
+                    ready,
+                })
+                .await
+                .expect("repository_index")
+                .into_inner();
+            let entries: Vec<(&str, &str, &str, &str)> = index
+                .models
+                .iter()
+                .map(|m| {
+                    (
+                        m.name.as_str(),
+                        m.version.as_str(),
+                        m.state.as_str(),
+                        m.reason.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                entries,
+                vec![("multi", "1", "READY", ""), ("model3", "1", "READY", "")],
+                "ready={ready}: every configured model, in config order"
+            );
+        }
+
+        let status = client
+            .repository_index(RepositoryIndexRequest {
+                repository_name: "somewhere".to_string(),
+                ready: false,
+            })
+            .await
+            .expect_err("a named repository is not supported");
+        assert_eq!(status.code(), tonic::Code::Unimplemented, "{status:?}");
     }
 
     /// A tensor-capable Python model (the committed `pymul` fixture, which
