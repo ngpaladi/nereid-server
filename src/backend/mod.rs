@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 use tonic::Status;
 
 use crate::config::{ModelConfig, ServerConfig};
-use crate::metrics::{InferenceMetrics, RequestTimer};
+use crate::metrics::{InferenceMetrics, PendingSlot, RequestTimer};
 use crate::proto::{CheckpointResponse, TensorChunk};
 
 pub use contract::{Contract, TensorSpec};
@@ -183,8 +183,9 @@ impl ModelManager {
     /// Run one inference. Inputs must already be validated and in the model's
     /// declared input order. Bounds in-flight requests by the model's
     /// `queue_capacity` (full -> `ResourceExhausted`) and runs the blocking
-    /// backend off the async runtime. Records the queue wait, the backend's
-    /// execution time, and the batch size on `timer`; the caller still ends the
+    /// backend off the async runtime. Releases `timer`'s pending slot when a
+    /// worker picks the request up, and records the queue wait, the backend's
+    /// execution time, and the batch size on it; the caller still ends the
     /// timer with the request's overall outcome.
     pub async fn infer(
         &self,
@@ -205,7 +206,7 @@ impl ModelManager {
         let batch = inference_count(&entry.contract, &inputs);
         let backend = entry.backend.clone();
         let name = model_name.to_string();
-        let execution = run_backend(backend, inputs).await;
+        let execution = run_backend(backend, inputs, timer.take_pending()).await;
         let result = match execution {
             Ok(execution) => {
                 timer.executed(execution.queued, execution.ran, batch);
@@ -252,6 +253,9 @@ impl ModelManager {
                 .backend
                 .checkpoint_stream(model_name, input.clone(), &entry.contract)
         {
+            // This path takes no permit: the backend starts the moment the
+            // stream exists, so the request stops awaiting execution here.
+            drop(timer.take_pending());
             return Ok(record_stream(stream, timer, batch));
         }
         // Default: run inference and stream the single output tensor.
@@ -276,7 +280,7 @@ impl ModelManager {
                 }
             };
             let inputs = input.into_iter().collect::<Vec<_>>();
-            let execution = run_backend(backend, inputs).await;
+            let execution = run_backend(backend, inputs, timer.take_pending()).await;
             drop(permit);
             let outputs = match execution {
                 Ok(execution) => {
@@ -326,10 +330,16 @@ struct Execution {
 
 /// Run `backend.infer` off the async runtime, timing the wait and the run.
 /// `Err` only when the blocking task itself fails to join (it panicked).
-async fn run_backend(backend: Arc<dyn Backend>, inputs: Vec<Tensor>) -> Result<Execution, Status> {
+async fn run_backend(
+    backend: Arc<dyn Backend>,
+    inputs: Vec<Tensor>,
+    pending: Option<PendingSlot>,
+) -> Result<Execution, Status> {
     let queued_at = Instant::now();
     let (started, result) = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
+        // Execution begins here: the request is no longer awaiting one.
+        drop(pending);
         (started, backend.infer(inputs))
     })
     .await

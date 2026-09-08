@@ -16,9 +16,11 @@
 //!   (both the KServe `ModelInfer` and native `Checkpoint` surfaces open one),
 //!   and the model's pending gauge goes up.
 //! - The frontend marks the input built ([`RequestTimer::input_ready`]:
-//!   `compute_input`); the `ModelManager` marks the execution
-//!   ([`RequestTimer::executed`]: `queue` = waiting for a blocking worker,
-//!   `compute_infer` = the backend's `infer`, plus the batch size).
+//!   `compute_input`); the `ModelManager` releases the pending slot
+//!   ([`RequestTimer::take_pending`]) the moment the backend starts running the
+//!   request, and marks the execution once it is done ([`RequestTimer::executed`]:
+//!   `queue` = waiting for a blocking worker, `compute_infer` = the backend's
+//!   `infer`, plus the batch size).
 //! - The request ends with [`RequestTimer::succeed`] (the remainder is
 //!   `compute_output`; counts and durations are committed, as in Triton, only
 //!   for successful requests) or [`RequestTimer::fail`] (one failure counted
@@ -134,10 +136,11 @@ impl InferenceMetrics {
 
     /// Open the accounting for one request to `model_name`, or `None` when the
     /// model is not registered. The model's pending gauge goes up until the
-    /// request executes or ends.
+    /// request starts executing (or ends before it does).
     pub fn begin(&self, model_name: &str) -> Option<RequestTimer> {
         let model = self.by_name.get(model_name)?.clone();
         model.pending_request_count.fetch_add(1, Ordering::Relaxed);
+        let slot = model.clone();
         let now = Instant::now();
         Some(RequestTimer {
             model,
@@ -148,7 +151,7 @@ impl InferenceMetrics {
             infer_us: 0,
             executions: 0,
             inferences: 0,
-            pending: true,
+            pending: Some(PendingSlot { model: slot }),
             reason: None,
             finished: false,
         })
@@ -299,8 +302,9 @@ pub struct RequestTimer {
     infer_us: u64,
     executions: u64,
     inferences: u64,
-    /// Whether this request still counts toward the pending gauge.
-    pending: bool,
+    /// This request's claim on the model's pending gauge, until it is handed
+    /// off to the execution (see [`Self::take_pending`]) or the request ends.
+    pending: Option<PendingSlot>,
     /// A failure reason pinned by whoever observed the failure (e.g. the
     /// `ModelManager` on a backend error); overrides status-code classification.
     reason: Option<FailureReason>,
@@ -324,8 +328,10 @@ impl RequestTimer {
 
     /// The backend ran: `queue` is how long the request waited for a worker,
     /// `infer` how long the backend's `infer` took, `batch` the number of
-    /// inferences in this execution (the request's batch size, or 1). Ends the
-    /// pending state and starts the `compute_output` phase.
+    /// inferences in this execution (the request's batch size, or 1). Starts
+    /// the `compute_output` phase. The pending slot is normally already gone by
+    /// now ([`Self::take_pending`]); releasing it here too only backstops a
+    /// caller that never took it.
     pub fn executed(&mut self, queue: Duration, infer: Duration, batch: u64) {
         self.queue_us += micros(queue);
         self.infer_us += micros(infer);
@@ -333,6 +339,17 @@ impl RequestTimer {
         self.inferences += batch.max(1);
         self.clear_pending();
         self.phase = Instant::now();
+    }
+
+    /// Hand off this request's claim on the pending gauge, to be dropped the
+    /// moment the backend starts running it: Triton's
+    /// `nv_inference_pending_request_count` counts requests *awaiting*
+    /// execution, so the gauge must fall when execution begins, not when it
+    /// ends. The slot is `Send`, so it can travel into the blocking worker and
+    /// be released there. Returns `None` if it has already been released.
+    #[must_use = "the pending gauge only falls when the slot is dropped"]
+    pub fn take_pending(&mut self) -> Option<PendingSlot> {
+        self.pending.take()
     }
 
     /// Pin the failure reason to `BACKEND`: the model itself failed, whatever
@@ -383,17 +400,28 @@ impl RequestTimer {
     }
 
     fn clear_pending(&mut self) {
-        if self.pending {
-            self.pending = false;
-            self.model
-                .pending_request_count
-                .fetch_sub(1, Ordering::Relaxed);
-        }
+        drop(self.pending.take());
     }
 
     fn close(&mut self) {
         self.clear_pending();
         self.finished = true;
+    }
+}
+
+/// One request's claim on a model's pending gauge. Dropping it releases the
+/// claim, so the gauge falls exactly once however the request ends — dropped in
+/// the blocking worker when execution starts, or with the [`RequestTimer`] when
+/// the request never got that far.
+pub struct PendingSlot {
+    model: Arc<ModelMetrics>,
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.model
+            .pending_request_count
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -463,6 +491,68 @@ mod tests {
             );
         }
         assert!(text.contains("# TYPE nv_inference_pending_request_count gauge"));
+    }
+
+    #[test]
+    fn pending_falls_when_execution_starts_and_only_once() {
+        let metrics = InferenceMetrics::new(["model3"]);
+        let pending =
+            |m: &InferenceMetrics| series(&m.render(), "nv_inference_pending_request_count", M3);
+        let mut timer = metrics.begin("model3").expect("registered model");
+        assert_eq!(
+            pending(&metrics),
+            Some(1),
+            "pending while awaiting execution"
+        );
+
+        // The slot travels to whoever starts the backend; the gauge falls when
+        // it lands there, not when the execution finishes.
+        let slot = timer.take_pending().expect("the slot is still held");
+        assert_eq!(
+            pending(&metrics),
+            Some(1),
+            "still pending until handed over"
+        );
+        assert!(
+            timer.take_pending().is_none(),
+            "the slot is taken only once"
+        );
+        drop(slot);
+        assert_eq!(pending(&metrics), Some(0), "execution has begun");
+
+        // Nothing that ends the request may decrement the gauge a second time —
+        // it is unsigned, so a double release would wrap to u64::MAX.
+        timer.executed(Duration::from_micros(7), Duration::from_micros(1500), 1);
+        assert_eq!(pending(&metrics), Some(0), "executed must not re-release");
+        timer.succeed();
+        assert_eq!(pending(&metrics), Some(0), "succeed must not re-release");
+    }
+
+    #[test]
+    fn a_request_that_ends_after_execution_started_releases_pending_once() {
+        let metrics = InferenceMetrics::new(["model3"]);
+        let pending =
+            |m: &InferenceMetrics| series(&m.render(), "nv_inference_pending_request_count", M3);
+
+        let mut timer = metrics.begin("model3").expect("registered model");
+        drop(timer.take_pending());
+        timer.fail(&Status::internal("backend blew up"));
+        assert_eq!(pending(&metrics), Some(0), "fail after the handoff");
+
+        // The client hung up mid-execution: the timer is dropped unfinished
+        // with its slot already gone.
+        let mut timer = metrics.begin("model3").expect("registered model");
+        drop(timer.take_pending());
+        drop(timer);
+        assert_eq!(pending(&metrics), Some(0), "drop after the handoff");
+        assert_eq!(
+            series(
+                &metrics.render(),
+                "nv_inference_request_failure",
+                &format!("{M3},reason=\"CANCELED\"")
+            ),
+            Some(1)
+        );
     }
 
     #[test]
