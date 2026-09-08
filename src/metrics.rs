@@ -12,9 +12,12 @@
 //!
 //! How a request is accounted:
 //!
-//! - A [`RequestTimer`] is opened when a request has named a configured model
-//!   (both the KServe `ModelInfer` and native `Checkpoint` surfaces open one),
-//!   and the model's pending gauge goes up.
+//! - A [`RequestTimer`] is opened once a request has named a configured model
+//!   *and an available version* (both the KServe `ModelInfer` and native
+//!   `Checkpoint` surfaces open one), and the model's pending gauge goes up.
+//!   Every series here is labelled `version="1"`, so a request naming a version
+//!   nereid does not serve is attributed nowhere rather than being charged to
+//!   the version that never saw it.
 //! - The frontend marks the input built ([`RequestTimer::input_ready`]:
 //!   `compute_input`); the `ModelManager` releases the pending slot
 //!   ([`RequestTimer::take_pending`]) the moment the backend starts running the

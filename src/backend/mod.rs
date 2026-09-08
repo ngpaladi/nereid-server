@@ -156,8 +156,9 @@ impl ModelManager {
     }
 
     /// Open the metrics accounting for one request to `model_name`. Call it as
-    /// soon as the request has named a configured model, before building its
-    /// inputs, so `compute_input` and validation failures are attributed.
+    /// soon as the request has named a configured model and an available
+    /// version, before building its inputs, so `compute_input` and validation
+    /// failures are attributed.
     pub fn begin_request(&self, model_name: &str) -> Result<RequestTimer, Status> {
         self.metrics.begin(model_name).ok_or_else(|| {
             Status::not_found(format!(
