@@ -26,8 +26,34 @@ and streaming `ModelStreamInfer`.
   the typed `contents`.
 - nereid serves a single implicit model version, `"1"`.
 
+Every inference request is also accounted in Triton's Prometheus metrics — see
+[Metrics](metrics.md).
+
+## HTTP health endpoints
+
+Kubernetes probes speak HTTP, not gRPC, so the KServe v2 health endpoints are served on
+`server.http_addr` (the same address as `/metrics`; see [Metrics](metrics.md#enabling)):
+
+| Endpoint | Answer |
+|---|---|
+| `GET /v2/health/live` | `200` once the server is up. |
+| `GET /v2/health/ready` | `200` once the server is up. nereid loads every configured model before it listens and fails startup otherwise, so a running server is a ready one — the same answer gRPC `ServerReady` gives. |
+| `GET /v2/models/{name}/ready` | `200` for a configured model, else `400` (Triton's code). |
+| `GET /v2/models/{name}/versions/{version}/ready` | As above, for the single version `1`. |
+
+All answer with an empty body. A probe block for a Deployment:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /v2/health/live, port: 8002 }
+readinessProbe:
+  httpGet: { path: /v2/health/ready, port: 8002 }
+```
+
+The rest of the HTTP/REST `/v2` surface — inference and metadata — is not implemented.
+
 > **Not implemented (deferred):** Torch `UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror;
-> Prometheus metrics; and the repository / config / statistics RPCs.
+> and the repository / config / statistics RPCs.
 
 ## Verifying compatibility
 

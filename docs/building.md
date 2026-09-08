@@ -141,13 +141,14 @@ The server reads `nereid.yaml` from its working directory and resolves
 the config and the model folders belong:
 
 ```bash
-docker run --rm -p 50051:50051 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server:latest
+docker run --rm -p 50051:50051 -p 8002:8002 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server:latest
 ```
 
 Two things differ from a host run:
 
 - **Bind a non-loopback address.** `nereid.yaml.example` uses `[::1]:50051`, which inside a
-  container is reachable only from that container. Use `[::]:50051` (or `0.0.0.0:50051`).
+  container is reachable only from that container. Use `[::]:50051` (or `0.0.0.0:50051`) — and
+  likewise `http_addr: "[::]:8002"` if you publish the [metrics / health](metrics.md) port.
 - **The container runs unprivileged**, as uid 10001. The Python backend builds a `venv/`
   *inside* each model folder, so a mounted model directory has to be writable by that uid —
   otherwise run with `--user "$(id -u):$(id -g)"` to match the host owner.

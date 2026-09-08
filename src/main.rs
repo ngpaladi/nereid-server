@@ -10,6 +10,8 @@ mod backend;
 mod backends;
 mod config;
 mod dtype;
+mod http;
+mod metrics;
 mod triton;
 
 use backend::{Contract, ModelManager, Tensor};
@@ -179,20 +181,33 @@ impl Nereid for NereidService {
                 ))
             })?;
 
+        // From here the request is attributed to the model in the metrics.
+        let mut timer = self.model_manager.begin_request(&model_name)?;
+
         // When the model declares an input tensor, validate and reassemble it
         // from the request stream; otherwise drain the (input-less) stream. The
         // backend then streams its `Checkpoint` response (Python backends also
         // interleave stdout/stderr log chunks).
         let input = if contract.has_input() {
-            Some(collect_input_tensor(&mut stream, &contract, &model_name).await?)
+            match collect_input_tensor(&mut stream, &contract, &model_name).await {
+                Ok(tensor) => Some(tensor),
+                Err(status) => {
+                    timer.fail(&status);
+                    return Err(status);
+                }
+            }
         } else {
             tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
             None
         };
+        timer.input_ready();
 
-        Ok(Response::new(
-            self.model_manager.checkpoint(&model_name, input)?,
-        ))
+        // The stream owns the timer from here and ends it when it completes.
+        Ok(Response::new(self.model_manager.checkpoint(
+            &model_name,
+            input,
+            timer,
+        )?))
     }
 }
 
@@ -206,6 +221,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ModelManager::from_config(&config)
             .map_err(|status| std::io::Error::other(status.to_string()))?,
     );
+
+    // The plain-HTTP surface — Prometheus metrics and the KServe v2 health
+    // probes — on its own address, when configured. Bound here, before serving,
+    // so a bad or busy address fails startup rather than silently going
+    // unscraped.
+    if let Some(http_addr) = &config.server.http_addr {
+        let http_addr: std::net::SocketAddr = http_addr.parse().map_err(|err| {
+            std::io::Error::other(format!("invalid server.http_addr '{http_addr}': {err}"))
+        })?;
+        let listener = tokio::net::TcpListener::bind(http_addr).await?;
+        let http_root = format!("http://{}", listener.local_addr()?);
+        println!("Prometheus metrics at {http_root}/metrics");
+        println!("HTTP health at {http_root}/v2/health/live and /v2/health/ready");
+        let manager = model_manager.clone();
+        tokio::spawn(async move {
+            if let Err(err) = http::serve_on(listener, manager).await {
+                eprintln!("[nereid-server] HTTP endpoint stopped: {err}");
+            }
+        });
+    }
 
     let nereid = NereidService::new(model_manager.clone());
     let triton = TritonService::new(model_manager);
@@ -292,16 +327,28 @@ mod checkpoint_e2e_tests {
     }
 
     async fn spawn_test_server(ml_backends_path: PathBuf, models: Vec<ModelConfig>) -> SocketAddr {
+        spawn_test_server_with_manager(ml_backends_path, models)
+            .await
+            .0
+    }
+
+    /// Like [`spawn_test_server`], also handing back the `ModelManager` (for
+    /// reading the metrics it records).
+    async fn spawn_test_server_with_manager(
+        ml_backends_path: PathBuf,
+        models: Vec<ModelConfig>,
+    ) -> (SocketAddr, Arc<ModelManager>) {
         let config = ServerConfig {
             server: ServerSection {
                 bind_addr: "127.0.0.1:0".to_string(),
                 ml_backends_path: ml_backends_path.to_string_lossy().into_owned(),
+                http_addr: None,
             },
             models,
         };
         let model_manager =
             Arc::new(ModelManager::from_config(&config).expect("model manager should build"));
-        let nereid = NereidService::new(model_manager);
+        let nereid = NereidService::new(model_manager.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -316,7 +363,17 @@ mod checkpoint_e2e_tests {
                 .await;
         });
 
-        addr
+        (addr, model_manager)
+    }
+
+    /// The integer sample of the series `name{labels}` in rendered metrics.
+    fn metric(text: &str, name: &str, labels: &str) -> u64 {
+        let prefix = format!("{name}{{{labels}}} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("series {name}{{{labels}}} missing from:\n{text}"))
+            .parse()
+            .expect("integer sample")
     }
 
     async fn connect(addr: SocketAddr) -> NereidClient<tonic::transport::Channel> {
@@ -1207,5 +1264,135 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             .expect_err("empty stream must be rejected");
 
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Prometheus metrics
+    // ---------------------------------------------------------------------
+
+    /// The native `Checkpoint` path is accounted in the same `nv_inference_*`
+    /// series as `ModelInfer`: a batch-2 success on the Rust backend, then a
+    /// shape mismatch (`OTHER`), both attributed to the model.
+    #[tokio::test]
+    async fn checkpoint_is_counted_in_prometheus_metrics() {
+        let ml_backends = fixtures_dir();
+        assert!(
+            ml_backends.join("model3").is_dir(),
+            "model3 fixture missing"
+        );
+        let (addr, manager) =
+            spawn_test_server_with_manager(ml_backends, vec![cpu_model("model3")]).await;
+        let mut client = connect(addr).await;
+        let labels = "model=\"model3\",version=\"1\"";
+
+        let values: Vec<f32> = (0..32).map(|v| v as f32).collect();
+        let collected = run_checkpoint(
+            &mut client,
+            vec![
+                meta("model3"),
+                tensor_chunk(vec![2, 16], f32_le_bytes(&values), true),
+            ],
+        )
+        .await
+        .expect("batch-2 checkpoint should succeed");
+        assert!(collected.saw_done);
+
+        let status = run_checkpoint(
+            &mut client,
+            vec![
+                meta("model3"),
+                tensor_chunk(vec![1, 15], f32_le_bytes(&values[..15]), true),
+            ],
+        )
+        .await
+        .expect_err("shape mismatch must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
+        let text = manager.metrics().render();
+        assert_eq!(metric(&text, "nv_inference_request_success", labels), 1);
+        assert_eq!(metric(&text, "nv_inference_count", labels), 2, "batch of 2");
+        assert_eq!(metric(&text, "nv_inference_exec_count", labels), 1);
+        assert_eq!(
+            metric(
+                &text,
+                "nv_inference_request_failure",
+                &format!("{labels},reason=\"OTHER\"")
+            ),
+            1
+        );
+        assert!(metric(&text, "nv_inference_compute_infer_duration_us", labels) > 0);
+        assert_eq!(
+            metric(&text, "nv_inference_pending_request_count", labels),
+            0
+        );
+    }
+
+    /// A Python model's own `Checkpoint` stream is accounted through the same
+    /// timer: exit code 0 is a success, a non-zero exit a `BACKEND` failure.
+    #[tokio::test]
+    async fn python_checkpoint_outcomes_are_counted() {
+        let (ml_backends, name) =
+            make_python_model("metrics-python", "e2e_metrics_python", "print('hello')\n");
+        let (ml_backends_fail, name_fail) = make_python_model(
+            "metrics-python-fail",
+            "e2e_metrics_python_fail",
+            "import sys\nsys.exit(3)\n",
+        );
+        // Both models under one ml-backends dir so one server serves them.
+        std::fs::rename(
+            ml_backends_fail.join(&name_fail),
+            ml_backends.join(&name_fail),
+        )
+        .expect("move failing model alongside");
+        let _ = std::fs::remove_dir_all(&ml_backends_fail);
+
+        let (addr, manager) = spawn_test_server_with_manager(
+            ml_backends.clone(),
+            vec![cpu_model(&name), cpu_model(&name_fail)],
+        )
+        .await;
+        let mut client = connect(addr).await;
+
+        let ok = run_checkpoint(&mut client, vec![meta(&name)])
+            .await
+            .expect("python checkpoint should succeed");
+        assert_eq!(ok.exit_code, 0);
+        let failed = run_checkpoint(&mut client, vec![meta(&name_fail)])
+            .await
+            .expect("stream completes even on failure");
+        assert_eq!(failed.exit_code, 3);
+
+        let text = manager.metrics().render();
+        let ok_labels = format!("model=\"{name}\",version=\"1\"");
+        let fail_labels = format!("model=\"{name_fail}\",version=\"1\"");
+        assert_eq!(metric(&text, "nv_inference_request_success", &ok_labels), 1);
+        assert_eq!(metric(&text, "nv_inference_exec_count", &ok_labels), 1);
+        assert_eq!(
+            metric(&text, "nv_inference_count", &ok_labels),
+            1,
+            "input-less model runs once"
+        );
+        assert_eq!(
+            metric(&text, "nv_inference_request_success", &fail_labels),
+            0
+        );
+        assert_eq!(
+            metric(
+                &text,
+                "nv_inference_request_failure",
+                &format!("{fail_labels},reason=\"BACKEND\"")
+            ),
+            1
+        );
+        assert_eq!(
+            metric(&text, "nv_inference_pending_request_count", &ok_labels),
+            0
+        );
+        assert_eq!(
+            metric(&text, "nv_inference_pending_request_count", &fail_labels),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&ml_backends);
     }
 }
