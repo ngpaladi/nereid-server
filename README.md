@@ -482,7 +482,7 @@ grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50
 ```
 
 ## AI-generated code
-nereid is developed with the help of AI coding tools. How they are used, what stays with the
+nereid is developed with the help of AI coding tools. How they are used, what remains the
 responsibility of human maintainers, and the review policy applied to every change are set out in
 [docs/ai-code-policy.md](docs/ai-code-policy.md).
 
