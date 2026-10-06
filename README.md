@@ -27,8 +27,8 @@ are still written against nereid's own contracts (a `.pt` file or a `main.py`).
 
 **Implemented RPCs:** `ServerLive`, `ServerReady`, `ModelReady`, `ServerMetadata`,
 `ModelMetadata`, unary `ModelInfer`, streaming `ModelStreamInfer`, and `RepositoryIndex` (every
-configured model, version `"1"`, state `READY` — the discovery call CMSSW's SONIC client makes on
-connect; a named `repository_name` is `UNIMPLEMENTED`, as in Triton). Both backends are
+configured model, version `"1"`, state `READY`; the one repository is named after
+`server.ml_backends_path`, and `repository_name` may be empty or that name). Both backends are
 servable:
 - **Rust `.pt`** — single-tensor and multi-tensor (nested `input {}`/`output {}` blocks in
   the textproto); datatypes are the libtorch kinds (`FP16/32/64`, `INT8/16/32/64`, `UINT8`,

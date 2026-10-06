@@ -16,9 +16,9 @@ Usage:
         --model pymul:mul --model pyaddint:addint --model model3 \
         --stream pymul
 
-The script first fetches the repository index (``RepositoryIndex``, the call
-CMSSW's SONIC client makes on connect) and requires every model named below to
-be listed there as ``READY``. Each ``--model`` is ``NAME`` or ``NAME:MODE``.
+The script first fetches the repository index (``RepositoryIndex``, the
+model-discovery call a client makes on connect) and requires every model named
+below to be listed there as ``READY``. Each ``--model`` is ``NAME`` or ``NAME:MODE``.
 For every model the script checks readiness, metadata, and one ``infer()``. Modes assert real arithmetic:
 ``mul`` -> ``input*2+1`` in FP32 (the ``ml-backends/pymul`` fixture);
 ``addint`` -> ``input+1`` in INT32 (``ml-backends/pyaddint``, the non-float

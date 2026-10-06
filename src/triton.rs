@@ -8,8 +8,8 @@
 //!
 //! Implemented: `ServerLive/Ready`, `ModelReady`, `ServerMetadata`,
 //! `ModelMetadata`, unary `ModelInfer`, streaming `ModelStreamInfer`, and
-//! `RepositoryIndex` (the model list a client such as CMSSW's SONIC fetches on
-//! connect). This surface is backend-agnostic: it validates the request against the model's
+//! `RepositoryIndex` (the model list a client fetches on connect). This
+//! surface is backend-agnostic: it validates the request against the model's
 //! [`Contract`], builds canonical [`Tensor`]s, and dispatches through
 //! `ModelManager` — so every backend (TorchScript, ONNX, TensorFlow, Python) and
 //! both single- and multi-tensor models flow through one path. The request
@@ -349,19 +349,22 @@ impl GrpcInferenceService for TritonService {
 
     /// The model repository index: one `READY` entry per configured model, in
     /// `nereid.yaml` order, at version `"1"`. Clients that discover what a
-    /// server can serve — CMSSW's SONIC `TritonService` among them — call this
-    /// on connect. nereid has one implicit repository (`server.ml_backends_path`)
-    /// and loads all of it at startup, so `ready: true` filters nothing out and
-    /// naming a `repository_name` is rejected exactly as Triton rejects it.
+    /// server can serve call this on connect. nereid serves exactly one
+    /// repository, named after `server.ml_backends_path`: a request may leave
+    /// `repository_name` empty (the index of all repositories, as the proto
+    /// defines it) or name that repository; any other name is `NOT_FOUND`.
+    /// Every model is loaded at startup, so `ready: true` filters nothing out.
     async fn repository_index(
         &self,
         request: Request<RepositoryIndexRequest>,
     ) -> Result<Response<RepositoryIndexResponse>, Status> {
         let request = request.into_inner();
-        if !request.repository_name.is_empty() {
-            return Err(Status::unimplemented(
-                "'repository_name' specification is not supported",
-            ));
+        let served = self.model_manager.repository_name();
+        if !request.repository_name.is_empty() && request.repository_name != served {
+            return Err(Status::not_found(format!(
+                "unknown model repository '{}': this server serves only '{served}'",
+                request.repository_name
+            )));
         }
         let models = self
             .model_manager
@@ -840,7 +843,9 @@ mod triton_e2e_tests {
 
     /// `RepositoryIndex` lists every configured model as `READY` at version
     /// `"1"`, in config order; `ready: true` changes nothing (everything nereid
-    /// serves is loaded); naming a repository is `Unimplemented`, as in Triton.
+    /// serves is loaded). The one repository nereid serves is named after
+    /// `server.ml_backends_path`: naming it exactly is the same as naming
+    /// none, and any other name is `NotFound`.
     #[tokio::test]
     async fn repository_index_lists_configured_models() {
         assert!(fixtures_dir().join("model3").is_dir(), "model3 missing");
@@ -873,10 +878,16 @@ mod triton_e2e_tests {
         });
         let mut client = connect(addr).await;
 
-        for ready in [false, true] {
+        let served = fixtures_dir().to_string_lossy().into_owned();
+        for (repository_name, ready) in [
+            (String::new(), false),
+            (String::new(), true),
+            (served.clone(), false),
+            (served, true),
+        ] {
             let index = client
                 .repository_index(RepositoryIndexRequest {
-                    repository_name: String::new(),
+                    repository_name: repository_name.clone(),
                     ready,
                 })
                 .await
@@ -897,7 +908,7 @@ mod triton_e2e_tests {
             assert_eq!(
                 entries,
                 vec![("multi", "1", "READY", ""), ("model3", "1", "READY", "")],
-                "ready={ready}: every configured model, in config order"
+                "repository_name={repository_name:?} ready={ready}: every configured model, in config order"
             );
         }
 
@@ -907,8 +918,12 @@ mod triton_e2e_tests {
                 ready: false,
             })
             .await
-            .expect_err("a named repository is not supported");
-        assert_eq!(status.code(), tonic::Code::Unimplemented, "{status:?}");
+            .expect_err("a repository other than server.ml_backends_path is unknown");
+        assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+        assert!(
+            status.message().contains("somewhere"),
+            "the rejection names the unknown repository: {status:?}"
+        );
     }
 
     /// A tensor-capable Python model (the committed `pymul` fixture, which

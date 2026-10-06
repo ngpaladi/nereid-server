@@ -72,6 +72,10 @@ struct ModelEntry {
 }
 
 pub struct ModelManager {
+    /// The name of the single model repository nereid serves: the configured
+    /// `server.ml_backends_path`, verbatim (not canonicalized), which is what
+    /// a client names in a `RepositoryIndex` request.
+    repository_name: String,
     model_names: Vec<String>,
     entries: HashMap<String, ModelEntry>,
 }
@@ -135,9 +139,16 @@ impl ModelManager {
         }
 
         Ok(Self {
+            repository_name: config.server.ml_backends_path.clone(),
             model_names,
             entries,
         })
+    }
+
+    /// The name of the one model repository nereid serves: the configured
+    /// `server.ml_backends_path`, as written in `nereid.yaml`.
+    pub fn repository_name(&self) -> &str {
+        &self.repository_name
     }
 
     pub fn configured_models(&self) -> Vec<String> {
