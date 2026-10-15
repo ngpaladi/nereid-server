@@ -14,6 +14,11 @@ nereid binds a single address (`server.bind_addr`) and serves two gRPC services 
 They aren't two systems. Both are backed by the same models and the same `ModelManager`; they're
 just two front doors into it.
 
+Optionally, a third, non-gRPC address (`server.http_addr`) serves plain HTTP: Prometheus metrics
+for the requests that come through either door — Triton's `nv_inference_*` series, so Triton
+dashboards apply unchanged (see [Metrics](metrics.md)) — and the KServe v2 `/v2/health/*`
+endpoints for Kubernetes probes (see [KServe v2](triton.md#http-health-endpoints)).
+
 ## The ModelManager
 
 At startup the server reads `nereid.yaml` and builds a `ModelManager` that owns every configured

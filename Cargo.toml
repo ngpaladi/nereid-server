@@ -7,7 +7,10 @@ edition = "2024"
 tonic = "*"
 prost = "0.14"
 tonic-prost = "*"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "net"] }
+# The Prometheus `/metrics` endpoint (see `metrics`). axum is already compiled
+# in as tonic's router, so this adds only its HTTP/1 server features.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 # Link-time backend registry: each backend `submit!`s itself so the core never
