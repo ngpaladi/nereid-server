@@ -18,13 +18,21 @@ against any other server's model-repository layout.
 ## Implemented RPCs
 
 `ServerLive`, `ServerReady`, `ModelReady`, `ServerMetadata`, `ModelMetadata`, unary `ModelInfer`,
-and streaming `ModelStreamInfer`.
+streaming `ModelStreamInfer`, and `RepositoryIndex`.
 
 - **Datatypes** are the KServe fixed-width kinds: `FP16/32/64`, `INT8/16/32/64`, `UINT8`, `BOOL`,
   `BF16`, plus `UINT16/32/64` on the native (ONNX/TensorFlow) path.
 - **Inputs** may be sent as `raw_input_contents` (raw little-endian bytes, preferred) or, for FP32,
   the typed `contents`.
 - nereid serves a single implicit model version, `"1"`.
+- **`RepositoryIndex`** — the model-discovery call a client makes on connect (CMSSW's SONIC
+  `TritonService`, for one, uses it to learn which models a server offers). nereid answers with
+  one entry per model in `nereid.yaml`, in that order, each at version `"1"` and state `READY`:
+  every model is loaded before the server listens, so there is no other state to report, and the
+  `ready: true` filter therefore excludes nothing. nereid serves exactly one model repository,
+  named after `server.ml_backends_path` as written in `nereid.yaml`; a request may leave
+  `repository_name` empty or name that repository, and any other name is rejected with
+  `NOT_FOUND`.
 
 Every inference request is also accounted in Triton's Prometheus metrics — see
 [Metrics](metrics.md).
@@ -53,7 +61,7 @@ readinessProbe:
 The rest of the HTTP/REST `/v2` surface — inference and metadata — is not implemented.
 
 > **Not implemented (deferred):** Torch `UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror;
-> and the repository / config / statistics RPCs.
+> and the model load/unload, config and statistics RPCs.
 
 ## Verifying compatibility
 

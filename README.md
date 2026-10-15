@@ -26,7 +26,9 @@ so the wire format is byte-compatible. This is **wire**-parity, not authoring-pa
 are still written against nereid's own contracts (a `.pt` file or a `main.py`).
 
 **Implemented RPCs:** `ServerLive`, `ServerReady`, `ModelReady`, `ServerMetadata`,
-`ModelMetadata`, unary `ModelInfer`, and streaming `ModelStreamInfer`. Both backends are
+`ModelMetadata`, unary `ModelInfer`, streaming `ModelStreamInfer`, and `RepositoryIndex` (every
+configured model, version `"1"`, state `READY`; the one repository is named after
+`server.ml_backends_path`, and `repository_name` may be empty or that name). Both backends are
 servable:
 - **Rust `.pt`** — single-tensor and multi-tensor (nested `input {}`/`output {}` blocks in
   the textproto); datatypes are the libtorch kinds (`FP16/32/64`, `INT8/16/32/64`, `UINT8`,
@@ -42,8 +44,8 @@ servable:
 
 The request datatype must match the model's declared `data_type` (default `FP32`). nereid
 serves a single implicit model version, `"1"`. **Not implemented (deferred):** Rust
-`UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror and the
-repository/config/statistics RPCs.
+`UINT16/32/64` and `BYTES`; the HTTP/REST `/v2` mirror and the model load/unload, config and
+statistics RPCs.
 
 ### Verifying compatibility
 Wire compatibility is established by a **stock `tritonclient`** (built from Triton's own proto
@@ -448,8 +450,14 @@ the **[docs site](docs/building.md#container-image)** for details, and the *Cont
 workflow's `workflow_dispatch` for building or publishing outside a release.
 
 ## Linux packages (`.deb` / `.rpm`)
-Every published GitHub release also attaches a `.deb` and an `.rpm` for `x86_64`, built
-from the same bundle as the container image:
+Every published GitHub release attaches a `.deb` and an `.rpm` for `x86_64`, built from the
+same bundle as the container image. On the RHEL family there is a dnf repository, so
+upgrades come with everything else:
+```bash
+sudo dnf config-manager --add-repo https://www.noahpaladino.com/nereid-server/rpm/nereid-server.repo
+sudo dnf install nereid-server
+```
+Or install a downloaded package directly:
 ```bash
 sudo apt install ./nereid-server_<version>-1_amd64.deb     # Debian / Ubuntu
 sudo dnf install ./nereid-server-<version>-1.x86_64.rpm    # RHEL / Rocky / AlmaLinux / Fedora
@@ -485,6 +493,17 @@ RHEL/Rocky/AlmaLinux 9+, Debian 12+, Ubuntu 22.04+, or Fedora 38+. Each release 
 and run in `almalinux:9` and `ubuntu:22.04` — the binding end of that floor in each package
 family — before the assets are attached.
 
+The dnf repository is published as part of the docs site by `packaging/make-rpm-repo.sh`,
+which regenerates it from the release assets whenever the packages workflow finishes. Only
+the *metadata* is hosted there — one package is ~200 MB and GitHub Pages caps a site at
+1 GB — so `primary.xml` carries an `xml:base` that sends `dnf` to the release download URL
+for the package itself. The `.repo` sets `gpgcheck=1` and `repo_gpgcheck=1`; the RPMs are
+signed by the packages workflow, and an unsigned one is left out of the metadata rather than
+listed and then refused. `packaging/test-rpm-repo.sh` installs from the generated repository
+in `almalinux:9` and `fedora:latest` on every docs build. See
+[the install page](https://www.noahpaladino.com/nereid-server/install/) for the user-facing
+version. There is no apt repository yet.
+
 Built by the *Linux packages* workflow from `packaging/nfpm.yaml`, on the EL9 build stage in
 `packaging/Dockerfile.el9` — the container image keeps its own Debian base, since nothing in
 a container cares what the host's glibc is. The workflow's `workflow_dispatch` builds and
@@ -510,6 +529,11 @@ View models:
 ```bash
 grpcurl -plaintext -import-path ./proto -proto inference.proto -d '{}' '[::1]:50051' inference.Nereid/ViewModels
 ```
+
+## AI-generated code
+nereid is developed with the help of AI coding tools. How they are used, what remains the
+responsibility of human maintainers, and the review policy applied to every change are set out in
+[docs/ai-code-policy.md](docs/ai-code-policy.md).
 
 ## Project structure
 - `src/main.rs`: gRPC service implementation and server bootstrap.

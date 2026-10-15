@@ -16,6 +16,14 @@ on:
       # re-run the coverage check even when no doc file was touched.
       - "src/backends/**"
       - "scripts/check_backend_docs.sh"
+      # The dnf repository published at /rpm/ is generated into the site by
+      # these scripts, so a change to one is a change to the site. The public
+      # key is published there too, and is the one file here that could ever be
+      # replaced on its own — a rotation that did not redeploy would leave the
+      # old key served against metadata signed by the new one.
+      - "packaging/make-rpm-repo.sh"
+      - "packaging/test-rpm-repo.sh"
+      - "packaging/RPM-GPG-KEY-nereid"
   pull_request:
     paths:
       - "docs/**"
@@ -25,6 +33,20 @@ on:
       - ".github/workflows/docs.yml"
       - "src/backends/**"
       - "scripts/check_backend_docs.sh"
+      - "packaging/make-rpm-repo.sh"
+      - "packaging/test-rpm-repo.sh"
+      - "packaging/RPM-GPG-KEY-nereid"
+
+  # A release's .rpm is not attached until the Linux packages workflow finishes
+  # — up to two hours after the release is published. Triggering on the release
+  # itself would regenerate the repository metadata before the package it needs
+  # to list even exists, so wait on that workflow instead. Firing for its
+  # `workflow_dispatch` dry runs too is harmless: regenerating from an unchanged
+  # set of releases produces the same metadata.
+  workflow_run:
+    workflows: ["Linux packages"]
+    types: [completed]
+
   workflow_dispatch:
 
 permissions:
@@ -35,6 +57,11 @@ jobs:
   # Runs on every PR that touches the docs.
   build:
     runs-on: ubuntu-latest
+    # A failed packages build has produced nothing new to list, and rebuilding
+    # the site off the back of it would only re-publish what is already there.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
       # Fail if a registered backend is missing from the canonical docs table.
@@ -47,8 +74,72 @@ jobs:
         run: pip install -r docs-requirements.txt
       - name: Build (strict)
         run: mkdocs build --strict
+
+      # ---- the dnf repository at <site>/rpm/ ------------------------------
+      #
+      # Generated into the built site rather than committed, because it is
+      # derived state: it is a function of which releases currently carry a
+      # signed .rpm, and nothing else. See packaging/make-rpm-repo.sh for why
+      # only the metadata is published here and the packages stay on Releases.
+      - name: Install repository tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq createrepo-c rpm
+
+      # The cache key is the list of releases itself, so a docs-only change
+      # re-uses the previously downloaded .rpm files (a few hundred MB each)
+      # instead of pulling them again, and a new release misses the key exactly
+      # once. A published release's assets are immutable, so a hit is always the
+      # right file.
+      - name: Resolve the release list
+        id: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+              --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' \
+              || true)"
+          echo "releases: ${tags:-<none>}"
+          printf 'hash=%s\n' "$(printf '%s' "$tags" | sha256sum | cut -c1-16)" \
+              >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: .cache/rpm-repo
+          key: rpm-repo-${{ steps.releases.outputs.hash }}
+          restore-keys: rpm-repo-
+
+      - name: Generate the dnf repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Absent on a pull request from a fork, which is fine: that build is
+          # never deployed, and the script degrades to unsigned metadata so the
+          # rest of it still gets exercised.
+          GPG_PRIVATE_KEY: ${{ secrets.NEREID_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.NEREID_GPG_PASSPHRASE }}
+          REPO_SLUG: ${{ github.repository }}
+        run: ./packaging/make-rpm-repo.sh site/rpm
+
+      # Install from what was just generated, in the two distros the packages
+      # workflow already smoke-tests: AlmaLinux 9 is the glibc floor, Fedora the
+      # far end. dnf reads the metadata off disk (the site is not deployed yet)
+      # but fetches the package itself from the release URL in the xml:base, so
+      # the part that could realistically be wrong is the part being tested.
+      - name: Verify the repository installs (AlmaLinux 9)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w almalinux:9 \
+            /w/packaging/test-rpm-repo.sh /w/site/rpm
+
+      - name: Verify the repository installs (Fedora)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w fedora:latest \
+            /w/packaging/test-rpm-repo.sh /w/site/rpm
+
+      # workflow_run always runs against the default branch, but say so
+      # explicitly rather than leaning on github.ref happening to reflect that.
       - name: Upload site artifact
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_run'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
@@ -56,9 +147,16 @@ jobs:
   # Deploy to GitHub Pages, only from main. Requires Pages to be enabled for the
   # repo with "GitHub Actions" as the source (Settings -> Pages).
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_run'
     needs: build
     runs-on: ubuntu-latest
+    # A release deploy (via workflow_run) and an ordinary docs push can land at
+    # the same time; Pages takes one deployment at a time, and the later one
+    # should queue rather than be thrown away — it is the one carrying the newer
+    # repository metadata.
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write

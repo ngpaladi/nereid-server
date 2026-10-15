@@ -10,10 +10,10 @@
 // `//@@` doc comments from upstream are stripped for brevity; nothing on the
 // wire changes.
 //
-// This is the MVP subset only — it intentionally omits ModelConfig/repository/
-// statistics/shared-memory/trace/log RPCs, and the `import "model_config.proto"`
-// they require. Add them back from upstream as parity work proceeds (see README
-// "Triton compatibility").
+// This is the MVP subset only — it intentionally omits the ModelConfig, model
+// load/unload, statistics, shared-memory, trace and log RPCs, and the
+// `import "model_config.proto"` they require. Add them back from upstream as
+// parity work proceeds (see README "Triton compatibility").
 
 syntax = "proto3";
 
@@ -42,6 +42,9 @@ service GRPCInferenceService
   // Perform streaming inference.
   rpc ModelStreamInfer(stream ModelInferRequest)
       returns (stream ModelStreamInferResponse) {}
+
+  // Get the index of model repository contents.
+  rpc RepositoryIndex(RepositoryIndexRequest) returns (RepositoryIndexResponse) {}
 }
 
 message ServerLiveRequest {}
@@ -175,4 +178,36 @@ message ModelStreamInferResponse
   string error_message = 1;
   // The results of the request.
   ModelInferResponse infer_response = 2;
+}
+
+message RepositoryIndexRequest
+{
+  // The name of the repository. If empty the index is returned
+  // for all repositories.
+  string repository_name = 1;
+
+  // If true returned only models currently ready for inferencing.
+  bool ready = 2;
+}
+
+message RepositoryIndexResponse
+{
+  // Index entry for a model.
+  message ModelIndex
+  {
+    // The name of the model.
+    string name = 1;
+
+    // The version of the model.
+    string version = 2;
+
+    // The state of the model.
+    string state = 3;
+
+    // The reason, if any, that the model is in the given state.
+    string reason = 4;
+  }
+
+  // An index entry for each model.
+  repeated ModelIndex models = 1;
 }

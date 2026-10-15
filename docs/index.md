@@ -17,6 +17,8 @@ ones you want.
 
 ## What to read next
 
+- **[Install](install.md)** — the dnf repository, what the packages lay down, and getting the
+  service running.
 - **[Architecture](architecture.md)** — the two gRPC surfaces, the `ModelManager`, how requests are
   bounded, and how one gets to a backend.
 - **[Backends](backends.md)** — the backends that ship today, how the server finds them, and how you
@@ -29,6 +31,8 @@ ones you want.
   and what each one measures in nereid.
 - **[Building & running](building.md)** — `build.sh`, the libtorch dependency, linking modes, HPC
   builds, and choosing your backends.
+- **[AI-generated code](ai-code-policy.md)** — how AI tools are used in developing nereid, and the
+  review policy applied to every change.
 
 ## Core ideas
 
