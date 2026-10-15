@@ -25,6 +25,9 @@ use proto::{
 use triton::TritonService;
 
 pub mod proto {
+    // tonic's generated service traits carry `#[async_trait]`, whose expansion
+    // trips clippy's `double_must_use` (Rust 1.99+). Generated code; allow it.
+    #![allow(clippy::double_must_use)]
     tonic::include_proto!("inference");
 }
 
