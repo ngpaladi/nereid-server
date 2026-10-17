@@ -335,30 +335,35 @@ fn inference_count(contract: &Contract, inputs: &[Tensor]) -> u64 {
 struct Execution {
     /// How long the request waited for a blocking worker to pick it up.
     queued: Duration,
-    /// How long the backend's `infer` ran.
+    /// How long the backend's `infer` ran, clocked on the worker that ran it.
     ran: Duration,
     result: Result<Vec<Tensor>, Status>,
 }
 
 /// Run `backend.infer` off the async runtime, timing the wait and the run.
-/// `Err` only when the blocking task itself fails to join (it panicked).
+/// Both are clocked on the blocking worker: the run ends when `infer` returns
+/// there, not when the async caller gets to observe it, so a busy runtime
+/// that is slow to resume the caller does not inflate `compute_infer` (that
+/// wait lands in `compute_output`, as the request's remainder). `Err` only
+/// when the blocking task itself fails to join (it panicked).
 async fn run_backend(
     backend: Arc<dyn Backend>,
     inputs: Vec<Tensor>,
     pending: Option<PendingSlot>,
 ) -> Result<Execution, Status> {
     let queued_at = Instant::now();
-    let (started, result) = tokio::task::spawn_blocking(move || {
+    let (started, ran, result) = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         // Execution begins here: the request is no longer awaiting one.
         drop(pending);
-        (started, backend.infer(inputs))
+        let result = backend.infer(inputs);
+        (started, started.elapsed(), result)
     })
     .await
     .map_err(|err| Status::internal(format!("inference task failed to join: {err}")))?;
     Ok(Execution {
         queued: started.duration_since(queued_at),
-        ran: started.elapsed(),
+        ran,
         result,
     })
 }
@@ -589,9 +594,11 @@ pub(crate) fn missing_feature(model_name: &str, what: &str, feature: &str) -> St
 
 #[cfg(test)]
 mod tests {
-    use super::detect_backend;
+    use super::{Backend, Tensor, detect_backend, run_backend};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tonic::Status;
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -672,5 +679,39 @@ mod tests {
         let base = temp_dir("empty");
         assert!(detect_backend(&base, "model", None).is_err());
         let _ = fs::remove_dir_all(&base);
+    }
+    /// A backend whose `infer` returns at once.
+    struct Instant;
+
+    impl Backend for Instant {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+
+        fn infer(&self, _inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// `compute_infer` is clocked on the blocking worker. If the async runtime
+    /// is busy when `infer` returns, the time until the caller resumes must
+    /// not be charged to the backend.
+    #[tokio::test]
+    async fn run_backend_times_infer_on_the_worker_not_on_resume() {
+        let execution = tokio::spawn(run_backend(Arc::new(Instant), Vec::new(), None));
+        // Let the task reach `spawn_blocking`, then hog the (single) runtime
+        // thread so its completion cannot be observed for a while.
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(200));
+        let execution = execution
+            .await
+            .expect("task joins")
+            .expect("blocking task joins");
+        assert!(execution.result.is_ok());
+        assert!(
+            execution.ran < Duration::from_millis(100),
+            "ran {:?} includes the runtime's resume delay",
+            execution.ran
+        );
     }
 }

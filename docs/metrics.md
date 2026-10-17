@@ -78,10 +78,23 @@ requests.
 | `nv_inference_compute_infer_duration_us` | The backend's `infer` — the model itself. For a Python model's `Checkpoint` stream, the whole subprocess run. |
 | `nv_inference_compute_output_duration_us` | Validating and serializing the outputs. |
 
-Note that `compute_input` and `compute_output` are measured where nereid does that work — at the
-gRPC boundary — whereas Triton measures them inside the backend. Backends that convert bytes to
-framework tensors (libtorch, ONNX Runtime) do so inside `infer`, so that time lands in
-`compute_infer` here.
+### How the phases differ from Triton's
+
+Triton's phases run *queue → compute_input → compute_infer → compute_output*: a request first waits
+in the scheduler (and dynamic batcher), and the backend then reports the three compute phases
+itself, `compute_input` being the conversion of the request's tensors into the framework's (for
+example the copy into GPU memory). nereid has no scheduler queue and no dynamic batcher, so its
+phases run *compute_input → queue → compute_infer → compute_output*: the request's tensors are
+validated and assembled at the gRPC boundary (`compute_input`), the request is dispatched at once
+and waits only for a worker thread (`queue`), the backend's `infer` runs as one step
+(`compute_infer`), and the outputs are validated and serialized (`compute_output`). Converting
+bytes to framework tensors (libtorch, ONNX Runtime) happens inside `infer`, so that time lands in
+`compute_infer` here, not in `compute_input`.
+
+In both servers the four phases partition the request's time inside the server, so sums and
+`request_duration_us` compare directly. The two `compute_input` series do not: nereid's measures
+the protobuf-to-tensor work that Triton's frontend does before any phase starts, and Triton's
+measures backend input conversion that nereid counts under `compute_infer`.
 
 ## Which requests count
 
