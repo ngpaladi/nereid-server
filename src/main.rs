@@ -185,7 +185,7 @@ impl Nereid for NereidService {
             })?;
 
         // From here the request is attributed to the model in the metrics.
-        let mut timer = self.model_manager.begin_request(&model_name)?;
+        let timer = self.model_manager.begin_request(&model_name)?;
 
         // When the model declares an input tensor, validate and reassemble it
         // from the request stream; otherwise drain the (input-less) stream. The
@@ -203,7 +203,6 @@ impl Nereid for NereidService {
             tokio::spawn(async move { while let Ok(Some(_)) = stream.message().await {} });
             None
         };
-        timer.input_ready();
 
         // The stream owns the timer from here and ends it when it completes.
         Ok(Response::new(self.model_manager.checkpoint(

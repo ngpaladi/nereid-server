@@ -470,8 +470,9 @@ impl TritonService {
         result
     }
 
-    /// The input → execute → output body of [`Self::infer_once`], marking the
-    /// phase boundaries on `timer`.
+    /// The input → execute → output body of [`Self::infer_once`]. Only the
+    /// execution is recorded on `timer` (by the `ModelManager`): decoding the
+    /// request and serializing the response here belong to no compute phase.
     async fn infer_timed(
         &self,
         contract: &Contract,
@@ -480,7 +481,6 @@ impl TritonService {
         timer: &mut RequestTimer,
     ) -> Result<ModelInferResponse, Status> {
         let (inputs, expected_batch) = build_input_tensors(contract, &mut request, &model_name)?;
-        timer.input_ready();
         let outputs = self.model_manager.infer(&model_name, inputs, timer).await?;
 
         if contract.strict_output_dtype {
@@ -2410,10 +2410,18 @@ with open(os.environ['NEREID_OUTPUT_PATH'], 'wb') as f:
             metric(&text, "nv_inference_compute_infer_duration_us", labels) > 0,
             "backend execution latency accumulates"
         );
+        let phases: u64 = [
+            "nv_inference_queue_duration_us",
+            "nv_inference_compute_input_duration_us",
+            "nv_inference_compute_infer_duration_us",
+            "nv_inference_compute_output_duration_us",
+        ]
+        .iter()
+        .map(|name| metric(&text, name, labels))
+        .sum();
         assert!(
-            metric(&text, "nv_inference_request_duration_us", labels)
-                >= metric(&text, "nv_inference_compute_infer_duration_us", labels),
-            "the request span contains the backend execution"
+            metric(&text, "nv_inference_request_duration_us", labels) >= phases,
+            "the request span contains the queue wait and the backend's three compute phases"
         );
         assert_eq!(
             metric(&text, "nv_inference_pending_request_count", labels),

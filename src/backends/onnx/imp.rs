@@ -10,7 +10,7 @@ use tonic::Status;
 
 use crate::backend::Tensor;
 use crate::backend::native_common::{bytes_to_vec, dispatch_dtype, slice_to_bytes};
-use crate::backend::{Backend, Contract};
+use crate::backend::{Backend, ComputeClock, Contract};
 use crate::config::ModelConfig;
 
 pub struct OnnxBackend {
@@ -92,7 +92,7 @@ impl Backend for OnnxBackend {
         "onnxruntime_onnx"
     }
 
-    fn infer(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+    fn infer(&self, inputs: Vec<Tensor>, clock: &mut ComputeClock) -> Result<Vec<Tensor>, Status> {
         if inputs.len() != self.input_names.len() {
             return Err(Status::invalid_argument(format!(
                 "ONNX model expects {} input(s), got {}",
@@ -105,10 +105,12 @@ impl Backend for OnnxBackend {
             ort_inputs.push((Cow::Owned(name.clone()), tensor_to_ort_value(t)?));
         }
 
+        clock.infer_begins();
         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
         let outputs = session
             .run(ort_inputs)
             .map_err(|e| ort_err("run inference", e))?;
+        clock.infer_ends();
 
         let mut result = Vec::with_capacity(self.output_names.len());
         for name in &self.output_names {

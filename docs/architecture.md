@@ -69,7 +69,9 @@ processes a model can have running at once.
 
 Everything above is backend-agnostic. The core talks to one `Backend` trait — a `platform()`
 string, a blocking `infer()`, and an optional `checkpoint_stream()` — and never asks what kind of
-engine is on the other side. Tensors cross that boundary as raw bytes plus a shape and a dtype,
+engine is on the other side. `infer()` is also handed a clock on which the backend marks where the
+model starts and stops executing, which is how the [metrics](metrics.md#how-the-phases-are-measured)
+get Triton's backend-side `compute_input` / `compute_infer` / `compute_output` split. Tensors cross that boundary as raw bytes plus a shape and a dtype,
 rather than as any one framework's tensor type, which is what keeps the trait from quietly
 becoming libtorch-shaped.
 

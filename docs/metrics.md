@@ -73,28 +73,38 @@ requests.
 | Metric | Covers |
 |---|---|
 | `nv_inference_request_duration_us` | End to end, from the request naming a model to the response being ready. |
-| `nv_inference_compute_input_duration_us` | Validating and assembling the input tensors. On the `Checkpoint` path this includes receiving the streamed chunks. |
 | `nv_inference_queue_duration_us` | Waiting for a worker thread after a permit was granted. nereid sheds load rather than queueing (see [Backpressure](architecture.md#backpressure)), so this is normally tiny. |
-| `nv_inference_compute_infer_duration_us` | The backend's `infer` — the model itself. For a Python model's `Checkpoint` stream, the whole subprocess run. |
-| `nv_inference_compute_output_duration_us` | Validating and serializing the outputs. |
+| `nv_inference_compute_input_duration_us` | Inside the backend: turning the request's tensors into the framework's inputs (and moving them to the model's device). |
+| `nv_inference_compute_infer_duration_us` | Inside the backend: executing the model. |
+| `nv_inference_compute_output_duration_us` | Inside the backend: extracting the framework's outputs into response tensors (and copying them back from the device). |
 
-### How the phases differ from Triton's
+### How the phases are measured
 
-Triton's phases run *queue → compute_input → compute_infer → compute_output*: a request first waits
-in the scheduler (and dynamic batcher), and the backend then reports the three compute phases
-itself, `compute_input` being the conversion of the request's tensors into the framework's (for
-example the copy into GPU memory). nereid has no scheduler queue and no dynamic batcher, so its
-phases run *compute_input → queue → compute_infer → compute_output*: the request's tensors are
-validated and assembled at the gRPC boundary (`compute_input`), the request is dispatched at once
-and waits only for a worker thread (`queue`), the backend's `infer` runs as one step
-(`compute_infer`), and the outputs are validated and serialized (`compute_output`). Converting
-bytes to framework tensors (libtorch, ONNX Runtime) happens inside `infer`, so that time lands in
-`compute_infer` here, not in `compute_input`.
+The phases follow Triton's definitions and order, *queue → compute_input → compute_infer →
+compute_output*, and — as in Triton — the three compute phases are reported by the backend and lie
+entirely inside it. What the server does around the backend is in `request_duration_us` only:
+decoding and validating the request (on the `Checkpoint` path, receiving the streamed chunks), and
+validating and serializing the response. So the four phases sum to somewhat less than
+`request_duration_us`, and the difference is the frontend's overhead.
 
-In both servers the four phases partition the request's time inside the server, so sums and
-`request_duration_us` compare directly. The two `compute_input` series do not: nereid's measures
-the protobuf-to-tensor work that Triton's frontend does before any phase starts, and Triton's
-measures backend input conversion that nereid counts under `compute_infer`.
+Where each backend draws the lines:
+
+| Backend | `compute_input` | `compute_infer` | `compute_output` |
+|---|---|---|---|
+| Torch | Building libtorch tensors, moving them to the device | The forward pass (on CUDA, synchronized before the clock stops) | Copying outputs to host bytes |
+| ONNX | Building ONNX Runtime values | `Session::run` | Extracting output tensors |
+| TensorFlow | Building and feeding TF tensors | `Session::run` | Fetching output tensors |
+| Python, C++ (`main.cpp`) | — | The child process, spawn to exit (the input is piped to it while it runs) | Reading and parsing the output tensor file |
+| C++ (compiled-in) | — | The whole call: the model takes and returns raw bytes | — |
+
+A Python model's `Checkpoint` stream runs as one opaque step, so its whole span is `compute_infer`.
+
+Two differences from Triton remain, both because nereid has no scheduler queue or instance groups:
+
+- `queue` is only the wait for a worker thread. A request that waits for another request to the
+  same in-process model to finish (models run one execution at a time; `queue_capacity` above 1
+  admits more) spends that wait in `compute_infer`, where Triton would count it as `queue`.
+- There is no dynamic batcher, so every execution serves exactly one request.
 
 ## Which requests count
 

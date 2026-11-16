@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use tonic::Status;
 
-use crate::backend::{Backend, Contract, Tensor};
+use crate::backend::{Backend, ComputeClock, Contract, Tensor};
 use crate::config::ModelConfig;
 
 pub struct CxxBackend {
@@ -54,7 +54,10 @@ impl Backend for CxxBackend {
         "nereid_cxx"
     }
 
-    fn infer(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+    // The compiled-in model takes and returns raw bytes, so there is no tensor
+    // conversion on either side of it: the clock is left unmarked and the whole
+    // call counts as `compute_infer`.
+    fn infer(&self, inputs: Vec<Tensor>, _clock: &mut ComputeClock) -> Result<Vec<Tensor>, Status> {
         let input = inputs.into_iter().next().ok_or_else(|| {
             Status::invalid_argument("cxx model expects exactly one input tensor")
         })?;

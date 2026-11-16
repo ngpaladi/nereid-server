@@ -29,6 +29,8 @@ use std::thread::JoinHandle;
 
 use tonic::Status;
 
+use crate::backend::ComputeClock;
+
 /// A validated input tensor to feed a subprocess model. `bytes` are the tensor
 /// values in row-major little-endian order for the element type named by
 /// `dtype`; `shape` is the (already batch-normalized) tensor shape.
@@ -205,10 +207,15 @@ pub fn parse_framed_tensor(
 /// child to completion (draining stdout/stderr so it can't wedge), and parses
 /// the framed tensor the model wrote to `NEREID_OUTPUT_PATH`. Blocking — run it
 /// off the async runtime (e.g. `tokio::task::spawn_blocking`).
+///
+/// On `clock`, the child's whole life — spawn to exit, which includes feeding
+/// it the input on stdin — is `compute_infer`; reading back and parsing the
+/// output tensor is `compute_output`.
 pub fn run_subprocess_inference(
     mut command: Command,
     model_name: &str,
     input: Option<TensorInput>,
+    clock: &mut ComputeClock,
 ) -> Result<(Vec<i64>, Vec<u8>, String), Status> {
     let output_path = unique_output_path(model_name);
     // The output dtype hint defaults to float32 for an output-only model.
@@ -239,6 +246,7 @@ pub fn run_subprocess_inference(
         command.stdin(Stdio::null());
     }
 
+    clock.infer_begins();
     let (mut child, stdin_handle) = spawn_with_optional_stdin(command, input)
         .map_err(|err| Status::internal(format!("failed to run model '{model_name}': {err}")))?;
 
@@ -255,6 +263,7 @@ pub fn run_subprocess_inference(
     if let Some(handle) = stdin_handle {
         let _ = handle.join();
     }
+    clock.infer_ends();
 
     let status = status.map_err(|err| {
         let _ = fs::remove_file(&output_path);

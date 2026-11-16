@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 use tonic::Status;
 
 use crate::config::{ModelConfig, ServerConfig};
-use crate::metrics::{InferenceMetrics, PendingSlot, RequestTimer};
+use crate::metrics::{ComputeTimes, InferenceMetrics, PendingSlot, RequestTimer};
 use crate::proto::{CheckpointResponse, TensorChunk};
 
 pub use contract::{Contract, TensorSpec};
@@ -43,6 +43,60 @@ pub struct Tensor {
 pub type CheckpointStream =
     tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<CheckpointResponse, Status>>;
 
+/// A backend's stopwatch over one `infer` call, splitting it into Triton's
+/// three compute phases — all of them inside the backend:
+///
+/// - `compute_input`: from the start of `infer` to [`Self::infer_begins`] —
+///   turning the request's tensors into the framework's inputs;
+/// - `compute_infer`: from there to [`Self::infer_ends`] — executing the model;
+/// - `compute_output`: from there to `infer` returning — extracting the
+///   framework's outputs into response tensors.
+///
+/// A backend that marks neither boundary (it runs the request as one opaque
+/// step) has its whole run counted as `compute_infer`.
+#[derive(Debug)]
+pub struct ComputeClock {
+    started: Instant,
+    infer_began: Option<Instant>,
+    infer_ended: Option<Instant>,
+}
+
+impl ComputeClock {
+    pub(crate) fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            infer_began: None,
+            infer_ended: None,
+        }
+    }
+
+    /// The inputs are ready and the model is about to execute: the end of
+    /// `compute_input`.
+    pub fn infer_begins(&mut self) {
+        self.infer_began = Some(Instant::now());
+    }
+
+    /// The model has executed and its outputs are about to be extracted: the
+    /// start of `compute_output`.
+    pub fn infer_ends(&mut self) {
+        self.infer_ended = Some(Instant::now());
+    }
+
+    /// Stop the clock (`infer` has returned) and split the run.
+    pub(crate) fn finish(self) -> ComputeTimes {
+        let finished = Instant::now();
+        let began = self.infer_began.unwrap_or(self.started);
+        // Clamped so a backend that marks the boundaries out of order cannot
+        // produce a negative phase.
+        let ended = self.infer_ended.unwrap_or(finished).max(began);
+        ComputeTimes {
+            input: began.duration_since(self.started),
+            infer: ended.duration_since(began),
+            output: finished.duration_since(ended),
+        }
+    }
+}
+
 /// A loaded inference backend. One boxed instance backs each model. `infer` is
 /// blocking (run off the async runtime); the `ModelManager` serializes/bounds
 /// concurrency, so implementations need only be thread-safe for shared `&self`.
@@ -52,7 +106,13 @@ pub trait Backend: Send + Sync {
 
     /// Run one inference with already-validated inputs (in the model's declared
     /// input order); return outputs in the model's declared output order.
-    fn infer(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status>;
+    ///
+    /// Mark the phase boundaries on `clock` — [`ComputeClock::infer_begins`]
+    /// once the framework's inputs are built, [`ComputeClock::infer_ends`]
+    /// once the model has executed — so the run is split into Triton's
+    /// `compute_input` / `compute_infer` / `compute_output`. Unmarked, the
+    /// whole call counts as `compute_infer`.
+    fn infer(&self, inputs: Vec<Tensor>, clock: &mut ComputeClock) -> Result<Vec<Tensor>, Status>;
 
     /// An optional richer `Checkpoint` stream (e.g. the Python backend streams
     /// stdout/stderr log chunks alongside the output tensor). Returning `None`
@@ -197,7 +257,7 @@ impl ModelManager {
     /// `queue_capacity` (full -> `ResourceExhausted`) and runs the blocking
     /// backend off the async runtime. Releases `timer`'s pending slot when a
     /// worker picks the request up, and records the queue wait, the backend's
-    /// execution time, and the batch size on it; the caller still ends the
+    /// compute phases, and the batch size on it; the caller still ends the
     /// timer with the request's overall outcome.
     pub async fn infer(
         &self,
@@ -221,7 +281,7 @@ impl ModelManager {
         let execution = run_backend(backend, inputs, timer.take_pending()).await;
         let result = match execution {
             Ok(execution) => {
-                timer.executed(execution.queued, execution.ran, batch);
+                timer.executed(execution.queued, execution.compute, batch);
                 execution.result
             }
             Err(status) => Err(status),
@@ -296,7 +356,7 @@ impl ModelManager {
             drop(permit);
             let outputs = match execution {
                 Ok(execution) => {
-                    timer.executed(execution.queued, execution.ran, batch);
+                    timer.executed(execution.queued, execution.compute, batch);
                     match execution.result {
                         Ok(outputs) => outputs,
                         Err(status) => {
@@ -335,45 +395,49 @@ fn inference_count(contract: &Contract, inputs: &[Tensor]) -> u64 {
 struct Execution {
     /// How long the request waited for a blocking worker to pick it up.
     queued: Duration,
-    /// How long the backend's `infer` ran, clocked on the worker that ran it.
-    ran: Duration,
+    /// The backend's `infer`, split into the three compute phases and clocked
+    /// on the worker that ran it.
+    compute: ComputeTimes,
     result: Result<Vec<Tensor>, Status>,
 }
 
 /// Run `backend.infer` off the async runtime, timing the wait and the run.
 /// Both are clocked on the blocking worker: the run ends when `infer` returns
 /// there, not when the async caller gets to observe it, so a busy runtime
-/// that is slow to resume the caller does not inflate `compute_infer` (that
-/// wait lands in `compute_output`, as the request's remainder). `Err` only
-/// when the blocking task itself fails to join (it panicked).
+/// that is slow to resume the caller does not inflate any compute phase (that
+/// wait shows up in `request_duration` only). `Err` only when the blocking
+/// task itself fails to join (it panicked).
 async fn run_backend(
     backend: Arc<dyn Backend>,
     inputs: Vec<Tensor>,
     pending: Option<PendingSlot>,
 ) -> Result<Execution, Status> {
     let queued_at = Instant::now();
-    let (started, ran, result) = tokio::task::spawn_blocking(move || {
-        let started = Instant::now();
+    let (started, compute, result) = tokio::task::spawn_blocking(move || {
+        let mut clock = ComputeClock::start();
+        let started = clock.started;
         // Execution begins here: the request is no longer awaiting one.
         drop(pending);
-        let result = backend.infer(inputs);
-        (started, started.elapsed(), result)
+        let result = backend.infer(inputs, &mut clock);
+        (started, clock.finish(), result)
     })
     .await
     .map_err(|err| Status::internal(format!("inference task failed to join: {err}")))?;
     Ok(Execution {
         queued: started.duration_since(queued_at),
-        ran,
+        compute,
         result,
     })
 }
 
 /// Relay a backend-provided `Checkpoint` stream, ending `timer` when it ends.
-/// The backend ran the request as one opaque step, so its whole span counts as
+/// The backend ran the request as one opaque step, so its whole span — from
+/// the stream being handed over to its terminal `done` — counts as
 /// `compute_infer`; a terminal `done` with exit code 0 is a success, a non-zero
 /// exit or an error status a backend failure, and a client that stops reading
 /// a cancellation.
 fn record_stream(inner: CheckpointStream, mut timer: RequestTimer, batch: u64) -> CheckpointStream {
+    let started = Instant::now();
     let mut inner = inner.into_inner();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<CheckpointResponse, Status>>(64);
     tokio::spawn(async move {
@@ -400,8 +464,11 @@ fn record_stream(inner: CheckpointStream, mut timer: RequestTimer, batch: u64) -
         }
         match outcome {
             Some(Ok(())) => {
-                let ran = timer.phase_elapsed();
-                timer.executed(Duration::ZERO, ran, batch);
+                let compute = ComputeTimes {
+                    infer: started.elapsed(),
+                    ..ComputeTimes::default()
+                };
+                timer.executed(Duration::ZERO, compute, batch);
                 timer.succeed();
             }
             Some(Err(status)) => {
@@ -594,7 +661,7 @@ pub(crate) fn missing_feature(model_name: &str, what: &str, feature: &str) -> St
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, Tensor, detect_backend, run_backend};
+    use super::{Backend, ComputeClock, ComputeTimes, Tensor, detect_backend, run_backend};
     use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -688,9 +755,63 @@ mod tests {
             "test"
         }
 
-        fn infer(&self, _inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+        fn infer(
+            &self,
+            _inputs: Vec<Tensor>,
+            _clock: &mut ComputeClock,
+        ) -> Result<Vec<Tensor>, Status> {
             Ok(Vec::new())
         }
+    }
+
+    /// A backend that spends a known time in each compute phase.
+    struct Phased;
+
+    impl Backend for Phased {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+
+        fn infer(
+            &self,
+            _inputs: Vec<Tensor>,
+            clock: &mut ComputeClock,
+        ) -> Result<Vec<Tensor>, Status> {
+            std::thread::sleep(Duration::from_millis(20));
+            clock.infer_begins();
+            std::thread::sleep(Duration::from_millis(60));
+            clock.infer_ends();
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(Vec::new())
+        }
+    }
+
+    /// The three compute phases are the backend's own marks, as in Triton.
+    #[tokio::test]
+    async fn run_backend_splits_the_run_at_the_backends_marks() {
+        let execution = run_backend(Arc::new(Phased), Vec::new(), None)
+            .await
+            .expect("blocking task joins");
+        let ComputeTimes {
+            input,
+            infer,
+            output,
+        } = execution.compute;
+        let ms = Duration::from_millis;
+        assert!(input >= ms(20) && input < ms(50), "input {input:?}");
+        assert!(infer >= ms(60) && infer < ms(90), "infer {infer:?}");
+        assert!(output >= ms(30) && output < ms(60), "output {output:?}");
+    }
+
+    /// A backend that marks nothing ran as one opaque step: all `compute_infer`.
+    #[test]
+    fn an_unmarked_clock_counts_the_whole_run_as_infer() {
+        let clock = ComputeClock::start();
+        std::thread::sleep(Duration::from_millis(5));
+        let compute = clock.finish();
+        assert_eq!(compute.input, Duration::ZERO);
+        assert_eq!(compute.output, Duration::ZERO);
+        assert!(compute.infer >= Duration::from_millis(5));
     }
 
     /// `compute_infer` is clocked on the blocking worker. If the async runtime
@@ -708,10 +829,11 @@ mod tests {
             .expect("task joins")
             .expect("blocking task joins");
         assert!(execution.result.is_ok());
+        let compute = execution.compute;
+        let ran = compute.input + compute.infer + compute.output;
         assert!(
-            execution.ran < Duration::from_millis(100),
-            "ran {:?} includes the runtime's resume delay",
-            execution.ran
+            ran < Duration::from_millis(100),
+            "ran {ran:?} includes the runtime's resume delay"
         );
     }
 }

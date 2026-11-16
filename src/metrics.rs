@@ -18,17 +18,23 @@
 //!   Every series here is labelled `version="1"`, so a request naming a version
 //!   nereid does not serve is attributed nowhere rather than being charged to
 //!   the version that never saw it.
-//! - The frontend marks the input built ([`RequestTimer::input_ready`]:
-//!   `compute_input`); the `ModelManager` releases the pending slot
+//! - The `ModelManager` releases the pending slot
 //!   ([`RequestTimer::take_pending`]) the moment the backend starts running the
-//!   request, and marks the execution once it is done ([`RequestTimer::executed`]:
-//!   `queue` = waiting for a blocking worker, `compute_infer` = the backend's
-//!   `infer`, plus the batch size).
-//! - The request ends with [`RequestTimer::succeed`] (the remainder is
-//!   `compute_output`; counts and durations are committed, as in Triton, only
-//!   for successful requests) or [`RequestTimer::fail`] (one failure counted
-//!   under a Triton `reason`). A timer dropped before either — the handler's
-//!   future was cancelled because the client went away — counts as `CANCELED`.
+//!   request, and marks the execution once it is done
+//!   ([`RequestTimer::executed`]): `queue` is the wait for a blocking worker,
+//!   and the three compute phases are the backend's own split of its run
+//!   ([`ComputeTimes`]), plus the batch size.
+//! - As in Triton, the phases are `queue → compute_input → compute_infer →
+//!   compute_output` and all three compute phases lie *inside the backend*:
+//!   building the framework's input tensors, running the model, and extracting
+//!   the output tensors. What the frontend does around them — decoding and
+//!   validating the request, validating and serializing the response — is in
+//!   `request_duration` only, so the phases sum to less than it.
+//! - The request ends with [`RequestTimer::succeed`] (counts and durations are
+//!   committed, as in Triton, only for successful requests) or
+//!   [`RequestTimer::fail`] (one failure counted under a Triton `reason`). A
+//!   timer dropped before either — the handler's future was cancelled because
+//!   the client went away — counts as `CANCELED`.
 //!
 //! The counters are plain atomics and the model set is fixed at startup, so
 //! recording is lock-free and the registry never grows.
@@ -144,14 +150,13 @@ impl InferenceMetrics {
         let model = self.by_name.get(model_name)?.clone();
         model.pending_request_count.fetch_add(1, Ordering::Relaxed);
         let slot = model.clone();
-        let now = Instant::now();
         Some(RequestTimer {
             model,
-            started: now,
-            phase: now,
-            input_us: 0,
+            started: Instant::now(),
             queue_us: 0,
+            input_us: 0,
             infer_us: 0,
+            output_us: 0,
             executions: 0,
             inferences: 0,
             pending: Some(PendingSlot { model: slot }),
@@ -194,49 +199,49 @@ impl InferenceMetrics {
             &mut out,
             "nv_inference_count",
             "counter",
-            "Number of inferences performed (a batch of \"n\" is counted as \"n\" inferences)",
+            "Number of inferences performed (does not include cached requests)",
             |m| m.count.load(Ordering::Relaxed),
         );
         self.family(
             &mut out,
             "nv_inference_exec_count",
             "counter",
-            "Number of model executions performed",
+            "Number of model executions performed (does not include cached requests)",
             |m| m.exec_count.load(Ordering::Relaxed),
         );
         self.family(
             &mut out,
             "nv_inference_request_duration_us",
             "counter",
-            "Cumulative inference request duration in microseconds",
+            "Cumulative inference request duration in microseconds (includes cached requests)",
             |m| m.request_duration_us.load(Ordering::Relaxed),
         );
         self.family(
             &mut out,
             "nv_inference_queue_duration_us",
             "counter",
-            "Cumulative inference queuing duration in microseconds",
+            "Cumulative inference queuing duration in microseconds (includes cached requests)",
             |m| m.queue_duration_us.load(Ordering::Relaxed),
         );
         self.family(
             &mut out,
             "nv_inference_compute_input_duration_us",
             "counter",
-            "Cumulative compute input duration in microseconds",
+            "Cumulative compute input duration in microseconds (does not include cached requests)",
             |m| m.compute_input_duration_us.load(Ordering::Relaxed),
         );
         self.family(
             &mut out,
             "nv_inference_compute_infer_duration_us",
             "counter",
-            "Cumulative compute inference duration in microseconds",
+            "Cumulative compute inference duration in microseconds (does not include cached requests)",
             |m| m.compute_infer_duration_us.load(Ordering::Relaxed),
         );
         self.family(
             &mut out,
             "nv_inference_compute_output_duration_us",
             "counter",
-            "Cumulative inference compute output duration in microseconds",
+            "Cumulative inference compute output duration in microseconds (does not include cached requests)",
             |m| m.compute_output_duration_us.load(Ordering::Relaxed),
         );
         self.family(
@@ -292,17 +297,28 @@ fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// A backend's own split of one execution into Triton's three compute phases,
+/// each measured inside the backend (see `crate::backend::ComputeClock`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeTimes {
+    /// Turning the request's tensors into the framework's inputs.
+    pub input: Duration,
+    /// Executing the model.
+    pub infer: Duration,
+    /// Extracting the framework's outputs into response tensors.
+    pub output: Duration,
+}
+
 /// The in-flight accounting for one inference request. See the module docs
 /// for the phase model. Must end with [`Self::succeed`] or [`Self::fail`];
 /// dropping it unfinished records a `CANCELED` failure.
 pub struct RequestTimer {
     model: Arc<ModelMetrics>,
     started: Instant,
-    /// Start of the current phase (input → queue/infer → output).
-    phase: Instant,
-    input_us: u64,
     queue_us: u64,
+    input_us: u64,
     infer_us: u64,
+    output_us: u64,
     executions: u64,
     inferences: u64,
     /// This request's claim on the model's pending gauge, until it is handed
@@ -315,33 +331,20 @@ pub struct RequestTimer {
 }
 
 impl RequestTimer {
-    /// The input tensors are built and validated: end of the `compute_input`
-    /// phase.
-    pub fn input_ready(&mut self) {
-        let now = Instant::now();
-        self.input_us += micros(now.duration_since(self.phase));
-        self.phase = now;
-    }
-
-    /// Time elapsed in the current phase — for a backend that runs the whole
-    /// execution as one opaque step (no separate queue/infer split).
-    pub fn phase_elapsed(&self) -> Duration {
-        self.phase.elapsed()
-    }
-
     /// The backend ran: `queue` is how long the request waited for a worker,
-    /// `infer` how long the backend's `infer` took, `batch` the number of
-    /// inferences in this execution (the request's batch size, or 1). Starts
-    /// the `compute_output` phase. The pending slot is normally already gone by
-    /// now ([`Self::take_pending`]); releasing it here too only backstops a
-    /// caller that never took it.
-    pub fn executed(&mut self, queue: Duration, infer: Duration, batch: u64) {
+    /// `compute` the backend's split of its run into the three compute phases,
+    /// `batch` the number of inferences in this execution (the request's batch
+    /// size, or 1). The pending slot is normally already gone by now
+    /// ([`Self::take_pending`]); releasing it here too only backstops a caller
+    /// that never took it.
+    pub fn executed(&mut self, queue: Duration, compute: ComputeTimes, batch: u64) {
         self.queue_us += micros(queue);
-        self.infer_us += micros(infer);
+        self.input_us += micros(compute.input);
+        self.infer_us += micros(compute.infer);
+        self.output_us += micros(compute.output);
         self.executions += 1;
         self.inferences += batch.max(1);
         self.clear_pending();
-        self.phase = Instant::now();
     }
 
     /// Hand off this request's claim on the pending gauge, to be dropped the
@@ -361,12 +364,9 @@ impl RequestTimer {
         self.reason = Some(FailureReason::Backend);
     }
 
-    /// The request completed. Commits the request's counts and durations; the
-    /// time since the last phase mark is `compute_output`.
+    /// The request completed. Commits the request's counts and durations.
     pub fn succeed(mut self) {
-        let now = Instant::now();
-        let output_us = micros(now.duration_since(self.phase));
-        let request_us = micros(now.duration_since(self.started));
+        let request_us = micros(self.started.elapsed());
         let m = &self.model;
         m.request_success.fetch_add(1, Ordering::Relaxed);
         m.count.fetch_add(self.inferences, Ordering::Relaxed);
@@ -380,7 +380,7 @@ impl RequestTimer {
         m.compute_infer_duration_us
             .fetch_add(self.infer_us, Ordering::Relaxed);
         m.compute_output_duration_us
-            .fetch_add(output_us, Ordering::Relaxed);
+            .fetch_add(self.output_us, Ordering::Relaxed);
         self.close();
     }
 
@@ -525,7 +525,7 @@ mod tests {
 
         // Nothing that ends the request may decrement the gauge a second time —
         // it is unsigned, so a double release would wrap to u64::MAX.
-        timer.executed(Duration::from_micros(7), Duration::from_micros(1500), 1);
+        timer.executed(Duration::from_micros(7), ComputeTimes::default(), 1);
         assert_eq!(pending(&metrics), Some(0), "executed must not re-release");
         timer.succeed();
         assert_eq!(pending(&metrics), Some(0), "succeed must not re-release");
@@ -567,8 +567,14 @@ mod tests {
             Some(1),
             "pending while in flight"
         );
-        timer.input_ready();
-        timer.executed(Duration::from_micros(7), Duration::from_micros(1500), 4);
+        // The frontend's own work (here: a sleep) belongs to no phase.
+        std::thread::sleep(Duration::from_millis(5));
+        let compute = ComputeTimes {
+            input: Duration::from_micros(30),
+            infer: Duration::from_micros(1500),
+            output: Duration::from_micros(40),
+        };
+        timer.executed(Duration::from_micros(7), compute, 4);
         assert_eq!(
             series(&metrics.render(), "nv_inference_pending_request_count", M3),
             Some(0),
@@ -589,9 +595,19 @@ mod tests {
             series(&text, "nv_inference_compute_infer_duration_us", M3),
             Some(1500)
         );
+        assert_eq!(
+            series(&text, "nv_inference_compute_input_duration_us", M3),
+            Some(30),
+            "compute_input is what the backend reported, not frontend time"
+        );
+        assert_eq!(
+            series(&text, "nv_inference_compute_output_duration_us", M3),
+            Some(40),
+            "compute_output is what the backend reported, not the request's remainder"
+        );
         assert!(
-            series(&text, "nv_inference_compute_output_duration_us", M3).is_some(),
-            "output phase is recorded"
+            series(&text, "nv_inference_request_duration_us", M3) >= Some(5000),
+            "request_duration is end to end, frontend work included"
         );
         for reason in ["REJECTED", "CANCELED", "BACKEND", "OTHER"] {
             assert_eq!(
