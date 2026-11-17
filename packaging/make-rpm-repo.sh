@@ -153,10 +153,10 @@ fi
 #    xml:base on every <location>, so the href createrepo_c derives from the
 #    on-disk layout ("<tag>/<file>.rpm") resolves against the release-download
 #    root rather than against wherever this metadata is hosted.
-# ---------------------------------------------------------------------------
 #
 #    The compression is pinned to gzip: createrepo_c 1.x defaults to zstd,
 #    which test-rpm-repo.sh does not read and older dnf/yum cannot either.
+# ---------------------------------------------------------------------------
 log "==> createrepo_c"
 createrepo_c --quiet --checksum sha256 \
     --general-compress-type=gz \
