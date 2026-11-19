@@ -18,9 +18,10 @@
 # Runtime contract: the server reads `./nereid.yaml` from its working directory
 # and resolves `server.ml_backends_path` relative to it, so mount both into
 # /nereid:
-#   docker run --rm -p 50051:50051 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server
-# and set `bind_addr: "[::]:50051"` in that config — the example config's
-# `[::1]` is loopback-only and is unreachable from outside the container.
+#   docker run --rm -p 50051:50051 -p 8002:8002 -v "$PWD:/nereid" ghcr.io/ngpaladi/nereid-server
+# and set `bind_addr: "[::]:50051"` (plus `http_addr: "[::]:8002"` for the
+# Prometheus /metrics and /v2/health probe endpoints) in that config — the example config's `[::1]` is
+# loopback-only and is unreachable from outside the container.
 
 ARG RUST_VERSION=1
 ARG DEBIAN_SUITE=bookworm
@@ -85,6 +86,7 @@ USER nereid
 # The config contract: `nereid.yaml` and the model folders are read from here.
 WORKDIR /nereid
 
-EXPOSE 50051
+# gRPC, and the optional HTTP surface (server.http_addr): /metrics, /v2/health/*.
+EXPOSE 50051 8002
 
 ENTRYPOINT ["/opt/nereid/grpc-test"]

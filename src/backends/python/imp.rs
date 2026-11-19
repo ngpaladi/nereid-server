@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use crate::backend::{Backend, CheckpointStream, Contract, Tensor};
+use crate::backend::{Backend, CheckpointStream, ComputeClock, Contract, Tensor};
 use crate::config::ModelConfig;
 use crate::proto::{CheckpointResponse, TensorChunk};
 
@@ -55,9 +55,10 @@ impl Backend for PythonBackend {
         "python"
     }
 
-    fn infer(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+    fn infer(&self, inputs: Vec<Tensor>, clock: &mut ComputeClock) -> Result<Vec<Tensor>, Status> {
         let input = inputs.into_iter().next();
-        let (shape, data, dtype) = run_python_inference(&self.model_name, &self.model_dir, input)?;
+        let (shape, data, dtype) =
+            run_python_inference(&self.model_name, &self.model_dir, input, clock)?;
         Ok(vec![Tensor {
             name: "output".to_string(),
             shape,
@@ -299,10 +300,15 @@ fn python_command(model_dir: &Path, model_name: &str) -> Result<Command, Status>
 }
 
 /// Run a model for one unary request; return `(shape, bytes, canonical dtype)`.
+///
+/// On `clock`, the interpreter's whole life — spawn to exit, which includes
+/// feeding it the input on stdin — is `compute_infer`; reading back and parsing
+/// the output tensor is `compute_output`.
 fn run_python_inference(
     model_name: &str,
     model_dir: &Path,
     input: Option<Tensor>,
+    clock: &mut ComputeClock,
 ) -> Result<(Vec<i64>, Vec<u8>, String), Status> {
     let output_path = unique_output_path(model_name);
     let output_dtype = input
@@ -333,6 +339,7 @@ fn run_python_inference(
         None
     };
 
+    clock.infer_begins();
     let (mut child, stdin_handle) =
         spawn_with_optional_stdin(command, input_bytes).map_err(|err| {
             Status::internal(format!(
@@ -350,6 +357,7 @@ fn run_python_inference(
     if let Some(handle) = stdin_handle {
         let _ = handle.join();
     }
+    clock.infer_ends();
 
     let status = status.map_err(|err| {
         let _ = std::fs::remove_file(&output_path);

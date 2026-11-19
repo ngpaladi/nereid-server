@@ -149,7 +149,11 @@ Drop a folder into `src/backends/` with two files in it:
 - `mod.rs` — the detection predicate and the `inventory::submit!` above. This is always compiled,
   and must not depend on the engine.
 - `imp.rs` — the engine itself, behind `#[cfg(feature = "...")]`, implementing the `Backend` trait
-  (`platform()`, `infer()`, and optionally `checkpoint_stream()`).
+  (`platform()`, `infer()`, and optionally `checkpoint_stream()`). `infer()` receives a
+  `ComputeClock`: call `infer_begins()` once the engine's inputs are built and `infer_ends()` once
+  the model has run, and the [metrics](metrics.md#how-the-phases-are-measured) split your run into
+  `compute_input` / `compute_infer` / `compute_output`. Leave it unmarked and the whole call counts
+  as `compute_infer`.
 
 Then build. `build.rs` globs the subfolders of `src/backends/` and emits the module declarations,
 so there is no `mod` line to add, no enum arm, no detection list, and no registration call

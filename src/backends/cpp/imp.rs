@@ -10,7 +10,7 @@ use std::process::Command;
 use tonic::Status;
 
 use super::subprocess::{self, TensorInput};
-use crate::backend::{Backend, Contract, Tensor};
+use crate::backend::{Backend, ComputeClock, Contract, Tensor};
 use crate::config::ModelConfig;
 
 pub struct CppBackend {
@@ -57,13 +57,14 @@ impl Backend for CppBackend {
         "cpp_subprocess"
     }
 
-    fn infer(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+    fn infer(&self, inputs: Vec<Tensor>, clock: &mut ComputeClock) -> Result<Vec<Tensor>, Status> {
         let input = inputs.into_iter().next().map(|t| TensorInput {
             shape: t.shape,
             bytes: t.data,
             dtype: t.dtype,
         });
-        let (shape, data, dtype) = run_cpp_inference(&self.model_name, &self.model_dir, input)?;
+        let (shape, data, dtype) =
+            run_cpp_inference(&self.model_name, &self.model_dir, input, clock)?;
         Ok(vec![Tensor {
             name: "output".to_string(),
             shape,
@@ -134,6 +135,7 @@ fn run_cpp_inference(
     model_name: &str,
     model_dir: &Path,
     input: Option<TensorInput>,
+    clock: &mut ComputeClock,
 ) -> Result<(Vec<i64>, Vec<u8>, String), Status> {
     let binary = cpp_binary_path(model_dir);
     if !binary.is_file() {
@@ -143,5 +145,5 @@ fn run_cpp_inference(
     }
     let mut command = Command::new(&binary);
     command.current_dir(model_dir);
-    subprocess::run_subprocess_inference(command, model_name, input)
+    subprocess::run_subprocess_inference(command, model_name, input, clock)
 }

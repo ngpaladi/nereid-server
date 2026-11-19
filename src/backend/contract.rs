@@ -81,7 +81,6 @@ impl Contract {
 
     /// The expected request batch size (leading dim) if the request carries a
     /// batch dimension, else `None`. `normalized` must be batch-normalized.
-    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub fn expected_batch(&self, normalized: &[i64]) -> Option<i64> {
         if self.has_batch_dim() {
             normalized.first().copied()

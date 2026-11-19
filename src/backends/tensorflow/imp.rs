@@ -10,7 +10,7 @@ use tonic::Status;
 
 use crate::backend::Tensor;
 use crate::backend::native_common::{bytes_to_vec, dispatch_dtype_tf, slice_to_bytes};
-use crate::backend::{Backend, Contract};
+use crate::backend::{Backend, ComputeClock, Contract};
 use crate::config::ModelConfig;
 
 /// A resolved feed/fetch: the graph operation plus its output index.
@@ -108,7 +108,7 @@ impl Backend for TensorflowBackend {
         "tensorflow_savedmodel"
     }
 
-    fn infer(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, Status> {
+    fn infer(&self, inputs: Vec<Tensor>, clock: &mut ComputeClock) -> Result<Vec<Tensor>, Status> {
         let loaded = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inputs.len() != loaded.inputs.len() {
             return Err(Status::invalid_argument(format!(
@@ -131,11 +131,13 @@ impl Backend for TensorflowBackend {
             .map(|b| args.request_fetch(&b.operation, b.index))
             .collect();
 
+        clock.infer_begins();
         loaded
             .bundle
             .session
             .run(&mut args)
             .map_err(|e| tf_err("run session", e))?;
+        clock.infer_ends();
 
         let mut result = Vec::with_capacity(loaded.outputs.len());
         for (binding, token) in loaded.outputs.iter().zip(fetch_tokens.iter()) {

@@ -8,7 +8,7 @@ use tch::{CModule, Cuda, Device, IValue, Kind, Tensor};
 use tonic::Status;
 
 use crate::backend::Tensor as NTensor;
-use crate::backend::{Backend, Contract};
+use crate::backend::{Backend, ComputeClock, Contract};
 use crate::config::{ModelConfig, ModelDevice};
 
 pub struct TorchBackend {
@@ -58,10 +58,15 @@ impl Backend for TorchBackend {
         "pytorch_libtorch"
     }
 
-    fn infer(&self, inputs: Vec<NTensor>) -> Result<Vec<NTensor>, Status> {
-        // Build libtorch tensors of the declared kinds (uint16/32/64 have no
-        // libtorch kind and are rejected here).
-        let mut tch_inputs = Vec::with_capacity(inputs.len());
+    fn infer(
+        &self,
+        inputs: Vec<NTensor>,
+        clock: &mut ComputeClock,
+    ) -> Result<Vec<NTensor>, Status> {
+        // compute_input: build libtorch tensors of the declared kinds
+        // (uint16/32/64 have no libtorch kind and are rejected here) and move
+        // them to the model's device.
+        let mut ivalues = Vec::with_capacity(inputs.len());
         for t in &inputs {
             let kind = kind_from_canonical(&t.dtype).ok_or_else(|| {
                 Status::invalid_argument(format!(
@@ -69,19 +74,30 @@ impl Backend for TorchBackend {
                     t.dtype
                 ))
             })?;
-            tch_inputs.push(tensor_from_input_bytes(
-                &t.data,
-                &t.shape,
-                "torch model",
-                kind,
-            )?);
+            let tensor = tensor_from_input_bytes(&t.data, &t.shape, "torch model", kind)?;
+            ivalues.push(IValue::Tensor(tensor.to_device(self.device)));
         }
 
+        // compute_infer: the forward pass.
+        clock.infer_begins();
+        let failed = |err| Status::internal(format!("Torch inference failed: {err}"));
         let outputs = {
             let module = self.module.lock().unwrap_or_else(|e| e.into_inner());
-            run_forward_pass(&module, self.device, tch_inputs)
-                .map_err(|err| Status::internal(format!("Torch inference failed: {err}")))?
+            run_forward_pass(&module, &ivalues).map_err(failed)?
         };
+        // CUDA executes asynchronously: wait for the forward pass to really
+        // finish, or its tail would be charged to the output copy below.
+        if let Device::Cuda(index) = self.device {
+            Cuda::synchronize(i64::try_from(index).unwrap_or(0));
+        }
+        clock.infer_ends();
+
+        // compute_output: copy the output tensors back to host bytes.
+        let outputs = outputs
+            .iter()
+            .map(tensor_to_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failed)?;
 
         Ok(outputs
             .into_iter()
@@ -273,22 +289,15 @@ fn tensor_to_bytes(tensor: &Tensor) -> Result<TensorOutput, tch::TchError> {
 
 /// Run the model's forward pass over `inputs` (positionally). The model may
 /// return a single tensor or a tuple; each output is serialized to bytes.
-fn run_forward_pass(
-    model: &CModule,
-    device: Device,
-    inputs: Vec<Tensor>,
-) -> Result<Vec<TensorOutput>, tch::TchError> {
-    let ivalues: Vec<IValue> = inputs
-        .into_iter()
-        .map(|t| IValue::Tensor(t.to_device(device)))
-        .collect();
-    match model.forward_is(&ivalues)? {
-        IValue::Tensor(tensor) => Ok(vec![tensor_to_bytes(&tensor)?]),
+/// Run the model and return its output tensors, still on the model's device.
+fn run_forward_pass(model: &CModule, inputs: &[IValue]) -> Result<Vec<Tensor>, tch::TchError> {
+    match model.forward_is(inputs)? {
+        IValue::Tensor(tensor) => Ok(vec![tensor]),
         IValue::Tuple(items) => {
             let mut outputs = Vec::with_capacity(items.len());
             for item in items {
                 match item {
-                    IValue::Tensor(tensor) => outputs.push(tensor_to_bytes(&tensor)?),
+                    IValue::Tensor(tensor) => outputs.push(tensor),
                     other => {
                         return Err(tch::TchError::Torch(format!(
                             "model tuple output element is non-tensor: {other:?}"

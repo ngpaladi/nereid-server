@@ -14,6 +14,11 @@ nereid binds a single address (`server.bind_addr`) and serves two gRPC services 
 They aren't two systems. Both are backed by the same models and the same `ModelManager`; they're
 just two front doors into it.
 
+Optionally, a third, non-gRPC address (`server.http_addr`) serves plain HTTP: Prometheus metrics
+for the requests that come through either door — Triton's `nv_inference_*` series, so Triton
+dashboards apply unchanged (see [Metrics](metrics.md)) — and the KServe v2 `/v2/health/*`
+endpoints for Kubernetes probes (see [KServe v2](triton.md#http-health-endpoints)).
+
 ## The ModelManager
 
 At startup the server reads `nereid.yaml` and builds a `ModelManager` that owns every configured
@@ -64,7 +69,9 @@ processes a model can have running at once.
 
 Everything above is backend-agnostic. The core talks to one `Backend` trait — a `platform()`
 string, a blocking `infer()`, and an optional `checkpoint_stream()` — and never asks what kind of
-engine is on the other side. Tensors cross that boundary as raw bytes plus a shape and a dtype,
+engine is on the other side. `infer()` is also handed a clock on which the backend marks where the
+model starts and stops executing, which is how the [metrics](metrics.md#how-the-phases-are-measured)
+get Triton's backend-side `compute_input` / `compute_infer` / `compute_output` split. Tensors cross that boundary as raw bytes plus a shape and a dtype,
 rather than as any one framework's tensor type, which is what keeps the trait from quietly
 becoming libtorch-shaped.
 
