@@ -1,0 +1,11 @@
+# Pin the toolchain. Newer Cargo (seen on the GitHub runner image of
+# 2026-11-16, most likely Rust 1.100) moved build-script OUT_DIRs to a new
+# layout (`target/debug/build/<pkg>/<hash>/out` instead of `<pkg>-<hash>/out`),
+# and `ort-sys` 2.0.0-rc.12's `copy-dylibs` step derives the target dir by
+# walking three levels up from OUT_DIR — under the new layout it lands in
+# `target/debug/build/`, tries to symlink into the nonexistent
+# `build/examples/`, and panics with ENOENT. Bump this once `ort` handles the
+# new layout.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]
